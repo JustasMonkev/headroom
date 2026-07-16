@@ -16,15 +16,12 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-_OPENAI = (
-    Path(__file__).resolve().parents[1] / "headroom" / "proxy" / "handlers" / "openai.py"
-)
+_OPENAI = Path(__file__).resolve().parents[1] / "headroom" / "proxy" / "handlers" / "openai.py"
 
 
 def _returns_compression_exception(node: ast.Return) -> bool:
     return any(
-        isinstance(c, ast.Constant) and c.value == "compression_exception"
-        for c in ast.walk(node)
+        isinstance(c, ast.Constant) and c.value == "compression_exception" for c in ast.walk(node)
     )
 
 
