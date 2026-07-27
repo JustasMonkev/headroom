@@ -6999,6 +6999,16 @@ class OpenAIHandlerMixin:
                                 frame_type="response.create",
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
+                            # Compression failed for this frame — forward the
+                            # original bytes. This return used to be dedented to
+                            # the try/except's own level, so it ran on the SUCCESS
+                            # path too and discarded every compressed frame (always
+                            # forwarding raw and reporting "compression_exception").
+                            return (
+                                raw_after_store,
+                                store_forced,
+                                "chatgpt_store_false" if store_forced else "compression_exception",
+                            )
                         # Record transform labels even when the frame bytes are
                         # unchanged: control-arm output-shaper labels
                         # (output_shaper:control:*) must reach the outcome
@@ -7006,11 +7016,6 @@ class OpenAIHandlerMixin:
                         for t in frame_transforms:
                             if t not in transforms_applied:
                                 transforms_applied.append(t)
-                        return (
-                            raw_after_store,
-                            store_forced,
-                            "chatgpt_store_false" if store_forced else "compression_exception",
-                        )
                         if not modified:
                             reason = frame_reason or "no_compression"
                             _log_ws_passthrough(
