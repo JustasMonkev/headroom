@@ -417,6 +417,27 @@ def _tree_has_dash_marker(line: str) -> bool:
     return False
 
 
+def _tree_structure_stop(line: str) -> int:
+    """Index of the first character a foldable path would never contain.
+
+    ``rg --json`` emits one compact record per line, and a matched string inside
+    it can hold a ``:12:`` or ``-12-`` reference. The scan would skip the
+    record's own structural colons, accept the embedded marker, and treat
+    ``{"type":"match","data":{"lines":{"text":"foo`` as a path — reversible, so
+    the round-trip guard passes it and the model gets shredded JSON. Anchoring
+    context rows fixed the dash form only; the colon scan reaches these records
+    on its own, so the path itself has to be rejected.
+
+    Returns ``len(line)`` when the line holds none of them.
+    """
+    stop = len(line)
+    for ch in '"{}':
+        found = line.find(ch)
+        if found != -1 and found < stop:
+            stop = found
+    return stop
+
+
 def _tree_colon_row(line: str) -> tuple[str, str, str, str] | None:
     """Parse a ``path:line:content`` match row.
 
@@ -429,12 +450,13 @@ def _tree_colon_row(line: str) -> tuple[str, str, str, str] | None:
     # the line-number marker.
     start = 2 if len(line) >= 3 and line[0].isalpha() and line[1] == ":" and line[2] in "\\/" else 0
     first_space = line.find(" ")
+    structure = _tree_structure_stop(line)
     pos = line.find(":", start)
     seen = 0
     while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
         seen += 1
         end = _tree_digit_run_end(line, pos)
-        if end > pos + 1 and end < len(line) and line[end] == ":" and pos > 0:
+        if end > pos + 1 and end < len(line) and line[end] == ":" and 0 < pos <= structure:
             # A space before the marker usually means this is the *body* of a
             # ``-`` context row quoting a ``foo.py:12:`` reference, not a path.
             # But a line with no dash marker anywhere cannot be a context row,
@@ -465,12 +487,21 @@ def _tree_dash_row(
     recognised when its path is one the colon pass already established. Nothing
     anchors a JSON record or a stray prose line, so they stay passthrough.
 
+    The scan keeps going after a hit and takes the *longest* anchored path.
+    Both prefixes can be real files at once — a result set holding
+    ``report.log:1:…`` and ``report.log-2026-backup:2:…`` makes both members, and
+    stopping at the first marker files ``report.log-2026-backup-1-before`` under
+    ``report.log`` as line 2026. Nothing in the text settles that, but the longer
+    path explains the whole row rather than leaving ``backup-1-before`` as a
+    body, and it is the reading the surrounding block agrees with.
+
     ``known_lengths`` lets the scan reject a candidate marker on an integer
     compare instead of slicing the prefix, keeping the walk linear.
     """
     if not known_paths:
         return None
     limit = min(len(line), _TREE_MAX_PATH)
+    best: tuple[str, str, str, str] | None = None
     pos = line.find("-")
     seen = 0
     while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
@@ -480,9 +511,9 @@ def _tree_dash_row(
             if end > pos + 1 and end < len(line) and line[end] == "-":
                 path = line[:pos]
                 if path in known_paths:
-                    return path, "-", line[pos + 1 : end], line[end + 1 :]
+                    best = (path, "-", line[pos + 1 : end], line[end + 1 :])
         pos = line.find("-", pos + 1)
-    return None
+    return best
 
 
 def _tree_split_row(

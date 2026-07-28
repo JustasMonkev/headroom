@@ -305,6 +305,44 @@ def test_ripgrep_json_records_are_never_folded():
     assert compact_lossless(records, "search") == records
 
 
+@pytest.mark.parametrize("embedded", ["foo-12-bar", "foo:12:bar"])
+def test_ripgrep_json_is_rejected_for_both_marker_forms(embedded):
+    # Anchoring context rows closes the dash form only — the colon scan reaches
+    # these records on its own, skipping the record's own structural colons and
+    # accepting the one embedded in a matched string.
+    records = "".join(
+        '{"type":"match","data":{"path":{"text":"src/a.rs"},'
+        f'"lines":{{"text":"{embedded}"}},"line_number":{n}}}}}\n'
+        for n in (7, 9, 11)
+    )
+    assert search_tree_heading(records) == records
+    assert compact_lossless(records, "search") == records
+
+
+def test_braces_and_quotes_in_a_body_do_not_block_the_fold():
+    # The structural guard only looks at the path, so ordinary code bodies —
+    # dict literals, string literals — still fold.
+    grep = 'a/f.py:1:def x(): return {"k": 2}\na/f.py:2:def y(): return {"k": 4}\n'
+    folded = search_tree_heading(grep)
+    assert len(folded) < len(grep)
+    assert search_tree_unheading(folded) == grep
+
+
+def test_context_row_prefers_the_longest_anchored_path():
+    # Both prefixes are real files here, so anchoring alone does not settle it;
+    # the longest match explains the whole row instead of leaving
+    # `backup-1-before` as a body under `report.log` at line 2026.
+    rg = (
+        "report.log:1:MATCH one\n"
+        "report.log-2026-backup:2:MATCH two\n"
+        "report.log-2026-backup-1-before\n"
+    )
+    folded = search_tree_heading(rg)
+    assert "\n2026-backup-1-before" not in folded
+    assert folded.rstrip("\n").endswith("1-before")
+    assert search_tree_unheading(folded) == rg
+
+
 def test_a_reference_inside_a_context_body_does_not_hijack_the_parse():
     # The body of a context row quoting `other.py:12:` must not be read as a
     # path — that is what the space guard on the colon tier is for.
