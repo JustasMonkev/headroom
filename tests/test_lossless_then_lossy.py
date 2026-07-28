@@ -17,7 +17,7 @@ from headroom.transforms.content_router import (
     ContentRouterConfig,
     _estimate_tokens,
 )
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import search_unfold
 
 
 def _grep_block() -> str:
@@ -110,7 +110,7 @@ def test_keeps_pure_fold_when_lossy_marginal():
     assert len(calls) == 1  # kompress was attempted...
     assert rc.get("lossless_accept") == 1  # ...but the pure fold won
     assert rc.get("lossless_then_lossy_accept", 0) == 0
-    assert search_unheading(out) == block  # fully recoverable (byte-exact)
+    assert search_unfold(out) == block  # fully recoverable (byte-exact)
 
 
 def test_never_kompresses_diff():
@@ -132,7 +132,7 @@ def test_lossy_after_fold_off_is_pure_fold():
     assert was is True
     assert calls == []  # no lossy pass when lossless-then-lossy is disabled
     assert rc.get("lossless_accept") == 1
-    assert search_unheading(out) == block
+    assert search_unfold(out) == block
 
 
 def test_lossy_after_fold_never_worse_than_pure_fold():
@@ -181,4 +181,4 @@ def test_lossy_after_fold_noop_in_lossless_only_mode():
     out, was, tr, rc = _run(r, block)
     assert was is True
     assert calls == []  # no lossy in lossless-only mode
-    assert search_unheading(out) == block
+    assert search_unfold(out) == block

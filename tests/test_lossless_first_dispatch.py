@@ -10,7 +10,7 @@ stage.
 """
 
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import search_unfold
 
 
 def _grep_block() -> str:
@@ -66,10 +66,28 @@ def test_flag_on_search_folds_lossless_byte_exact():
     assert was is True
     assert tr == ["router:tool_result:lossless_search"]
     assert len(out) < len(block)
-    # word count is flat/higher -> the old word-ratio gate would have rejected it
-    assert len(out.split()) >= len(block.split())
     # fully recoverable
-    assert search_unheading(out) == block
+    assert search_unfold(out) == block
+
+
+def test_flag_on_search_fold_accepted_when_word_count_is_flat():
+    # The regression this guards: acceptance is a BYTE reduction, not a word
+    # reduction. Distinct bodies give the tree fold nothing to collapse beyond
+    # the paths, so word count stays flat/rises while bytes drop — exactly what
+    # the old word-ratio gate rejected.
+    block = (
+        "\n".join(
+            f"src/services/wallet/overdraft/handler_{ln}.py:{ln}:    step_{ln} = resolve(ln_{ln})"
+            for ln in range(1, 40)
+        )
+        + "\n"
+    )
+    out, was, tr = _compress(block, lossless=True)
+    assert was is True
+    assert tr == ["router:tool_result:lossless_search"]
+    assert len(out) < len(block)
+    assert len(out.split()) >= len(block.split())
+    assert search_unfold(out) == block
 
 
 def test_flag_on_search_fold_is_deterministic():
@@ -91,7 +109,7 @@ def test_flag_off_still_keeps_lossless_floor_for_foldable():
     out, was, tr = _compress(block, lossless=False)
     assert was is True
     assert tr == ["router:tool_result:lossless_search"]
-    assert search_unheading(out) == block
+    assert search_unfold(out) == block
 
 
 def test_has_lossless_fold_admits_small_block_below_size_floor():

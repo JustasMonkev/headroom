@@ -22,7 +22,12 @@ from headroom.transforms.content_router import (
     _bash_command_is_search,
     _bash_program,
 )
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import (
+    search_heading,
+    search_tree_unheading,
+    search_unfold,
+    search_unheading,
+)
 
 SEARCH = frozenset({"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"})
 GREP = "".join(
@@ -128,13 +133,13 @@ def test_openai_bash_grep_folds_and_recovers(tokenizer):
     out, transforms = _openai("grep -rn foo .", GREP, tokenizer)
     assert "router:bash:lossless_search" in transforms
     assert len(out) < len(GREP)
-    assert search_unheading(out) == GREP  # byte-exact
+    assert search_tree_unheading(out) == GREP  # byte-exact
 
 
 def test_anthropic_bash_rtk_grep_folds_and_recovers(tokenizer):
     out, transforms = _anthropic("rtk grep foo headroom/", GREP, tokenizer)
     assert "router:bash:lossless_search" in transforms
-    assert search_unheading(out) == GREP
+    assert search_tree_unheading(out) == GREP
 
 
 def test_non_search_bash_command_not_folded(tokenizer):
@@ -242,7 +247,10 @@ def test_search_dir_fold_factors_directory_across_distinct_files() -> None:
     folded = compact_lossless(grep, "search")
     assert len(folded) < len(grep)  # actually shrank (0% before this fold)
     assert "headroom/proxy/" in folded  # directory factored to a header line
-    assert search_dir_unheading(folded) == grep  # exact byte round-trip
+    # The tree fold factors the same directory and also the repeated body, so it
+    # is the candidate that wins here; its inverse is the byte-exact one.
+    assert search_tree_unheading(folded) == grep
+    # The standalone dir fold remains exactly reversible on this shape.
     assert search_dir_unheading(search_dir_heading(grep)) == grep
 
 
@@ -253,13 +261,17 @@ def test_search_dir_fold_roundtrips_mixed_and_passthrough() -> None:
         "src/b/z.py:3:content with a colon: value\nnoslash.py:4:pathless row\n"
     )
     out = compact_lossless(mixed, "search")
-    assert search_dir_unheading(out) == mixed or search_unheading(out) == mixed or out == mixed
+    # Whichever candidate wins, search_unfold finds the inverse that applies.
+    assert search_unfold(out) == mixed or out == mixed
 
 
-def test_search_file_fold_still_wins_for_many_matches_one_file() -> None:
-    # Many matches in ONE file: the file fold is smaller, and compact_lossless
-    # keeps whichever candidate round-trips and is smallest.
+def test_search_file_fold_wins_for_many_matches_one_file() -> None:
+    # Many matches in ONE file: compact_lossless keeps whichever candidate
+    # round-trips and is smallest. The rows here are consecutive, so the tree
+    # fold drops every line number after the first on top of the shared path.
     grep = "\n".join(f"headroom/proxy/server.py:{i}:    line {i}" for i in range(1, 40)) + "\n"
     out = compact_lossless(grep, "search")
     assert len(out) < len(grep)
-    assert search_unheading(out) == grep
+    assert search_tree_unheading(out) == grep
+    # The standalone file fold remains exactly reversible on this shape.
+    assert search_unheading(search_heading(grep)) == grep

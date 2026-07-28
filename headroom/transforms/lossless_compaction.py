@@ -27,6 +27,9 @@ __all__ = [
     "search_unheading",
     "search_dir_heading",
     "search_dir_unheading",
+    "search_tree_heading",
+    "search_tree_unheading",
+    "search_unfold",
     "diff_strip_index",
     "compact_lossless",
 ]
@@ -353,6 +356,311 @@ def search_dir_unheading(text: str) -> str:
     return _join(out, had_trailing)
 
 
+# ── search_tree_heading: dir + file + line folding in one pass ─────────────
+#
+# `search_heading` factors a repeated FILE, `search_dir_heading` factors a
+# repeated DIRECTORY, and `compact_lossless` picks whichever is smaller — so a
+# result set that repeats BOTH (the normal `grep -rn` shape: several matches in
+# each of several files under a shared directory) only ever gets one of the two
+# savings. This fold composes them and adds two more axes that neither covers:
+# consecutive line numbers, and a body repeated on several lines of one file.
+
+# A tree-fold data row. Either an explicit line-number list
+# (``12:body`` / ``12,40,73:body``) or an *increment* row (``:body``) meaning
+# "previous line number + 1". The separator is ``:`` for grep match rows and
+# ``-`` for ripgrep context rows (``-C``/``-A``/``-B``).
+_TREE_NUMS_RE = re.compile(r"^(?P<nums>\d+(?:,\d+)*)(?P<sep>[:-])(?P<content>.*)$")
+_TREE_INC_RE = re.compile(r"^(?P<sep>[:-])(?P<content>.*)$")
+# ripgrep's between-groups separator. It is also a syntactically valid
+# increment row (``-`` separator, body ``-``), so both directions special-case
+# it: the fold never emits it as an increment, the unfold never reads it as one.
+_RG_GROUP_SEP = "--"
+
+
+def _tree_split_row(line: str) -> tuple[str, str, str, str] | None:
+    """Split a grep/ripgrep row into ``(path, sep, line_digits, content)``.
+
+    Handles both row shapes ripgrep emits — ``path:line:content`` for matches
+    and ``path-line-content`` for ``-C`` context — and requires the two
+    separators to agree, since a row never mixes them.
+
+    The colon shape is tried first and, because a path essentially never
+    contains ``:``, its leftmost marker is the right one. Only if that fails do
+    we look for a dash marker, where the leftmost is *not* reliable (real paths
+    hold dashes: ``logs/2026-05-03/app.log``). A misread there is not a
+    correctness problem the way it is for the lossy compressor — the digits are
+    carried through as the original *text*, so ``compact_lossless``'s round-trip
+    check still reproduces the row byte-for-byte — but it does cost savings, so
+    the dash scan skips markers whose left side has no extension and whose right
+    side still carries path structure.
+
+    Returns ``None`` for any line that isn't a data row.
+    """
+    for sep in (":", "-"):
+        start = 0
+        # Skip a Windows drive colon (``C:\Users\...``) so it is never mistaken
+        # for the line-number marker.
+        if (
+            sep == ":"
+            and len(line) >= 3
+            and line[0].isalpha()
+            and line[1] == ":"
+            and line[2] in "\\/"
+        ):
+            start = 2
+        pos = line.find(sep, start)
+        while pos != -1:
+            end = pos + 1
+            while end < len(line) and line[end].isdigit():
+                end += 1
+            if end > pos + 1 and end < len(line) and line[end] == sep:
+                path = line[:pos]
+                if path and (sep == "-" or " " not in path):
+                    if sep == ":" or not _tree_dash_continues(path, line[end + 1 :]):
+                        return path, sep, line[pos + 1 : end], line[end + 1 :]
+            pos = line.find(sep, pos + 1)
+    return None
+
+
+def _tree_dash_continues(path: str, rest: str) -> bool:
+    """True when a dash marker looks like it sits *inside* the path.
+
+    Positive evidence only: the path so far has no extension on its last
+    segment (``logs/2026``) and the text after the marker still carries path
+    structure (a ``/`` or an extension dot) before the first space. Absent that
+    evidence the caller stops at this marker, which is what the plain
+    leftmost-wins rule would do anyway.
+    """
+    tail = path.rsplit("/", 1)[-1]
+    if "." in tail:
+        return False
+    token = rest.split(" ", 1)[0]
+    return "/" in token or "." in token
+
+
+def _tree_is_data_row(line: str) -> bool:
+    return line != _RG_GROUP_SEP and bool(_TREE_NUMS_RE.match(line) or _TREE_INC_RE.match(line))
+
+
+def search_tree_heading(text: str) -> str:
+    """Fold grep/ripgrep rows along all four repeating axes at once.
+
+    Output grammar (each line is one of)::
+
+        <dir>/                      directory header, emitted on directory change
+        <base>                      file header, emitted on file change
+        <n>:<content>               data row
+        <n1>,<n2>,<n3>:<content>    one body that matched on several lines
+        :<content>                  data row at previous line + 1
+
+    ``-`` replaces ``:`` on ripgrep context rows, exactly as in the input. Rows
+    that don't parse pass through untouched and end the current grouping.
+
+    The line-list form reorders a file's rows (all lines sharing a body move to
+    the body's first position), so :func:`search_tree_unheading` re-sorts each
+    file block it merged — which reproduces the input exactly because grep emits
+    a file's rows in ascending line order. ``compact_lossless`` verifies that
+    round-trip and drops the fold if it doesn't hold.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+
+    out: list[str] = []
+    # Mirrors the inverse's state: "" means no directory header is in effect.
+    current_dir = ""
+    i = 0
+    n = len(lines)
+    while i < n:
+        row = _tree_split_row(lines[i])
+        if row is None:
+            out.append(lines[i])
+            current_dir = ""
+            i += 1
+            continue
+
+        # Collect the contiguous block of rows belonging to this one file.
+        path = row[0]
+        block: list[tuple[str, str, str, str]] = []
+        while i < n:
+            nxt = _tree_split_row(lines[i])
+            if nxt is None or nxt[0] != path:
+                break
+            block.append(nxt)
+            i += 1
+
+        cut = path.rfind("/") + 1
+        dir_part, base = path[:cut], path[cut:]
+        # Three shapes can't be headed, and all three are decided BEFORE any
+        # header is written — a dir header emitted above an unfoldable block
+        # would be consumed by the inverse and never re-emitted:
+        #   * no basename (``src/:1:x``) — the header line would be empty;
+        #   * a basename that itself parses as a data row
+        #     (``20240101-002-add_users.sql``) — the inverse would read the
+        #     header as content;
+        #   * a path with no directory while a directory header is still in
+        #     effect — there is no way to spell "back to no directory", so the
+        #     inverse would keep prefixing the stale one.
+        if not base or _tree_is_data_row(base) or (not dir_part and current_dir):
+            out.extend(f"{p}{s}{d}{s}{c}" for p, s, d, c in block)
+            current_dir = ""
+            continue
+        if dir_part != current_dir:
+            out.append(dir_part)
+            current_dir = dir_part
+        out.append(base)
+        out.extend(_tree_render_block(block))
+
+    return _join(out, had_trailing)
+
+
+def _tree_render_block(block: list[tuple[str, str, str, str]]) -> list[str]:
+    """Render one file's rows: merge duplicate bodies, elide consecutive lines."""
+    # Merging moves every line sharing a body up to that body's first position,
+    # and the inverse undoes it by re-sorting the block — which only reproduces
+    # the input if the block was in ascending line order to begin with. grep
+    # always emits it that way; when something upstream hasn't, skip merging for
+    # this block rather than hand ``compact_lossless`` a fold that fails
+    # verification and costs the *whole* payload its savings.
+    numbers = [int(digits) for _p, _s, digits, _c in block]
+    mergeable = all(a <= b for a, b in zip(numbers, numbers[1:]))
+
+    # Group by (separator, body) in first-appearance order. A zero-padded line
+    # number gets a private, unmergeable key: the merge form re-sorts through
+    # ``int`` on the way back, and the elision form regenerates the number from
+    # a count — both would drop the padding.
+    groups: dict[object, list[str]] = {}
+    fields: dict[object, tuple[str, str]] = {}
+    order: list[object] = []
+    for index, (_path, sep, digits, content) in enumerate(block):
+        padded = digits != str(int(digits))
+        key: object = ("pad", index) if padded or not mergeable else ("body", sep, content)
+        if key not in groups:
+            groups[key] = []
+            fields[key] = (sep, content)
+            order.append(key)
+        groups[key].append(digits)
+
+    rendered: list[str] = []
+    previous: int | None = None
+    for key in order:
+        nums = groups[key]
+        sep, content = fields[key]
+        padded = nums[0] != str(int(nums[0]))
+        if not padded and len(nums) == 1 and previous is not None and int(nums[0]) == previous + 1:
+            row = f"{sep}{content}"
+            if row == _RG_GROUP_SEP:
+                row = f"{nums[0]}{sep}{content}"
+            rendered.append(row)
+        else:
+            rendered.append(f"{','.join(nums)}{sep}{content}")
+        previous = int(nums[-1])
+    return rendered
+
+
+def search_tree_unheading(text: str) -> str:
+    """Exact inverse of :func:`search_tree_heading`.
+
+    A line ending in ``/`` followed by a non-data line is a directory header; a
+    non-data line with no ``/`` followed by a data row is a file header. Both
+    are consumed rather than emitted, and their text re-prefixes the data rows
+    beneath. A file block that contained a merged line list is re-sorted by line
+    number on the way out; blocks with nothing merged keep their emitted order.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+
+    out: list[str] = []
+    current_dir = ""
+    current_file: str | None = None
+    previous: int | None = None
+    pending: list[tuple[int, str, str, str]] = []
+    merged = False
+
+    def flush() -> None:
+        nonlocal pending, merged
+        if not pending:
+            return
+        rows = sorted(pending, key=lambda r: r[0]) if merged else pending
+        out.extend(f"{current_dir}{current_file}{s}{d}{s}{c}" for _, s, d, c in rows)
+        pending = []
+        merged = False
+
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        if current_file is not None and line != _RG_GROUP_SEP:
+            m = _TREE_NUMS_RE.match(line)
+            if m:
+                digits = m.group("nums").split(",")
+                if len(digits) > 1:
+                    merged = True
+                for d in digits:
+                    pending.append((int(d), m.group("sep"), d, m.group("content")))
+                previous = int(digits[-1])
+                i += 1
+                continue
+            m = _TREE_INC_RE.match(line)
+            if m and previous is not None:
+                previous += 1
+                pending.append((previous, m.group("sep"), str(previous), m.group("content")))
+                i += 1
+                continue
+
+        flush()
+        if line.endswith("/") and i + 1 < n and not _tree_is_data_row(lines[i + 1]):
+            current_dir = line
+            current_file = None
+            previous = None
+            i += 1
+            continue
+        if (
+            line
+            and "/" not in line
+            and not _tree_is_data_row(line)
+            and i + 1 < n
+            and _tree_is_data_row(lines[i + 1])
+        ):
+            current_file = line
+            previous = None
+            i += 1
+            continue
+        current_dir = ""
+        current_file = None
+        previous = None
+        out.append(line)
+        i += 1
+
+    flush()
+    return _join(out, had_trailing)
+
+
+def search_unfold(text: str) -> str:
+    """Expand any ``kind="search"`` fold back to the original grep output.
+
+    ``compact_lossless`` picks whichever of the search folds is smallest for a
+    given payload, so a caller holding a folded blob cannot know which inverse
+    applies. This tries each one and accepts the first whose expansion *re-folds*
+    to exactly the input — the same self-check ``compact_lossless`` runs, in the
+    other direction. Text that isn't a fold (or that no inverse claims) is
+    returned unchanged, so this is safe to call on arbitrary content.
+    """
+    for fold, unfold in (
+        (search_tree_heading, search_tree_unheading),
+        (search_heading, search_unheading),
+        (search_dir_heading, search_dir_unheading),
+    ):
+        try:
+            expanded = unfold(text)
+        except Exception:
+            continue
+        if expanded != text and fold(expanded) == text:
+            return expanded
+    return text
+
+
 def diff_strip_index(text: str) -> str:
     """Drop ``index <sha>..<sha>`` lines from a unified diff (still applies)."""
     lines, had_trailing = _split_keep_trailing(text)
@@ -457,16 +765,27 @@ def compact_lossless(content: str, kind: str) -> str:
             return candidate if _smaller(candidate, content) else content
 
         if kind == "search":
-            # Two independent folds; keep the smaller that round-trips exactly.
-            # search_heading factors a repeated FILE (many matches in one file);
-            # search_dir_heading factors a repeated DIRECTORY (one match each
-            # across many files in a dir — the grep -rn case the file fold misses).
+            # Three independent folds; keep the smallest that round-trips
+            # exactly. search_heading factors a repeated FILE (many matches in
+            # one file); search_dir_heading factors a repeated DIRECTORY (one
+            # match each across many files in a dir — the grep -rn case the file
+            # fold misses); search_tree_heading factors both at once and also
+            # folds consecutive line numbers and repeated bodies, so it wins on
+            # most real result sets. The first two stay as candidates because
+            # they are strictly more permissive about what counts as a data row,
+            # and so still round-trip on inputs the tree fold declines.
             best = content
-            for candidate, inverse in (
-                (search_heading(content), search_unheading),
-                (search_dir_heading(content), search_dir_unheading),
+            for fold, inverse in (
+                (search_tree_heading, search_tree_unheading),
+                (search_heading, search_unheading),
+                (search_dir_heading, search_dir_unheading),
             ):
-                if inverse(candidate) == content and _smaller(candidate, best):
+                # Size first: verifying costs about as much as folding, and a
+                # candidate that isn't smaller than the incumbent can't win no
+                # matter how it verifies. The tree fold leads because it is the
+                # one that usually wins, which makes the other two cheap.
+                candidate = fold(content)
+                if _smaller(candidate, best) and inverse(candidate) == content:
                     best = candidate
             return best
 

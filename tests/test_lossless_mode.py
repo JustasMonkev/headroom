@@ -22,6 +22,7 @@ from headroom.transforms.lossless_compaction import (
     expand_runs,
     is_run_collapsed,
     search_heading,
+    search_unfold,
     search_unheading,
     strip_ansi,
 )
@@ -188,7 +189,7 @@ def test_compact_lossless_search() -> None:
     grep = "\n".join(f"pkg/mod.py:{i}:code{i}" for i in range(1, 20)) + "\n"
     out = compact_lossless(grep, "search")
     assert len(out) < len(grep)
-    assert search_unheading(out) == grep
+    assert search_unfold(out) == grep
 
 
 def test_compact_lossless_unknown_kind_passthrough() -> None:
@@ -262,7 +263,7 @@ def test_router_lossless_search_no_marker_and_recoverable() -> None:
     _assert_no_marker(out)
     # identifiers still present / recoverable
     if result.strategy_used == CompressionStrategy.SEARCH:
-        assert search_unheading(out) == grep
+        assert search_unfold(out) == grep
     # at minimum, no data lost and no marker
     for i in (1, 30, 59):
         assert f"identifier_{i}" in out
@@ -311,7 +312,7 @@ def test_router_apply_accepts_lossless_search_token_measured() -> None:
     ]
     out = router.apply(messages, tok).messages[1]["content"]
     assert tok.count_text(out) < tok.count_text(grep)  # accepted: fewer TOKENS
-    assert search_unheading(out) == grep  # byte-exact recovery
+    assert search_unfold(out) == grep  # byte-exact recovery
     _assert_no_marker(out)
 
 
