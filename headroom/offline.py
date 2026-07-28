@@ -60,9 +60,9 @@ def apply_offline_env() -> None:
     """Force HuggingFace/Transformers offline so model code uses only locally
     cached artifacts and never reaches the Hub.
 
-    Idempotent and uses ``setdefault`` so an explicit operator override (e.g.
-    ``HF_HUB_OFFLINE=0``) still wins. Call once early in startup.
+    Idempotent and deliberately overrides conflicting online values: the
+    master offline switch must fail closed. Call once early in startup.
     """
     if is_offline():
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"

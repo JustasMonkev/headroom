@@ -100,6 +100,18 @@ class TestAuxiliaryEgressIsGated:
         assert os.environ.get("HF_HUB_OFFLINE") == "1"
         assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
 
+    def test_offline_overrides_conflicting_huggingface_online_values(self, monkeypatch):
+        import os
+
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+        monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+
+        apply_offline_env()
+
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
     def test_license_reporter_is_gated(self):
         """The UsageReporter phone-home is constructed only when not offline.
 

@@ -120,17 +120,23 @@ class _DaemonBoundedExecutor:
             future, fn, args, kwargs = self._queue.get()
             with self._worker_lock:
                 self._idle_workers -= 1
+            # A submitter can race between queue.get() and the idle decrement.
+            # Re-check after becoming busy so any work it left queued gets the
+            # additional worker capacity it needs.
+            self._ensure_workers_for_pending()
             try:
-                if not future.set_running_or_notify_cancel():
-                    continue
-                try:
-                    future.set_result(fn(*args, **kwargs))
-                except BaseException as exc:  # noqa: BLE001 - Future transports worker errors
-                    future.set_exception(exc)
+                if future.set_running_or_notify_cancel():
+                    try:
+                        future.set_result(fn(*args, **kwargs))
+                    except BaseException as exc:  # noqa: BLE001 - Future transports worker errors
+                        future.set_exception(exc)
             finally:
                 self._queue.task_done()
                 with self._worker_lock:
                     self._idle_workers += 1
+            # Do not retain the Future, callable, arguments, or result payload
+            # in this idle thread's frame while it blocks for the next job.
+            del future, fn, args, kwargs
 
     def _ensure_workers_for_pending(self) -> None:
         """Start only enough daemon workers for currently queued work."""

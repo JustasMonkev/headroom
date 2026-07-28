@@ -15,8 +15,10 @@ These tests pin the multi-block shape on both branches.
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -27,6 +29,7 @@ from headroom.transforms.content_router import (
     ContentRouterConfig,
     RouterCompressionResult,
     RoutingDecision,
+    _DaemonBoundedExecutor,
 )
 
 
@@ -318,6 +321,51 @@ def test_large_worker_setting_starts_only_workers_needed_for_one_block(monkeypat
     assert result.messages[1]["content"] == "compressed output"
     assert executor is not None
     assert len(executor._threads) == 1
+
+
+def test_idle_worker_releases_completed_payload_references():
+    """An idle worker must not pin the prior request's content in its frame."""
+
+    class _Payload:
+        pass
+
+    executor = _DaemonBoundedExecutor(max_workers=1, max_pending=1)
+    payload = _Payload()
+    payload_ref = weakref.ref(payload)
+    future = executor.submit(lambda _payload: None, payload, block=False)
+    assert future is not None
+    future.result(timeout=1.0)
+
+    del future, payload
+    deadline = time.monotonic() + 1.0
+    while payload_ref() is not None and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.01)
+
+    assert payload_ref() is None
+
+
+def test_lazy_executor_expands_for_concurrent_pending_work():
+    """A busy first worker must not leave the second task queued behind it."""
+    executor = _DaemonBoundedExecutor(max_workers=2, max_pending=2)
+    release = threading.Event()
+    first_started = threading.Event()
+    second_started = threading.Event()
+
+    def block(started: threading.Event):
+        started.set()
+        release.wait(timeout=2.0)
+
+    first = executor.submit(block, first_started, block=False)
+    assert first is not None
+    assert first_started.wait(timeout=1.0)
+    second = executor.submit(block, second_started, block=False)
+    assert second is not None
+    try:
+        assert second_started.wait(timeout=1.0)
+        assert len(executor._threads) == 2
+    finally:
+        release.set()
 
 
 def test_burst_larger_than_queue_drains_in_waves(monkeypatch):
