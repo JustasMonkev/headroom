@@ -22,6 +22,26 @@ def test_row_file_is_none_for_a_context_row():
     assert _row_file("src/app.py-40-before") is None
 
 
+def test_row_file_is_none_for_a_context_row_whose_body_holds_a_colon():
+    # Splitting on the first ':' alone yields `src/partial.py-11-type`, a file
+    # that does not exist, and the caller then backtracks over that one row and
+    # stops — leaving the rest of the file in the corpus.
+    assert _row_file("src/partial.py-11-type: value") is None
+    assert _row_file("src/app.py-40-    d = {'k': 12}") is None
+
+
+def test_trim_does_not_cut_inside_a_file_ending_in_a_colon_bodied_context_row():
+    rows = [f"src/keep.py:{n}:body" for n in range(1, 4)] + [
+        "src/partial.py:9:MATCH",
+        "src/partial.py-10-plain",
+        "src/partial.py-11-type: value",
+        "src/partial.py-12-more",
+    ]
+    cut = _trim_to_file_boundary(rows, 6)  # lands on the colon-bodied row
+    assert not any(r.startswith("src/partial.py") for r in rows[:cut])
+    assert rows[:cut] == rows[:3]
+
+
 def test_trim_only_drops_the_partial_file_at_the_cut():
     rows = (
         [f"crates/headroom-core/src/a.rs:{n}:body" for n in range(1, 6)]

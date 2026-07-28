@@ -24,6 +24,7 @@ it is counted.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,10 @@ QUERIES: list[tuple[str, str, list[str]]] = [
 SEARCH_ROOTS = ["headroom", "crates"]
 MAX_ROWS = 4000
 
+# A grep match row: ``path:<digits>:content``. The digit run is what separates
+# it from a context row whose body merely contains a colon.
+_MATCH_ROW_RE = re.compile(r"^(?P<path>[^:]*):[0-9]+:")
+
 
 def collect(pattern: str, flags: list[str]) -> str:
     """Run ripgrep and return at most ``MAX_ROWS`` rows, cut at a file boundary.
@@ -81,28 +86,37 @@ def collect(pattern: str, flags: list[str]) -> str:
 
 
 def _row_file(row: str) -> str | None:
-    """The file a row belongs to, or ``None`` for a context row.
+    """The file a match row belongs to, or ``None`` for anything else.
 
     Splitting on ``-`` here would be a bug, not a shortcut: it turns
     ``crates/headroom-core/src/x.rs`` into ``crates/headroom``, and the caller's
     backtrack would then discard every row under that whole prefix instead of
     the one partial file at the cut — hundreds of rows on the ``error`` corpus,
-    silently changing what the benchmark measures. A path cannot contain ``:``,
-    so the first one delimits the complete path. Context rows (``path-N-body``)
-    have no colon and return ``None``; they belong to whichever file surrounds
-    them, so the caller pulls them along.
+    silently changing what the benchmark measures.
+
+    Splitting on the first ``:`` alone is not enough either: a context row whose
+    *body* holds a colon (``src/partial.py-11-type: value``) then yields
+    ``src/partial.py-11-type``, a file that does not exist, and the caller
+    backtracks over that one row and stops — leaving the rest of
+    ``src/partial.py`` in the corpus, which is the cut-inside-a-file case this
+    whole helper exists to prevent.
+
+    So the row has to actually be a match row: ``path:<digits>:``. A path cannot
+    contain ``:``, so the first one delimits the complete path. Context rows
+    (``path-N-body``) return ``None``; they belong to whichever file surrounds
+    them, and the caller attributes them by prefix.
     """
-    head = row.split(":", 1)[0]
-    return None if head == row else head
+    m = _MATCH_ROW_RE.match(row)
+    return m.group("path") if m else None
 
 
 def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
     """Back ``cut`` up so it lands between files, never inside one.
 
-    Context rows carry no colon, so they are attributed by path prefix rather
-    than by "the nearest colon row" — treating every context row as part of the
-    file being dropped would also swallow the *previous* file's trailing
-    context. A leading context row whose match row fell outside the cut can
+    Context rows are attributed by path prefix rather than by "the nearest
+    match row" — treating every context row as part of the file being dropped
+    would also swallow the *previous* file's trailing context. A leading
+    context row whose match row fell outside the cut can
     still survive as an orphan; the fold leaves such a row as passthrough, so it
     costs a row of corpus, not a skewed ratio.
     """
