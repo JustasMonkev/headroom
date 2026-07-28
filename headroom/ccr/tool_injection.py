@@ -192,8 +192,14 @@ class CCRToolInjector:
             re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
-            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
+            # Generic fallback: any bracket compression marker with hash
+            # (exactly 24 chars). The gaps exclude brackets and newlines
+            # rather than using `.*?`: markers never contain nested brackets,
+            # and the lazy-dot form restarted a forward scan at every `[` —
+            # quadratic on bracket-dense content, measured at 12.8s for a
+            # single 181KB minified-JSON tool result with no marker at all
+            # (this scanner runs on every message of every request).
+            re.compile(r"\[[^\[\]\n]*compressed[^\[\]\n]*hash=([a-f0-9]{24})\]", re.IGNORECASE),
             # SmartCrusher markers: the row-drop summary
             # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
             # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
