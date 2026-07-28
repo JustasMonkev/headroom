@@ -73,6 +73,31 @@ def _add_kompress_must_keep_words(
             kept_ids.add(word_idx + chunk_start)
 
 
+def _keep_tokenizer_truncated_tail(
+    kept_ids: set[int],
+    word_ids: list[int | None],
+    chunk_len: int,
+    chunk_start: int,
+) -> None:
+    """Keep verbatim any chunk words the tokenizer truncated away.
+
+    Chunks are sized in *words* (chunk_words=350) but the model input is capped
+    at 512 *sub-word* tokens with ``truncation=True``. Text averaging >~1.45
+    sub-words per word (Russian, Japanese, Greek — any non-Latin script) blows
+    that cap, and truncated words never appear in ``word_ids``, so they could
+    never enter ``kept_ids``: they were silently deleted from the output, not
+    compressed. Same hazard the batch path documents for whole chunks that
+    never ran ("compressing from partial chunk coverage would silently drop
+    the words of the chunks that never ran") — this is the within-chunk case.
+    """
+    max_covered = -1
+    for wid in word_ids:
+        if wid is not None and wid > max_covered:
+            max_covered = wid
+    if max_covered < chunk_len - 1:
+        kept_ids.update(range(chunk_start + max_covered + 1, chunk_start + chunk_len))
+
+
 # ONNX artifacts are resolved against the model repo in this order, falling
 # through on download miss OR session-load failure:
 #
@@ -1413,6 +1438,10 @@ class KompressCompressor(Transform):
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
 
+                # Words past the 512-sub-word-token cap got no score/mask at
+                # all — keep them verbatim instead of silently deleting them.
+                _keep_tokenizer_truncated_tail(kept_ids, word_ids, len(chunk_words), chunk_start)
+
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
@@ -1737,6 +1766,10 @@ class KompressCompressor(Transform):
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
                 for batch_idx, (text_idx, chunk_start, chunk_words, ratio) in enumerate(batch):
+                    if text_idx not in kept_ids_per_text:
+                        # Text already passed through whole (earlier batch
+                        # failed); scoring more of its chunks is wasted work.
+                        continue
                     word_ids = encoding.word_ids(batch_index=batch_idx)
                     score_list = scores[batch_idx] if is_onnx else scores[batch_idx].cpu()
 
@@ -1748,6 +1781,13 @@ class KompressCompressor(Transform):
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:
                             word_scores[wid] = s
+
+                    # Words past the 512-sub-word-token cap got no score at
+                    # all — keep them verbatim instead of silently deleting
+                    # them (see _keep_tokenizer_truncated_tail).
+                    _keep_tokenizer_truncated_tail(
+                        kept_ids_per_text[text_idx], word_ids, len(chunk_words), chunk_start
+                    )
 
                     if not word_scores:
                         continue
