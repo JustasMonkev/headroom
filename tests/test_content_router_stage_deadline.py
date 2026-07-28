@@ -386,3 +386,48 @@ def test_deadline_cancels_queued_compression_work(monkeypatch):
 
     with lock:
         assert len(started) == 2, "cancelled queued compression ran after the deadline"
+
+
+def test_inline_deadline_cancels_work_waiting_in_shared_queue(monkeypatch):
+    """A one-block request must remove its timed-out queued future."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "2")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "30")
+    release = threading.Event()
+    blockers_started = threading.Event()
+    lock = threading.Lock()
+    active_blockers = 0
+
+    def blocker():
+        nonlocal active_blockers
+        with lock:
+            active_blockers += 1
+            if active_blockers == 2:
+                blockers_started.set()
+        release.wait(timeout=2.0)
+
+    executor = router._get_stage_compression_executor(2)
+    assert executor.submit(blocker, block=False) is not None
+    assert executor.submit(blocker, block=False) is not None
+    assert blockers_started.wait(timeout=1.0)
+
+    compression_calls: list[str] = []
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, *, context="", bias=1.0: (
+            compression_calls.append(content) or _compression_result(content, "compressed output")
+        ),
+    )
+    try:
+        original = _messages(pending=1)
+        result = _apply(router, original)
+        assert result.messages[1]["content"] == original[1]["content"]
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 1.0
+    while executor._queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert compression_calls == []

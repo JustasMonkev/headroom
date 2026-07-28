@@ -50,6 +50,7 @@ from threading import Lock
 
 import httpx
 
+from headroom.offline import is_offline
 from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
@@ -445,6 +446,9 @@ def _build_usage_headers(request_headers: dict[str, str]) -> dict[str, str] | No
 async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
     state = get_codex_rate_limit_state()
     try:
+        # The mode can change after scheduling but before this task runs.
+        if is_offline():
+            return
         async with httpx.AsyncClient(timeout=_USAGE_POLL_TIMEOUT_S) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code == 200:
@@ -472,6 +476,8 @@ def maybe_schedule_usage_poll(
     :func:`_build_usage_headers` and internally throttled to at most one live
     poll per ``min_interval_s``. Returns ``True`` when a poll was scheduled.
     """
+    if is_offline():
+        return False
     headers = _build_usage_headers(request_headers)
     if headers is None:
         return False

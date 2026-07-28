@@ -5122,6 +5122,13 @@ class ContentRouter(Transform):
                                 "the compression stage budget; failing open via PASSTHROUGH",
                                 deadline_s,
                             )
+                            # If this call was waiting in the shared queue,
+                            # remove it now; its request can no longer use the
+                            # output. A callable already running cannot be
+                            # cancelled and remains bounded by the worker pool.
+                            self._get_stage_compression_executor(configured_workers).cancel_pending(
+                                [future]
+                            )
                             r = _stage_passthrough(task_content)
                             compress_ms = (time.perf_counter() - t0) * 1000
                             transient_fallback_slots.add(slot_idx)

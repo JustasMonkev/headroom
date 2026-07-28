@@ -35,6 +35,8 @@ AUXILIARY_EGRESS_MODULES = (
     "headroom/proxy/server.py",  # license / usage reporter + HF env
     "headroom/offline.py",  # apply_offline_env -> HF_HUB_OFFLINE
     "headroom/subscription/tracker.py",  # Anthropic subscription polling
+    "headroom/subscription/copilot_quota.py",  # GitHub Copilot quota polling
+    "headroom/subscription/codex_rate_limits.py",  # ChatGPT/Codex usage polling
 )
 
 # Provider forwarding paths. These are NOT gated by HEADROOM_OFFLINE: a request
@@ -215,3 +217,13 @@ class TestDocsMatchBehavior:
     def test_offline_module_documents_the_carve_out(self):
         source = _read("headroom/offline.py")
         assert "does not block provider egress" in source.lower()
+
+    def test_offline_module_inventory_includes_all_quota_pollers(self):
+        source = _read("headroom/offline.py")
+        assert "Seven auxiliary-egress categories" in source
+        for module in (
+            "headroom.subscription.tracker",
+            "headroom.subscription.copilot_quota",
+            "headroom.subscription.codex_rate_limits.maybe_schedule_usage_poll",
+        ):
+            assert module in source

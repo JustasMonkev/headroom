@@ -2,16 +2,20 @@
 
 A single predicate the *auxiliary* egress paths consult so a regulated or
 air-gapped deployment can disable Headroom's own outbound network access with
-one flag. Exactly four call sites honour it today:
+one flag. Seven auxiliary-egress categories honour it today:
 
 * ``headroom.telemetry.beacon.is_telemetry_enabled`` — telemetry beacon
 * ``headroom.update_check.is_update_check_enabled`` — release/update check
 * ``headroom.proxy.server`` (``UsageReporter`` construction) — license /
   usage phone-home
+* ``headroom.subscription.tracker`` — Anthropic subscription polling
+* ``headroom.subscription.copilot_quota`` — GitHub Copilot quota polling
+* ``headroom.subscription.codex_rate_limits.maybe_schedule_usage_poll`` —
+  ChatGPT/Codex usage polling
 * ``apply_offline_env`` below — HuggingFace / Transformers model downloads
 
-Each of those already had its own opt-out; this is the one switch that turns
-them all off together and fails closed.
+This master switch overrides any path-specific eligibility or opt-out controls,
+turns every category off together, and fails closed.
 
 **What this switch does NOT do.** It does not block provider egress. The proxy
 forwards requests to whatever upstream is configured (Anthropic, OpenAI, Qwen,
@@ -44,8 +48,9 @@ OFFLINE_ENV = "HEADROOM_OFFLINE"
 def is_offline() -> bool:
     """Return True when ``HEADROOM_OFFLINE`` disables Headroom's auxiliary egress.
 
-    Gates telemetry, the update check, license reporting, and model downloads.
-    It does **not** gate provider forwarding — see the module docstring.
+    Gates telemetry, update/license checks, quota/subscription polling, and
+    model downloads. It does **not** gate provider forwarding — see the module
+    docstring.
     """
     return os.environ.get(OFFLINE_ENV, "").strip().lower() in _TRUE_VALUES
 
