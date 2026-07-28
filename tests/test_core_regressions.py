@@ -87,6 +87,22 @@ class TestCompressFailOpen:
         # Fail-open must return the PRE-hook content, not the mangled alias.
         assert result.messages == [{"role": "user", "content": "keep me"}]
 
+    def test_fail_open_survives_non_deepcopyable_messages(self) -> None:
+        import threading
+
+        from headroom.compress import compress
+        from headroom.hooks import CompressionHooks
+
+        class FailingHooks(CompressionHooks):
+            def compute_biases(self, messages, ctx):  # type: ignore[override]
+                raise RuntimeError("hook exploded")
+
+        # A lock is not deepcopyable; the snapshot must degrade to aliasing
+        # instead of raising before the fail-open boundary.
+        messages = [{"role": "user", "content": "keep me", "_handle": threading.Lock()}]
+        result = compress(messages, model="gpt-4o", hooks=FailingHooks())
+        assert result.messages is messages
+
 
 class TestSimpleCompressTinyTarget:
     def test_never_grows_input(self) -> None:

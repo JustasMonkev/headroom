@@ -238,7 +238,16 @@ def compress(
     # anyway. Only paid when third-party code (hooks / extensions) actually
     # gets a mutable reference — the plain path never mutates the input.
     if hooks is not None or pipeline_extensions.enabled:
-        original_messages = copy.deepcopy(messages)
+        try:
+            original_messages = copy.deepcopy(messages)
+        except Exception:
+            # Messages can carry non-deepcopyable payloads (locks, open file
+            # handles, provider objects with a raising __deepcopy__). The
+            # snapshot is best-effort hardening — it must never itself abort
+            # the request, so fall back to aliasing: fail-open then can't
+            # undo an in-place hook mutation, but it still returns the
+            # caller's list.
+            original_messages = messages
     else:
         original_messages = messages
 

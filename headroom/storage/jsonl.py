@@ -5,7 +5,7 @@ from __future__ import annotations
 import heapq
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +115,13 @@ class JSONLStorage(Storage):
         if page_end <= 0:
             return []
 
+        def _key_ts(ts: datetime) -> datetime:
+            # A long-lived file can mix naive and timezone-aware timestamps
+            # (parse_timestamp keeps a "+00:00" offset but strips "Z"), and
+            # comparing the two raises TypeError. Order everything as UTC,
+            # treating naive as UTC — the convention format_timestamp writes.
+            return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
         def _matches() -> Any:
             for idx, metrics in enumerate(self.iter_all()):
                 if start_time is not None and metrics.timestamp < start_time:
@@ -127,7 +134,7 @@ class JSONLStorage(Storage):
                     continue
                 # Tie-break equal timestamps by earlier file position first,
                 # matching the previous stable descending sort.
-                yield (metrics.timestamp, -idx), metrics
+                yield (_key_ts(metrics.timestamp), -idx), metrics
 
         newest = heapq.nlargest(page_end, _matches(), key=lambda pair: pair[0])
         return [metrics for _, metrics in newest[offset:]]

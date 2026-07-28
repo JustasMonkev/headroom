@@ -316,3 +316,20 @@ def test_jsonl_paging_matches_sqlite_and_stays_bounded(tmp_path: Path) -> None:
 
     assert jsonl.query(limit=0) == []
     sqlite.close()
+
+
+def test_jsonl_query_handles_mixed_timestamp_awareness(tmp_path: Path) -> None:
+    """parse_timestamp keeps a '+00:00' offset but strips 'Z', so a long-lived
+    file can mix naive and aware timestamps; ordering must not raise
+    TypeError and must treat naive as UTC."""
+    from datetime import timezone
+
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    naive = _metrics("naive", datetime(2026, 4, 23, 12, 0, 0))
+    aware = _metrics("aware", datetime(2026, 4, 23, 13, 0, 0, tzinfo=timezone.utc))
+    storage.save(naive)
+    storage.save(aware)
+
+    results = storage.query(limit=10)
+    assert [m.request_id for m in results] == ["aware", "naive"]
+    assert [m.request_id for m in storage.query(limit=1)] == ["aware"]
