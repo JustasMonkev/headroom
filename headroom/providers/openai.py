@@ -549,6 +549,15 @@ class OpenAIProvider(Provider):
         # warning and skew compression. Configuring the alias via
         # HEADROOM_MODEL_LIMITS / ~/.headroom/models.json makes it authoritative
         # here, before the dynamic LiteLLM lookup. Fail-soft, no network.
+        # Layers before the merged table: a merged exact entry may come from a
+        # lower-priority source (or the built-ins) and must not bypass a
+        # higher-priority family override.
+        for layer in self._custom_limit_layers:
+            if model in layer:
+                return layer[model]
+            layer_prefix = _longest_prefix_match(model, layer)
+            if layer_prefix is not None:
+                return layer[layer_prefix]
         if model in self._context_limits:
             return self._context_limits[model]
 
@@ -569,17 +578,20 @@ class OpenAIProvider(Provider):
 
     def _get_context_limit_manual(self, model: str) -> int:
         """Get context limit using hardcoded values (fallback)."""
-        if model in self._context_limits:
-            return self._context_limits[model]
-
-        # Prefix match (longest wins — see _longest_prefix_match). Custom
-        # layers are consulted in precedence order before the built-in table
-        # so caller configuration beats a longer lower-priority key (see
-        # __init__).
+        # Custom layers are consulted in precedence order (explicit > env >
+        # file) BEFORE the merged table's exact matches: a merged exact entry
+        # can originate from a lower-priority source or the built-ins, and
+        # returning it first would let it bypass a higher-priority family
+        # override (env "o1" must beat a built-in exact "o1-mini"). Within a
+        # layer, exact beats prefix; across layers, source precedence wins.
         for layer in self._custom_limit_layers:
+            if model in layer:
+                return layer[model]
             prefix = _longest_prefix_match(model, layer)
             if prefix is not None:
                 return layer[prefix]
+        if model in self._context_limits:
+            return self._context_limits[model]
         prefix = _longest_prefix_match(model, self._context_limits)
         if prefix is not None:
             return self._context_limits[prefix]
@@ -680,18 +692,17 @@ class OpenAIProvider(Provider):
 
     def _get_pricing(self, model: str) -> tuple[float, float] | None:
         """Get pricing for a model with fallback logic."""
-        # Direct match
-        if model in self._pricing:
-            return self._pricing[model]
-
-        # Prefix match (longest wins — see _longest_prefix_match). Custom
-        # layers are consulted in precedence order before the built-in table
-        # so caller configuration beats a longer lower-priority key (see
-        # __init__).
+        # Custom layers first, in precedence order (env > file), each with
+        # exact-then-prefix — see _get_context_limit_manual for why merged
+        # exact matches must not be consulted before the layers.
         for layer in self._custom_pricing_layers:
+            if model in layer:
+                return layer[model]
             model_prefix = _longest_prefix_match(model, layer)
             if model_prefix is not None:
                 return layer[model_prefix]
+        if model in self._pricing:
+            return self._pricing[model]
         model_prefix = _longest_prefix_match(model, self._pricing)
         if model_prefix is not None:
             return self._pricing[model_prefix]

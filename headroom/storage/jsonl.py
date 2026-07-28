@@ -182,20 +182,30 @@ class JSONLStorage(Storage):
         if not Path(self.file_path).exists():
             return
 
-        with open(self.file_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+        # Binary mode with per-line strict decoding: in text mode a torn
+        # multibyte write raises UnicodeDecodeError inside the file ITERATOR,
+        # before any except around the body can catch it — and query()
+        # exhausts the full history, so one damaged byte would break every
+        # page.
+        with open(self.file_path, "rb") as f:
+            for raw in f:
                 try:
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
                     data = json.loads(line)
                     yield self._dict_to_metrics(data)
-                except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-                    # Skip malformed lines AND structurally invalid records
-                    # (missing required fields -> KeyError, bad timestamps ->
-                    # ValueError): query() exhausts this iterator to find the
-                    # newest records, so a single bad record anywhere in the
-                    # history must not break every page.
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    ValueError,
+                    TypeError,
+                ):
+                    # Skip undecodable and malformed lines AND structurally
+                    # invalid records (missing required fields -> KeyError,
+                    # bad timestamps -> ValueError): a single bad record
+                    # anywhere in the history must not break every page.
                     continue
 
     def get_summary_stats(

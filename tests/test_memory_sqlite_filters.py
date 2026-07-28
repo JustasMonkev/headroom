@@ -274,3 +274,26 @@ async def test_huge_object_filter_stays_key_order_insensitive(
     wrong["k69"] = -1
     found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": wrong}))
     assert found == []
+
+
+async def test_bounded_path_matches_nested_objects_and_numerics(
+    store: SQLiteMemoryStore,
+) -> None:
+    """The bounded json_each-join path must stay order-insensitive one level
+    below the join and group integer/real as one numeric class — identical
+    filters must not flip results with container size."""
+    big = {f"k{i}": i for i in range(66)}
+    big["nested"] = {"x": 1, "y": 2}
+    big["ratio"] = 1.0  # stored as JSON real
+    await store.save(Memory(id="bigobj", content="big", user_id="u1", metadata={"cfg": big}))
+
+    flt = dict(big)
+    flt["nested"] = {"y": 2, "x": 1}  # reversed key order below the join
+    flt["ratio"] = 1  # int filter vs stored real
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": flt}))
+    assert [m.id for m in found] == ["bigobj"]
+
+    wrong = dict(flt)
+    wrong["nested"] = {"y": 3, "x": 1}
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": wrong}))
+    assert found == []

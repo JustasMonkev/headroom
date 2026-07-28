@@ -174,12 +174,15 @@ class TokenizerRegistry:
                 return tokenizer
             except Exception as e:
                 if fallback:
+                    # NOT cached: the cache key carries no fallback policy, so
+                    # a cached estimator would also satisfy a later
+                    # get(fallback=False) — hiding the factory failure it
+                    # promises to surface — and would pin a transient failure
+                    # forever. Only successful products are cached.
                     logger.warning(
                         f"Registered factory for {model} failed: {e}. Falling back to estimation."
                     )
-                    tokenizer = EstimatingTokenCounter()
-                    registry._cache[cache_key] = tokenizer
-                    return tokenizer
+                    return EstimatingTokenCounter()
                 raise ValueError(f"Factory for {model} failed: {e}") from e
 
         # Create tokenizer
@@ -189,12 +192,11 @@ class TokenizerRegistry:
             return tokenizer
         except Exception as e:
             if fallback:
+                # NOT cached — see the factory branch above.
                 logger.warning(
                     f"Failed to create tokenizer for {model}: {e}. Falling back to estimation."
                 )
-                tokenizer = EstimatingTokenCounter()
-                registry._cache[cache_key] = tokenizer
-                return tokenizer
+                return EstimatingTokenCounter()
             raise ValueError(f"No tokenizer available for {model}: {e}") from e
 
     @classmethod

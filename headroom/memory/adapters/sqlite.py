@@ -567,20 +567,60 @@ class SQLiteMemoryStore:
 
         return conditions, params
 
+    @staticmethod
+    def _entry_mismatch_sql(s: str, f: str, depth: int) -> str:
+        """SQL fragment: true when json_each rows ``s`` and ``f`` differ.
+
+        Integer and real are grouped as one numeric class (matching the
+        per-entry scalar branch, so results don't flip with container size).
+        Containers recurse ``depth`` more structural join levels — each level
+        keys objects by entry NAME (order-insensitive) and arrays by index
+        (order enforced) — then compare as minified text below that. The
+        nested json_each calls are guarded by CASE, which SQLite evaluates
+        lazily, so they never run against a scalar value.
+        """
+        numeric = "('integer', 'real')"
+        type_mismatch = (
+            f"({s}.type != {f}.type AND NOT ({s}.type IN {numeric} AND {f}.type IN {numeric}))"
+        )
+        scalar_mismatch = (
+            f"({f}.type IN ('integer', 'real', 'text') AND {s}.value IS NOT {f}.value)"
+        )
+        if depth <= 0:
+            inner = f"{s}.value != {f}.value"
+        else:
+            s2, f2 = f"{s}x", f"{f}x"
+            inner = (
+                f"(SELECT COUNT(*) FROM json_each({s}.value))"
+                f" != (SELECT COUNT(*) FROM json_each({f}.value))"
+                f" OR EXISTS (SELECT 1 FROM json_each({f}.value) AS {f2}"
+                f" LEFT JOIN json_each({s}.value) AS {s2} ON {s2}.key = {f2}.key"
+                f" WHERE {s2}.key IS NULL"
+                f" OR {SQLiteMemoryStore._entry_mismatch_sql(s2, f2, depth - 1)})"
+            )
+        container_mismatch = (
+            f"({f}.type IN ('object', 'array')"
+            f" AND CASE WHEN {s}.type = {f}.type THEN ({inner}) ELSE 1 END)"
+        )
+        return f"{type_mismatch} OR {scalar_mismatch} OR {container_mismatch}"
+
     def _bounded_container_equality(
         self, json_path: str, value: Any, conditions: list[str], params: list[Any]
     ) -> None:
         """Constant-size structural equality for a container filter value.
 
         Used when per-entry predicates would grow the SQL expression tree
-        beyond SQLite's MAX_EXPR_DEPTH (oversized containers, or the shared
-        predicate budget is spent). Joins the filter's entries against the
-        stored container's entries via json_each — on key for objects (key
-        order stays irrelevant even for huge objects) and on index for arrays
-        (order stays enforced). Scalar entries compare by json_each's typed
-        value; containers nested one level further down compare by minified
-        JSON text (the bounded compromise). Keys are joined as DATA, not
-        interpolated into paths, so arbitrary key names are safe here.
+        beyond SQLite's MAX_EXPR_DEPTH (oversized containers, spent predicate
+        budget, or nested keys unsafe for JSON paths). Joins the filter's
+        entries against the stored container's entries via json_each — on key
+        for objects (key order stays irrelevant even for huge objects) and on
+        index for arrays (order stays enforced) — and one more structural
+        join level below that, so objects nested directly inside the
+        container also match key-order-insensitively. Only containers three
+        levels down compare as minified text (the remaining bounded
+        compromise). Keys are joined as DATA, not interpolated into paths,
+        so arbitrary key names are safe here. The SQL is constant-size
+        regardless of container size.
         """
         json_kind = "array" if isinstance(value, (list, tuple)) else "object"
         serialized = json.dumps(value, separators=(",", ":"))
@@ -592,10 +632,7 @@ class SQLiteMemoryStore:
             " SELECT 1 FROM json_each(?) AS f"
             f" LEFT JOIN json_each(metadata, '{json_path}') AS s ON s.key = f.key"
             " WHERE s.key IS NULL"
-            "    OR s.type != f.type"
-            "    OR (f.type IN ('object', 'array') AND s.value != f.value)"
-            "    OR (f.type NOT IN ('object', 'array', 'null', 'true', 'false')"
-            "        AND s.value IS NOT f.value)"
+            f" OR {self._entry_mismatch_sql('s', 'f', 1)}"
             ")"
         )
         params.append(serialized)

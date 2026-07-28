@@ -352,3 +352,16 @@ def test_jsonl_time_filters_handle_mixed_awareness(tmp_path: Path) -> None:
         assert [m.request_id for m in storage.query(end_time=bound)] == ["naive"]
         assert storage.count(start_time=bound) == 1
         assert storage.get_summary_stats(start_time=bound)["total_requests"] == 1
+
+
+def test_jsonl_iter_all_skips_undecodable_lines(tmp_path: Path) -> None:
+    """A torn multibyte write must skip only the damaged line, not raise from
+    inside the file iterator and break every page."""
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    storage.save(_metrics("ok1", datetime(2026, 4, 23, 12, 0, 0)))
+    with open(storage.file_path, "ab") as fh:
+        fh.write(b'{"id":"torn","model":"gpt\xff4o"}\n')
+    storage.save(_metrics("ok2", datetime(2026, 4, 23, 13, 0, 0)))
+
+    assert [m.request_id for m in storage.query(limit=10)] == ["ok2", "ok1"]
+    assert storage.count() == 2

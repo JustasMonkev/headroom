@@ -198,3 +198,60 @@ class TestCacheEvictionPrefix:
         finally:
             TokenizerRegistry._tokenizers.pop("gpt-4", None)
             TokenizerRegistry.clear_cache()
+
+
+class TestRegistryFallbackNotCached:
+    def test_failed_factory_fallback_is_not_cached(self) -> None:
+
+        from headroom.tokenizers.base import TokenCounter
+        from headroom.tokenizers.estimator import EstimatingTokenCounter
+        from headroom.tokenizers.registry import TokenizerRegistry, register_tokenizer
+
+        class Flaky:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, model: str) -> TokenCounter:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("transient")
+
+                class Real(TokenCounter):
+                    def count_text(self, text: str) -> int:
+                        return 42
+
+                    def count_messages(self, messages) -> int:
+                        return 42
+
+                return Real()
+
+        flaky = Flaky()
+        try:
+            register_tokenizer("flaky-model-q", factory=flaky)
+            # First call fails -> estimator, NOT cached.
+            first = TokenizerRegistry.get("flaky-model-q")
+            assert isinstance(first, EstimatingTokenCounter)
+            # Strict call must invoke the factory again, not serve the
+            # cached estimator; the factory now succeeds.
+            second = TokenizerRegistry.get("flaky-model-q", fallback=False)
+            assert second.count_text("x") == 42
+        finally:
+            TokenizerRegistry._model_factories.pop("flaky-model-q", None)
+            TokenizerRegistry.clear_cache()
+
+    def test_strict_call_surfaces_factory_failure_after_fallback_call(self) -> None:
+        import pytest
+
+        from headroom.tokenizers.estimator import EstimatingTokenCounter
+        from headroom.tokenizers.registry import TokenizerRegistry, register_tokenizer
+
+        try:
+            register_tokenizer(
+                "always-broken-q", factory=lambda m: (_ for _ in ()).throw(RuntimeError("boom"))
+            )
+            assert isinstance(TokenizerRegistry.get("always-broken-q"), EstimatingTokenCounter)
+            with pytest.raises(ValueError, match="boom"):
+                TokenizerRegistry.get("always-broken-q", fallback=False)
+        finally:
+            TokenizerRegistry._model_factories.pop("always-broken-q", None)
+            TokenizerRegistry.clear_cache()
