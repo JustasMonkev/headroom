@@ -81,7 +81,7 @@ Typical marker: `[1200 items compressed to 40 (from 3100 source lines). Retrieve
 
 Hex tokenizes ~2 chars/token, so a 24-hex key ≈ 12 tok per marker. **Do not truncate to 12 hex:** 96 bits was a deliberate collision-resistance choice (documented at `compression_store.py:303-305`) — at 48 bits an adversary crafting content needs only ~2^24 candidates to find a colliding pair, after which storing the second value overwrites the first and an older marker retrieves the wrong original. The Rust path's 12-hex keys (`crusher.rs:1154-1163`) are an existing compatibility exception, not a precedent to generalize.
 
-The token saving is still available without losing entropy: re-encode the same 96 bits in base32/base64url (96 bits = 16 base64url chars ≈ 6–8 tok vs 12) — `parse_tool_call`/marker regexes would need to accept the wider alphabet in lockstep. Alternatively, keep hex and accept the cost; this is the lowest-priority marker item.
+The token saving is still available without losing entropy: re-encode the same 96 bits in base32/base64url (96 bits = 16 base64url chars ≈ 6–8 tok vs 12). But the migration surface is wider than the marker regexes — every hex-only consumer must move in lockstep: `CompressionStore.store`'s `explicit_hash` validator rejects non-hex keys outright (`compression_store.py:311`), SmartCrusher's Rust→Python mirror scanner consumes only hex characters (`smart_crusher.py:1081-1112`), plus `parse_tool_call`, the marker collectors, and the Rust emitters — with compatibility handling for hex markers already live in stored sessions. Given that breadth, keeping hex and accepting the cost is reasonable; this is the lowest-priority marker item either way.
 
 ### B4. `Expires in {N}m.` is dead weight and factually wrong
 `headroom/transforms/code_compressor.py:1266-1273`
@@ -117,7 +117,7 @@ Default mode re-emits the path per match (×5/file) plus once more in the footer
 
 - **Double footer** (`:486` + `log_compressor.rs:969-974`): `[137 lines omitted: 3 ERROR, 12 WARN, 122 INFO]` immediately followed by `[200 lines compressed to 63. Retrieve more: hash=...]` ≈ 48 tok restating the same arithmetic. Merge to one ~18-tok line.
 - **Misleading counts** (`:474-486`): the level breakdown counts *all* lines, not omitted ones — `[300 lines omitted: 12 ERROR ...]` advertises errors still present above. Subtract selected counts; drop the never-actionable INFO term.
-- **No dedup on errors/fails** (`:374-384`): `_dedupe_similar` applies only to warnings. The most repetitive real-world content — the same assertion across N parametrized tests — is kept verbatim up to `max_errors=10`. Dedup with a `×N` suffix (strictly more informative, ~4 tok). Same for stack traces: first 3 kept with no equality check; hash normalized frames, emit `[same trace ×3]`.
+- **No dedup on errors/fails** (`:374-384`): `_dedupe_similar` applies only to warnings; the same assertion across N parametrized tests is kept verbatim up to `max_errors=10`. **But don't extend `_dedupe_similar` wholesale** — its similarity normalization would collapse failures that differ only in IDs, values, or paths into one `×N` entry, hiding *which* inputs failed. Use **byte-identical** dedup for errors/fails (first occurrence + `×N`), or keep each distinct normalized suffix. Stack traces are safer: hash the exact frame list and emit `[same trace ×3]` only for byte-identical traces.
 - **Context expansion around everything** (`:445-459`): `error_context_lines` expands ±3 around errors *and* warnings, summaries, and stack-trace lines. pytest's `====` banners all match `summary_patterns`, dragging in up to 120 low-value neighbors against the `max_total_lines=100` budget. Restrict to ERROR/FAIL lines; make the window asymmetric (1 before, 2 after).
 
 ### C3. Diff output repeats each path 4× per file
@@ -150,7 +150,7 @@ Verified: a 45-char span becomes a 49-char pointer; `chars_removed` goes negativ
 ### C8. Config compressor never strips trailing inline comments
 `headroom/transforms/config_compressor.py:47-51`, `:246-260`
 
-All comment regexes are line-anchored, so `replicas: 3  # bumped for load test` — the dominant comment form in k8s/CI/pyproject files — survives untouched despite being CCR-recoverable. Extend `_strip_comment_lines` to trim trailing ` #…` with the existing quote/block-scalar conservatism.
+All comment regexes are line-anchored, so `replicas: 3  # bumped for load test` — the dominant comment form in k8s/CI/pyproject files — survives untouched despite being CCR-recoverable. **Caveat: this is not a regex-level change.** The compressor has block-scalar/multiline gates but no quote-aware inline handling, so a naive trailing-`#` trim would truncate real data like `command: "echo foo # keep"`. Doing this safely requires a flavor-aware lexer (track quote state before the `#`) or a parse-equivalence check (reparse the trimmed document and compare structures) — skip any line, or the whole file, where equivalence can't be proven.
 
 ### C9. Spreadsheet ingest: CRLF, phantom rows, empty columns
 `headroom/transforms/spreadsheet_ingest.py:21-27`
@@ -212,6 +212,69 @@ The learned block lands in `CLAUDE.local.md`/`AGENTS.md` — loaded into **every
 1. **No cap** on sections, bullets, or bytes; every `--apply` unions new + all prior sections forever. Add a rendered-block cap (~1,500 tok), evicting carried sections by ascending `estimated_tokens_saved` (already sorted).
 2. **Dedup is exact-string on LLM-free-written headings** — `Environment`, `Environment Rules`, and `Environment Setup` accumulate side by side. Normalize headings before comparison and give `_SYSTEM_PROMPT` a closed heading vocabulary.
 3. **The `on {now}` date line rewrites the file on every run** even when rules are identical — byte churn that busts downstream prefix caches for no semantic change. Move provenance to a sidecar; drop the per-section `*~N tokens/session saved*` annotations (~8 tok each — the analyzer's own guesses, meaningless to the consuming agent).
+
+---
+
+## F. Additional findings (round 2)
+
+A second pass surfaced 11 more opportunities. The first two are larger than the marker/JSON micro-optimizations above. Items are tagged **[verified]** (claims checked against the code in this review) or **[reported]** (plausible, but confirm the cited behavior before implementing).
+
+### Token & cost
+
+#### F1. Auto-enable Anthropic Tool Search for large toolsets — P0 [verified]
+`headroom/proxy/handlers/anthropic.py:2398-2440`, `proxy/helpers.py:2826`, `:2887`, `:2995`
+
+The deferral machinery already exists (`inject_tool_search_deferral`, min-tools threshold `_TOOL_SEARCH_MIN_TOOLS = 12`, plus an OpenAI variant) and the code itself cites the stakes: ~135 tool defs ≈ **28k tokens on every request** (`helpers.py:2826`). But the Anthropic path only activates behind the opt-in `HEADROOM_TOOL_SEARCH` env var. The injection is deterministic (prompt-cache-safe) and already scoped to first-party Anthropic. Make it default-on (`auto`) with provider/model gating and an explicit opt-out — potentially thousands to tens of thousands of input tokens per request for MCP-heavy setups.
+
+#### F2. Wire the Claude thinking compactor into the Anthropic handler — P0 [verified]
+`headroom/transforms/thinking_compactor.py:50`, `:97`
+
+`compact_thinking_to_text()` exists, is self-tested in-module, and has **zero production callers** — grep finds it only in its own file. The module's own measurements report ~688 tokens per historical Sonnet 4.6 thinking block and ~995 for Opus 4.6, re-billed on every subsequent turn for models where `bills_prior_thinking()` is true. Wire it into the Anthropic handler gated on `bills_prior_thinking(model)`, preserving the latest turn (`keep_last_turns=1`). Saves ~688–995 tokens per eligible historical thinking block per turn.
+
+#### F3. Compact completed tool-call *inputs*, not only outputs — P1 [reported]
+In-place compression currently targets tool outputs; historical tool-call **arguments** (Write payloads, apply_patch bodies, shell heredocs, SQL/query strings) stay verbatim in context forever. Once the matching result has completed and aged past the read-protection window, large arguments could be replaced with a reversible CCR reference while preserving the call ID and name. Worth hundreds to thousands of tokens in coding sessions. (`content_router.py:4254-4304` already builds `_tool_call_args` maps during traversal — a natural attachment point.)
+
+#### F4. Memory rendering: UUIDs, content echo, optional metadata — P1 [verified in part]
+`headroom/proxy/memory_handler.py:1267`, `:1967`
+
+Passive recall repeats a full UUID per memory row solely so it can later be edited — render request-local aliases (`m1`, `m2`, …) and resolve them server-side in `memory_update`/`memory_delete`. Verified: `memory_save` results echo back the first 100 chars of the content the model just wrote (`:1267`, preview again at `:1967`) — pure round-trip waste, drop it. Make search scores/extracted-entities in results optional. Consistent savings on every memory-enabled request; combines with A1/A5.
+
+#### F5. Separate native output controls from instruction steering — P1 [reported]
+On OpenAI models that support it, apply `text.verbosity=low` and reduced reasoning effort to mechanical continuations *natively*, without also appending the input-token steering paragraph (D4) — and don't force reduced verbosity onto fresh user questions. Lowers output/reasoning cost without spending steering tokens on requests where the native knob suffices.
+
+### Latency & memory
+
+#### F6. Request-specific state mutated on the shared `ContentRouter` [verified]
+`headroom/transforms/content_router.py:1899`, `:2090`, `:4304`, `:4517`, comment at `:1968-1969`
+
+`_runtime_target_ratio`, `_runtime_kompress_model`, `_tool_call_args`, and read-protection sets are instance fields mutated per request, while routers are reused and compression runs in a thread pool — concurrent requests can overwrite each other's routing context (wrong target ratio, wrong tool-args map). The comment at `:1968` acknowledges the pattern rather than fixing it. Pass an immutable per-request context object through the call chain instead.
+
+#### F7. Compression caches: byte-weighting, expiry sweeping, single-flight [corrected]
+`headroom/cache/compression_cache.py:112`, `:171`; `cache/compression_store.py:693`
+
+Contrary to the round-2 report, both caches **are** entry-bounded (LRU at 10,000 entries; store capped at 1,000 with an eviction heap). The real gaps: bounds are entry-count, not byte-weighted (10k large originals can pin significant memory); TTL expiry is lazy (expired entries linger until queried or LRU-evicted); and there is no single-flight, so identical concurrent requests each run the same compression. Add byte-weighted accounting, a periodic sweep, and per-key in-flight futures.
+
+#### F8. Quadratic read-lifecycle scans [reported]
+`headroom/transforms/read_lifecycle.py`
+
+Each tool operation reportedly rescans all messages to find its index, then each read scans all edits and later reads — O(n²) on long transcripts. Capture message indices during the initial traversal and classify files in reverse order using latest-edit / read-coverage state.
+
+#### F9. Copy-on-write and token-count deltas in the pipeline [reported]
+`headroom/pipeline.py`
+
+The pipeline does a full tokenization, a full deep copy, per-transform counts/copies, then another exact full count. Pass the baseline count into transforms and have them return exact deltas for changed slots; keep full recounts as a sampled validation path.
+
+#### F10. Unconditional whole-payload serialization [reported]
+The Responses path serializes the entire request before transformation and again after, even with debug metrics off or when nothing changed. Reuse the HTTP body bytes, skip the second serialization for unchanged payloads, and sample byte metrics.
+
+### Measurement defect
+
+#### F11. OpenAI tool-schema savings are double-counted when both layers run [verified]
+`headroom/proxy/handlers/openai.py:2393-2397`, `:2434-2438`
+
+Layer 1 (schema compaction) adds `count(original) − count(L1)` to `tokens_saved`; Layer 2 (description truncation) then adds `count(original) − count(L2)` — both diffs are taken against the *original* `payload`, so the L1 reduction is counted twice. Doesn't change billed tokens, but inflates reported savings and can distort optimization decisions. Fix: measure each stage against the preceding stage, or compute `original − final` once.
+
+**Round-2 implementation order:** F1 (auto tool deferral) → F2 (thinking compactor wiring) → F6 (router concurrency) → F7 (cache hardening) → F3 (tool-input compaction) → F8–F10 (scans/serialization) → F11 alongside any savings-reporting work.
 
 ---
 
