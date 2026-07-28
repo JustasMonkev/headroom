@@ -102,6 +102,20 @@ def _final_response(url: str) -> httpx.Response:
     )
 
 
+def _as_sse(response: httpx.Response) -> httpx.Response:
+    payload = response.json()
+    body = (
+        "event: response.completed\n"
+        f"data: {json.dumps({'type': 'response.completed', 'response': payload})}\n\n"
+    )
+    return httpx.Response(
+        response.status_code,
+        content=body.encode(),
+        headers={"content-type": "text/event-stream"},
+        request=response.request,
+    )
+
+
 def _install_two_call_retry(app, hash_key: str = "abc123def456abc123def456"):
     """First upstream call returns a headroom_retrieve function_call, second the resolved reply."""
     server = app.state.proxy
@@ -125,7 +139,7 @@ def test_non_streaming_ccr_tool_call_is_intercepted_and_resolved():
         calls = _install_two_call_retry(app)
 
         recording_handler = MagicMock()
-        recording_handler.has_ccr_tool_calls = MagicMock(return_value=True)
+        recording_handler.has_ccr_tool_calls = MagicMock(side_effect=[True, False])
         recording_handler.handle_response = AsyncMock(
             return_value={
                 "id": "resp_2",
@@ -164,6 +178,39 @@ def test_non_streaming_ccr_tool_call_is_intercepted_and_resolved():
     assert body["output"][0]["content"][0]["text"] == "Resolved!"
     # The unresolved function_call must not leak to the client.
     assert not any(item.get("type") == "function_call" for item in body["output"])
+
+
+@pytest.mark.parametrize("client_stream", [False, True])
+def test_ccr_parses_sse_initial_and_continuation_responses(client_stream: bool):
+    """An upstream that always returns SSE still completes the private CCR loop."""
+    app = _make_app()
+    calls: list[dict] = []
+
+    async def fake_retry(method, url, headers, body, stream=False, **kwargs):
+        calls.append(body)
+        response = _tool_call_response(url) if len(calls) == 1 else _final_response(url)
+        return _as_sse(response)
+
+    with TestClient(app) as client:
+        app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "please look this up",
+                "tools": [_RETRIEVE_TOOL],
+                "stream": client_stream,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 2
+    assert calls[1]["stream"] is False
+    assert "headroom_retrieve" not in resp.text
+    assert "Resolved!" in resp.text
+    expected_type = "text/event-stream" if client_stream else "application/json"
+    assert resp.headers["content-type"].startswith(expected_type)
 
 
 def test_ccr_intercept_exception_is_reraised_not_swallowed():

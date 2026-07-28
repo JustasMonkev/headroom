@@ -885,6 +885,15 @@ def dashboard(port: int, no_open: bool) -> None:
     "(env: HEADROOM_STATELESS=true)",
 )
 @click.option(
+    "--offline",
+    is_flag=True,
+    help=(
+        "Disable Headroom auxiliary egress (telemetry, update/license checks, "
+        "and model downloads); provider forwarding is unaffected. "
+        "(env: HEADROOM_OFFLINE=1)"
+    ),
+)
+@click.option(
     "--embedding-server/--no-embedding-server",
     default=False,
     help="Run a dedicated embedding server sidecar (Option E). "
@@ -1001,6 +1010,7 @@ def proxy(
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
+    offline: bool,
     embedding_server: bool,
     embedding_server_socket: str | None,
 ) -> None:
@@ -1270,9 +1280,9 @@ def proxy(
         disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
-        # Optional inbound auth token + air-gap switch (env-driven).
+        # Optional inbound auth token + auxiliary-egress switch.
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
-        offline=_get_env_bool("HEADROOM_OFFLINE", False),
+        offline=offline or _get_env_bool("HEADROOM_OFFLINE", False),
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)

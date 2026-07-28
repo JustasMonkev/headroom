@@ -127,10 +127,13 @@ class TestPruneDanglingToolReferences:
                     {
                         "type": "tool_search_tool_result",
                         "tool_use_id": "srvtoolu_1",
-                        "content": [
-                            {"type": "tool_reference", "name": name},
-                            {"type": "tool_reference", "name": "Bash"},
-                        ],
+                        "content": {
+                            "type": "tool_search_tool_search_result",
+                            "tool_references": [
+                                {"type": "tool_reference", "tool_name": name},
+                                {"type": "tool_reference", "tool_name": "Bash"},
+                            ],
+                        },
                     }
                 ],
             },
@@ -143,15 +146,15 @@ class TestPruneDanglingToolReferences:
         out, pruned = prune_dangling_tool_references(messages, [_tool("Bash")])
 
         assert pruned == {"WaitForMcpServers"}
-        kept = out[1]["content"][0]["content"]
-        assert [b["name"] for b in kept] == ["Bash"]
+        kept = out[1]["content"][0]["content"]["tool_references"]
+        assert [b["tool_name"] for b in kept] == ["Bash"]
 
     def test_top_level_dangling_reference_is_pruned(self):
         messages = [
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_reference", "name": "WaitForMcpServers"},
+                    {"type": "tool_reference", "tool_name": "WaitForMcpServers"},
                     {"type": "text", "text": "hello"},
                 ],
             }
@@ -179,7 +182,8 @@ class TestPruneDanglingToolReferences:
 
         assert pruned
         assert out is not messages
-        assert len(messages[1]["content"][0]["content"]) == 2, "input was mutated"
+        original_references = messages[1]["content"][0]["content"]["tool_references"]
+        assert len(original_references) == 2, "input was mutated"
 
     def test_explicitly_empty_tools_prunes_all_references(self):
         """An understood empty tool surface makes every reference dangling."""
@@ -188,7 +192,53 @@ class TestPruneDanglingToolReferences:
         out, pruned = prune_dangling_tool_references(messages, [])
 
         assert pruned == {"Bash", "WaitForMcpServers"}
-        assert out[1]["content"][0]["content"] == []
+        result = out[1]["content"][0]["content"]
+        assert result["tool_references"] == []
+        assert result["type"] == "tool_search_tool_search_result"
+
+    def test_empty_custom_tool_result_content_gets_valid_placeholder(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_search",
+                        "content": [
+                            {
+                                "type": "tool_reference",
+                                "tool_name": "WaitForMcpServers",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        out, pruned = prune_dangling_tool_references(messages, [_tool("Bash")])
+
+        assert pruned == {"WaitForMcpServers"}
+        repaired = out[0]["content"][0]["content"]
+        assert repaired and repaired[0]["type"] == "text"
+        assert repaired[0]["text"]
+
+    def test_empty_message_content_gets_valid_placeholder(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_reference",
+                        "tool_name": "WaitForMcpServers",
+                    }
+                ],
+            }
+        ]
+
+        out, pruned = prune_dangling_tool_references(messages, [_tool("Bash")])
+
+        assert pruned == {"WaitForMcpServers"}
+        assert out[0]["content"] and out[0]["content"][0]["type"] == "text"
 
     def test_absent_tools_shape_is_a_noop(self):
         """Missing tools is ambiguous, so preserve the byte-stable history."""

@@ -1091,6 +1091,25 @@ def _is_event_stream_response(response: Any) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
 
 
+def _openai_responses_json_or_terminal_sse(response: Any) -> dict[str, Any]:
+    """Parse a buffered Responses reply, accepting terminal SSE as JSON.
+
+    Continuation calls are always requested with ``stream:false``, but
+    compatible upstreams can ignore that preference. Unlike the initial
+    passthrough response, a continuation cannot safely fall back to raw bytes:
+    it may contain proxy-private CCR or memory tool calls.
+    """
+    if _is_event_stream_response(response):
+        terminal = _openai_responses_sse_to_response(response.content)
+        if terminal is None:
+            raise ValueError("Responses SSE continuation had no terminal response event")
+        return terminal
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Responses continuation did not return a JSON object")
+    return payload
+
+
 def _output_shaping_holdout_fraction() -> float:
     from headroom.proxy import runtime_env
 
@@ -5212,9 +5231,9 @@ class OpenAIHandlerMixin:
                     # Parsing that as JSON used to raise JSONDecodeError out of
                     # this handler and turn a *successful* upstream reply into
                     # ``502 proxy_error``. Recover the terminal response object
-                    # for usage/telemetry instead, and leave ``resp_json`` None so
-                    # the JSON-rewriting blocks below (CCR, memory, buffered-SSE
-                    # replay) all skip and the SSE bytes pass through verbatim.
+                    # for usage/telemetry and private-tool interception. Keep
+                    # ``resp_json`` unset so an SSE reply with no proxy-private
+                    # calls still passes through with its original event bytes.
                     upstream_is_sse = _is_event_stream_response(response)
                     # Bound the unbound-name risk: every consumer below is already
                     # guarded on ``resp_json`` being truthy.
@@ -5336,7 +5355,7 @@ class OpenAIHandlerMixin:
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
                             )
-                            return cont_response.json()
+                            return _openai_responses_json_or_terminal_sse(cont_response)
 
                         try:
                             final_resp_json = await _ccr_response_handler.handle_response(
@@ -5346,14 +5365,22 @@ class OpenAIHandlerMixin:
                                 api_call_fn,
                                 provider="openai_responses",
                             )
+                            if _ccr_response_handler.has_ccr_tool_calls(
+                                final_resp_json, "openai_responses"
+                            ):
+                                raise RuntimeError(
+                                    "Responses CCR continuation still contained headroom_retrieve"
+                                )
                             resp_json = final_resp_json
                             # Remove encoding headers since content is now
                             # uncompressed JSON we synthesized.
                             ccr_response_headers = {
                                 k: v
                                 for k, v in response.headers.items()
-                                if k.lower() not in ("content-encoding", "content-length")
+                                if k.lower()
+                                not in ("content-encoding", "content-length", "content-type")
                             }
+                            ccr_response_headers["content-type"] = "application/json"
                             response = httpx.Response(
                                 status_code=200,
                                 content=json.dumps(final_resp_json).encode(),
@@ -5373,20 +5400,25 @@ class OpenAIHandlerMixin:
                             # feedback_no_silent_fallbacks.
                             raise
 
-                    # Memory: handle memory tool calls in Responses API response
+                    # Memory: handle memory tool calls in Responses API response.
+                    # As with CCR, a terminal SSE response is authoritative when
+                    # an upstream ignored the client's ``stream:false``.
+                    memory_response_source = resp_json or usage_source
                     if (
                         self.memory_handler
                         and memory_user_id
                         and responses_memory_tools_allowed
-                        and resp_json
+                        and memory_response_source
                         and response.status_code == 200
-                        and self.memory_handler.has_memory_tool_calls(resp_json, "openai")
+                        and self.memory_handler.has_memory_tool_calls(
+                            memory_response_source, "openai"
+                        )
                     ):
                         try:
                             # Extract function_call items from output
                             from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES
 
-                            output_items = resp_json.get("output", [])
+                            output_items = memory_response_source.get("output", [])
                             memory_fc_items = [
                                 item
                                 for item in output_items
@@ -5424,7 +5456,7 @@ class OpenAIHandlerMixin:
 
                             if tool_outputs:
                                 # Make continuation request with tool results
-                                response_id = resp_json.get("id")
+                                response_id = memory_response_source.get("id")
                                 continuation_body = {
                                     "model": model,
                                     "input": tool_outputs,
@@ -5438,16 +5470,37 @@ class OpenAIHandlerMixin:
                                 cont_response = await self._retry_request(
                                     "POST", url, headers, continuation_body
                                 )
-                                resp_json = cont_response.json()
-                                response = cont_response
+                                resp_json = _openai_responses_json_or_terminal_sse(cont_response)
+                                if _is_event_stream_response(cont_response):
+                                    memory_response_headers = {
+                                        k: v
+                                        for k, v in cont_response.headers.items()
+                                        if k.lower()
+                                        not in (
+                                            "content-encoding",
+                                            "content-length",
+                                            "content-type",
+                                        )
+                                    }
+                                    memory_response_headers["content-type"] = "application/json"
+                                    response = httpx.Response(
+                                        status_code=cont_response.status_code,
+                                        content=json.dumps(resp_json).encode(),
+                                        headers=memory_response_headers,
+                                    )
+                                else:
+                                    response = cont_response
                                 logger.info(
                                     f"[{request_id}] Memory: Handled {len(tool_outputs)} "
                                     f"tool call(s) with continuation for user {memory_user_id} (responses)"
                                 )
                         except Exception as e:
-                            logger.warning(
+                            logger.error(
                                 f"[{request_id}] Memory tool handling failed (responses): {e}"
                             )
+                            # Memory functions are proxy-private. Never leak an
+                            # unresolved call to a client that cannot execute it.
+                            raise
 
                     # Cost is recorded once by the outcome funnel below; here we only
                     # compute the cache-write / uncached split the funnel needs.

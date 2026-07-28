@@ -29,7 +29,6 @@ prefix replay is the usual answer).
 
 from __future__ import annotations
 
-import copy
 import logging
 from typing import Any
 
@@ -37,6 +36,11 @@ logger = logging.getLogger(__name__)
 
 # Blocks that carry a searchable reference to a deferred tool definition.
 _TOOL_REFERENCE_TYPE = "tool_reference"
+_EMPTY_REFERENCE_REPAIR_TEXT = {
+    "type": "text",
+    "text": "[Unavailable tool reference removed]",
+}
+_REMOVE = object()
 
 
 def collect_declared_tool_names(tools: Any) -> set[str]:
@@ -62,8 +66,66 @@ def collect_declared_tool_names(tools: Any) -> set[str]:
 def _referenced_name(block: Any) -> str | None:
     if not isinstance(block, dict) or block.get("type") != _TOOL_REFERENCE_TYPE:
         return None
-    name = block.get("name")
+    # Anthropic's wire format is ``tool_name``. Keep ``name`` as a
+    # compatibility fallback for older/custom producers.
+    name = block.get("tool_name", block.get("name"))
     return name if isinstance(name, str) and name else None
+
+
+def _prune_reference_value(
+    value: Any,
+    declared: set[str],
+    pruned: set[str],
+) -> tuple[Any, bool]:
+    """Copy-on-write pruning for the two Anthropic reference container shapes.
+
+    Built-in tool search nests references under
+    ``content.tool_references``; custom tool search can put them in a
+    ``tool_result.content`` list. The latter cannot be left empty because
+    Anthropic rejects empty content arrays, so replace an emptied ``content``
+    list with a neutral text block. An empty ``tool_references`` array is valid
+    and is the documented "no matches" shape.
+    """
+    name = _referenced_name(value)
+    if name is not None:
+        if name not in declared:
+            pruned.add(name)
+            return _REMOVE, True
+        return value, False
+
+    if isinstance(value, list):
+        changed = False
+        out: list[Any] = []
+        for item in value:
+            new_item, item_changed = _prune_reference_value(item, declared, pruned)
+            changed = changed or item_changed
+            if new_item is not _REMOVE:
+                out.append(new_item)
+        return (out, True) if changed else (value, False)
+
+    if not isinstance(value, dict):
+        return value, False
+
+    changed = False
+    out_dict = value
+    for key in ("content", "tool_references"):
+        child = value.get(key)
+        if not isinstance(child, (dict, list)):
+            continue
+        new_child, child_changed = _prune_reference_value(child, declared, pruned)
+        if not child_changed:
+            continue
+        if not changed:
+            out_dict = dict(value)
+            changed = True
+        if new_child is _REMOVE:
+            new_child = []
+        if key == "content" and isinstance(new_child, list) and not new_child:
+            # ``content: []`` is invalid for both messages and tool_result
+            # blocks. Preserve a syntactically valid, non-actionable marker.
+            new_child = [dict(_EMPTY_REFERENCE_REPAIR_TEXT)]
+        out_dict[key] = new_child
+    return out_dict, changed
 
 
 def find_dangling_tool_uses(messages: list[dict[str, Any]], declared: set[str]) -> set[str]:
@@ -116,32 +178,12 @@ def prune_dangling_tool_references(
             out.append(message)
             continue
 
-        new_content: list[Any] = []
-        message_changed = False
-        for block in content:
-            name = _referenced_name(block)
-            if name is not None and name not in declared:
-                pruned.add(name)
-                message_changed = True
-                continue
-            # A tool_search_tool_result wraps its references one level down.
-            nested = block.get("content") if isinstance(block, dict) else None
-            if isinstance(nested, list):
-                kept_nested = []
-                for nested_block in nested:
-                    nested_name = _referenced_name(nested_block)
-                    if nested_name is not None and nested_name not in declared:
-                        pruned.add(nested_name)
-                        continue
-                    kept_nested.append(nested_block)
-                if len(kept_nested) != len(nested):
-                    block = copy.deepcopy(block)
-                    block["content"] = kept_nested
-                    message_changed = True
-            new_content.append(block)
+        new_content, message_changed = _prune_reference_value(content, declared, pruned)
 
         if message_changed:
             changed = True
+            if not new_content:
+                new_content = [dict(_EMPTY_REFERENCE_REPAIR_TEXT)]
             new_message = dict(message)
             new_message["content"] = new_content
             out.append(new_message)

@@ -2451,6 +2451,7 @@ class AnthropicHandlerMixin:
             )
 
             _pre_hook_tokens: int | None = None
+            _post_hook_tokens: int | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
                     provider="anthropic",
@@ -2473,6 +2474,12 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+                # Capture the hook-only endpoint before the independent
+                # tool-reference repair below can change message tokens.
+                try:
+                    _post_hook_tokens = tokenizer.count_messages(body["messages"])
+                except Exception:
+                    _post_hook_tokens = None
 
             # Tool-reference integrity (#7). Run this after request hooks:
             # overlay_cached_prefix can replay references to tools that vanished
@@ -2509,7 +2516,11 @@ class AnthropicHandlerMixin:
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
                 # merely normalized a cross-estimator scale difference.
-                if _pre_hook_tokens is not None and optimized_tokens < _pre_hook_tokens:
+                if (
+                    _pre_hook_tokens is not None
+                    and _post_hook_tokens is not None
+                    and _post_hook_tokens < _pre_hook_tokens
+                ):
                     transforms_applied.append("turn_hook")
             except Exception:
                 logger.debug("consistency token re-count skipped", exc_info=True)

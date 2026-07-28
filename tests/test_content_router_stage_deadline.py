@@ -226,7 +226,7 @@ def test_completed_later_futures_survive_earlier_timeout(monkeypatch):
 
 
 def test_timed_out_workers_are_bounded_across_requests(monkeypatch):
-    """Repeated deadlines reuse one pool instead of leaking worker sets."""
+    """Repeated deadlines bound both live workers and retained queued work."""
     router = _router()
     monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "4")
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "30")
@@ -249,10 +249,26 @@ def test_timed_out_workers_are_bounded_across_requests(monkeypatch):
 
     monkeypatch.setattr(router, "compress", wedged_compress)
     try:
+        # Fill all four workers plus the executor's one bounded pending wave.
+        _apply(router, _messages(pending=12))
+        executor = router._stage_compression_executor
+        assert executor is not None
+        original_submit = executor.submit
+        later_submits = 0
+
+        def count_submit(*args, **kwargs):
+            nonlocal later_submits
+            later_submits += 1
+            return original_submit(*args, **kwargs)
+
+        monkeypatch.setattr(executor, "submit", count_submit)
         for _ in range(3):
-            _apply(router, _messages())
+            _apply(router, _messages(pending=12))
+
         assert max_active <= 4
         assert router._stage_compression_executor_workers == 4
+        assert router._stage_compression_admission_capacity == 8
+        assert later_submits == 0, "saturated executor accepted more retained request work"
     finally:
         release.set()
         deadline = time.monotonic() + 1.0

@@ -163,8 +163,8 @@ def test_anthropic_tool_references_are_validated_after_request_hooks():
                     {
                         "role": "assistant",
                         "content": [
-                            {"type": "tool_reference", "name": "keep_me"},
-                            {"type": "tool_reference", "name": "drop_me"},
+                            {"type": "tool_reference", "tool_name": "keep_me"},
+                            {"type": "tool_reference", "tool_name": "drop_me"},
                         ],
                     },
                 ],
@@ -180,4 +180,7 @@ def test_anthropic_tool_references_are_validated_after_request_hooks():
     outbound = outbound_bodies[0]
     assert [tool["name"] for tool in outbound["tools"]] == ["keep_me"]
     references = outbound["messages"][1]["content"]
-    assert [ref["name"] for ref in references] == ["keep_me"]
+    assert [ref["tool_name"] for ref in references] == ["keep_me"]
+    transforms = response.headers.get("x-headroom-transforms", "")
+    assert "tool_reference_repair" in transforms
+    assert "turn_hook" not in transforms

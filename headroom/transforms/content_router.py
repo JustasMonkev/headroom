@@ -45,7 +45,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1735,6 +1735,8 @@ class ContentRouter(Transform):
         self._stage_compression_executor_lock = threading.Lock()
         self._stage_compression_executor: ThreadPoolExecutor | None = None
         self._stage_compression_executor_workers = 0
+        self._stage_compression_admission: threading.BoundedSemaphore | None = None
+        self._stage_compression_admission_capacity = 0
 
         # Name-addressable compressor inventory: built-in metadata + opt-in
         # discovery of `headroom.compressor` entry points. Inventory only —
@@ -2090,7 +2092,49 @@ class ContentRouter(Transform):
                     thread_name_prefix="headroom-router-compress",
                 )
                 self._stage_compression_executor_workers = max_workers
+                # Bound total retained work to running workers plus one small
+                # pending wave. ThreadPoolExecutor's own queue is unbounded.
+                self._stage_compression_admission_capacity = max_workers * 2
+                self._stage_compression_admission = threading.BoundedSemaphore(
+                    self._stage_compression_admission_capacity
+                )
             return self._stage_compression_executor
+
+    def _submit_stage_compression(
+        self,
+        max_workers: int,
+        content: str,
+        context: str,
+        bias: float,
+        *,
+        block_for_capacity: bool,
+    ) -> Future[tuple[RouterCompressionResult, float]] | None:
+        """Submit only when the shared executor has bounded admission capacity.
+
+        Timed-out futures deliberately remain queued: cancelling a Future marks
+        it done but does not remove its work item from ThreadPoolExecutor's
+        unbounded queue. The wrapper releases admission only when the work item
+        actually runs to completion, keeping retained request contents bounded
+        even while every worker is wedged.
+        """
+        executor = self._get_stage_compression_executor(max_workers)
+        admission = self._stage_compression_admission
+        if admission is None:  # pragma: no cover - initialized with executor
+            return None
+        if not admission.acquire(blocking=block_for_capacity):
+            return None
+
+        def _run() -> tuple[RouterCompressionResult, float]:
+            try:
+                return self._timed_compress(content, context, bias)
+            finally:
+                admission.release()
+
+        try:
+            return executor.submit(_run)
+        except BaseException:
+            admission.release()
+            raise
 
     def compress(
         self,
@@ -4978,17 +5022,23 @@ class ContentRouter(Transform):
                         task_results.append((_stage_passthrough(task_content), 0.0))
                         continue
                     if deadline_s is not None:
-                        executor = self._get_stage_compression_executor(configured_workers)
-                        future = executor.submit(
-                            self._timed_compress,
+                        future = self._submit_stage_compression(
+                            configured_workers,
                             task_content,
                             task_ctx,
                             task_bias,
+                            block_for_capacity=False,
                         )
+                        if future is None:
+                            logger.warning(
+                                "ContentRouter compression executor is saturated; "
+                                "failing open via PASSTHROUGH"
+                            )
+                            task_results.append((_stage_passthrough(task_content), 0.0))
+                            continue
                         try:
                             r, compress_ms = future.result(timeout=deadline_s)
                         except FuturesTimeoutError:
-                            future.cancel()
                             logger.warning(
                                 "ContentRouter inline compression exceeded its %.1fs share of "
                                 "the compression stage budget; failing open via PASSTHROUGH",
@@ -5009,14 +5059,22 @@ class ContentRouter(Transform):
                 # Collect within the remaining budget, fail open for whatever has not
                 # landed, and reuse one bounded pool so stuck workers cannot grow
                 # without limit across requests.
-                executor = self._get_stage_compression_executor(configured_workers)
                 futures = [
-                    executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                    self._submit_stage_compression(
+                        configured_workers,
+                        task_content,
+                        task_ctx,
+                        task_bias,
+                        block_for_capacity=stage_expiry is None,
+                    )
                     for _, task_content, task_ctx, task_bias, _, _ in pending_tasks
                 ]
                 task_results = []
                 budget_spent = False
                 for future, (_, task_content, _, _, _, _) in zip(futures, pending_tasks):
+                    if future is None:
+                        task_results.append((_stage_passthrough(task_content), 0.0))
+                        continue
                     if not budget_spent:
                         try:
                             task_results.append(future.result(timeout=_stage_remaining()))
@@ -5036,7 +5094,6 @@ class ContentRouter(Transform):
                     if future.done():
                         task_results.append(future.result())
                         continue
-                    future.cancel()
                     task_results.append((_stage_passthrough(task_content), 0.0))
 
             parallel_ms = (time.perf_counter() - t_parallel_start) * 1000

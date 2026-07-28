@@ -376,3 +376,116 @@ def test_sse_body_is_not_reparsed_as_json_by_ccr() -> None:
     event = json.loads(SSE_BODY.split("data: ", 1)[1].strip())
     assert calls == [event["response"]]
     assert resp.text == SSE_BODY
+
+
+def test_terminal_sse_memory_call_is_intercepted_and_continued() -> None:
+    """Proxy-private memory calls in terminal SSE never leak to the client."""
+    from types import SimpleNamespace
+
+    initial = {
+        "id": "resp_memory_call",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "name": "memory_search",
+                "call_id": "call_memory",
+                "arguments": '{"query":"preference"}',
+            }
+        ],
+        "usage": {"input_tokens": 2, "output_tokens": 1},
+    }
+    final = {
+        "id": "resp_after_memory",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "remembered"}],
+            }
+        ],
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+    }
+
+    def as_sse(payload: dict) -> bytes:
+        event = {"type": "response.completed", "response": payload}
+        return f"event: response.completed\ndata: {json.dumps(event)}\n\n".encode()
+
+    class _MemorySpy:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                inject_context=False,
+                inject_tools=True,
+                project_root_override="",
+            )
+            self._backend = object()
+            self.executed: list[tuple] = []
+
+        def compute_memory_tool_definitions(self, provider):  # noqa: ANN001
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "memory_search",
+                        "description": "Search memory.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+
+        def has_memory_tool_calls(self, response, provider):  # noqa: ANN001
+            return any(
+                isinstance(item, dict) and item.get("name") == "memory_search"
+                for item in response.get("output", [])
+            )
+
+        async def _ensure_initialized(self):
+            return None
+
+        async def ensure_initialized(self):
+            return None
+
+        def health_status(self):
+            return {"initialized": False, "backend": "test"}
+
+        async def close(self):
+            return None
+
+        async def _execute_memory_tool(self, name, args, user_id, provider):  # noqa: ANN001
+            self.executed.append((name, args, user_id, provider))
+            return json.dumps({"matches": ["remembered"]})
+
+    app = _make_app()
+    memory = _MemorySpy()
+    app.state.proxy.memory_handler = memory
+    calls: list[dict] = []
+
+    async def fake_retry(method, url, headers, body_, stream=False, **kwargs):
+        calls.append(body_)
+        payload = initial if len(calls) == 1 else final
+        return httpx.Response(
+            200,
+            content=as_sse(payload),
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request(method, url),
+        )
+
+    app.state.proxy._retry_request = fake_retry
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/responses",
+            headers={
+                "Authorization": "Bearer sk-test",
+                "Content-Type": "application/json",
+                "x-headroom-user-id": "user-1",
+            },
+            json={"model": "gpt-5.4", "stream": False, "store": True, "input": "hello"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.json()["id"] == "resp_after_memory"
+    assert len(calls) == 2
+    assert memory.executed
+    assert "memory_search" not in resp.text
