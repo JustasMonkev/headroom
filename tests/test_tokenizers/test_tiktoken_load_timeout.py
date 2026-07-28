@@ -72,9 +72,11 @@ def test_fast_load_returns_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_registry_falls_back_to_estimator_on_stall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the Rust-bundled BPE, a stalled load still degrades to estimation."""
     import tiktoken
 
     monkeypatch.setattr(tiktoken, "get_encoding", _stalled_get_encoding)
+    monkeypatch.setattr(tc, "_rust_bundled_encoding", lambda _name: None)
     monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.2")
 
     counter = TokenizerRegistry()._create_tiktoken("gpt-4")

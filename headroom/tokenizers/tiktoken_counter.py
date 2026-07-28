@@ -35,6 +35,59 @@ class TiktokenLoadError(RuntimeError):
 _load_failed: set[str] = set()
 
 
+class _RustBundledEncoding:
+    """Minimal tiktoken-``Encoding`` stand-in backed by the Rust core.
+
+    ``tiktoken-rs`` (inside ``headroom._core``) vendors the BPE data files for
+    the four OpenAI encodings, so this works fully offline — no vocab download.
+    Token IDs are byte-identical to Python ``tiktoken`` for the same encoding
+    (same BPE merge tables), which keeps compression ratios and context-pressure
+    gates exact instead of degrading to character estimation when the network
+    is unavailable (air-gapped hosts, firewalled CI, proxies that block
+    openaipublic.blob.core.windows.net).
+
+    Special-token strings (e.g. a literal ``<|endoftext|>`` in tool output) are
+    always encoded as ordinary text — the tolerant behavior our counters
+    already opt into via ``disallowed_special=()`` — so ``encode`` never raises
+    on content, unlike tiktoken's default.
+    """
+
+    def __init__(self, name: str, core: Any):
+        self.name = name
+        self._core = core
+
+    def encode(self, text: str, **_kwargs: Any) -> list[int]:
+        return self._core.tiktoken_encode(self.name, text)
+
+    def decode(self, tokens: list[int]) -> str:
+        return self._core.tiktoken_decode(self.name, list(tokens))
+
+    def count_tokens(self, text: str) -> int:
+        # Fast path: counts without materializing the token-id list across the
+        # FFI boundary. TiktokenCounter.count_text prefers this when present.
+        return self._core.tiktoken_count(self.name, text)
+
+    def __repr__(self) -> str:
+        return f"_RustBundledEncoding(name={self.name!r})"
+
+
+def _rust_bundled_encoding(encoding_name: str) -> _RustBundledEncoding | None:
+    """Offline fallback encoding from the Rust core, or None if unavailable.
+
+    None when the compiled extension is missing (pure-Python install), predates
+    the tiktoken bridge, or doesn't bundle ``encoding_name``.
+    """
+    try:
+        from headroom import _core
+    except ImportError:
+        return None
+    if not hasattr(_core, "tiktoken_encode"):
+        return None
+    if encoding_name not in _core.tiktoken_bundled_encodings():
+        return None
+    return _RustBundledEncoding(encoding_name, _core)
+
+
 def _load_timeout_seconds() -> float:
     try:
         return float(os.environ.get("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "10"))
@@ -114,9 +167,19 @@ def _get_encoding(encoding_name: str):
     first timed-out encoding is remembered so later calls fail fast instead of
     re-blocking on every request.
     """
-    import tiktoken
+    try:
+        import tiktoken
+    except ImportError:
+        fallback = _rust_bundled_encoding(encoding_name)
+        if fallback is not None:
+            logger.info("tiktoken not installed; using bundled Rust BPE for %r", encoding_name)
+            return fallback
+        raise
 
     if encoding_name in _load_failed:
+        fallback = _rust_bundled_encoding(encoding_name)
+        if fallback is not None:
+            return fallback
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
 
     box: dict[str, Any] = {}
@@ -133,6 +196,16 @@ def _get_encoding(encoding_name: str):
 
     if worker.is_alive():
         _load_failed.add(encoding_name)
+        fallback = _rust_bundled_encoding(encoding_name)
+        if fallback is not None:
+            logger.info(
+                "tiktoken encoding %r did not load within %.1fs (likely a stalled "
+                "vocab download); using the BPE table bundled in headroom._core "
+                "instead (exact counts, no network needed).",
+                encoding_name,
+                _load_timeout_seconds(),
+            )
+            return fallback
         logger.warning(
             "tiktoken encoding %r did not load within %.1fs (likely a stalled vocab "
             "download); falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
@@ -142,6 +215,17 @@ def _get_encoding(encoding_name: str):
         )
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} load timed out")
     if "err" in box:
+        # Fast network failures land here (DNS refusal, blocked proxy, TLS
+        # errors from the vocab download) rather than in the timeout branch.
+        fallback = _rust_bundled_encoding(encoding_name)
+        if fallback is not None:
+            logger.info(
+                "tiktoken encoding %r failed to load (%s); using the BPE table "
+                "bundled in headroom._core instead (exact counts, no network needed).",
+                encoding_name,
+                box["err"],
+            )
+            return fallback
         raise box["err"]
     return box["enc"]
 
@@ -245,6 +329,13 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
+        encoding = self.encoding
+        count_tokens = getattr(encoding, "count_tokens", None)
+        if count_tokens is not None:
+            # Rust-bundled fallback encoding: count without materializing the
+            # token-id list across the FFI boundary. Real tiktoken encodings
+            # have no count_tokens attribute and take the path below.
+            return int(count_tokens(text))
         try:
             return len(self.encoding.encode(text))
         except ValueError:

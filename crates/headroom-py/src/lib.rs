@@ -1560,6 +1560,61 @@ fn known_html_tag_names() -> Vec<&'static str> {
     rust_known_html_tag_names().to_vec()
 }
 
+// ─── tiktoken bridge ───────────────────────────────────────────────────────
+//
+// `tiktoken-rs` vendors the BPE data files for the four OpenAI encodings,
+// so — unlike Python `tiktoken`, which downloads the vocab on first use —
+// these functions work with no network access. The Python tokenizer layer
+// (`headroom.tokenizers.tiktoken_counter`) uses them as an offline fallback
+// when the vocab download fails or times out, keeping token counts exact
+// instead of degrading to character estimation. Token IDs are byte-identical
+// to Python `tiktoken` for the same encoding (same BPE merge tables).
+
+fn bundled_bpe(encoding_name: &str) -> PyResult<std::sync::Arc<headroom_core::tokenizer::CoreBPE>> {
+    headroom_core::tokenizer::bpe_for_encoding(encoding_name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown tiktoken encoding: '{encoding_name}' (bundled: o200k_base, \
+             cl100k_base, p50k_base, r50k_base)"
+        ))
+    })
+}
+
+/// Encoding names whose BPE tables are bundled in the Rust core.
+#[pyfunction]
+fn tiktoken_bundled_encodings() -> Vec<&'static str> {
+    vec!["o200k_base", "cl100k_base", "p50k_base", "r50k_base"]
+}
+
+/// Count tokens in `text` under `encoding_name` without materializing the
+/// token-id list across the FFI boundary (counting is the hot path).
+///
+/// Special-token strings (e.g. a literal `<|endoftext|>`) are encoded as
+/// ordinary text — the tolerant behavior the Python counters already opt
+/// into via `disallowed_special=()`.
+#[pyfunction]
+fn tiktoken_count(py: Python<'_>, encoding_name: &str, text: &str) -> PyResult<usize> {
+    let bpe = bundled_bpe(encoding_name)?;
+    let owned = text.to_string();
+    Ok(py.detach(move || bpe.encode_ordinary(&owned).len()))
+}
+
+/// Encode `text` to token IDs under `encoding_name`. Special-token strings
+/// are treated as ordinary text (see `tiktoken_count`).
+#[pyfunction]
+fn tiktoken_encode(py: Python<'_>, encoding_name: &str, text: &str) -> PyResult<Vec<u32>> {
+    let bpe = bundled_bpe(encoding_name)?;
+    let owned = text.to_string();
+    Ok(py.detach(move || bpe.encode_ordinary(&owned)))
+}
+
+/// Decode token IDs back to text under `encoding_name`.
+#[pyfunction]
+fn tiktoken_decode(py: Python<'_>, encoding_name: &str, tokens: Vec<u32>) -> PyResult<String> {
+    let bpe = bundled_bpe(encoding_name)?;
+    py.detach(move || bpe.decode(&tokens))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("decode failed: {e}")))
+}
+
 // ─── Module init ───────────────────────────────────────────────────────────
 
 /// Apply OpenAI `/v1/responses` live-zone compression to a request body.
@@ -1843,5 +1898,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(content_has_error_indicators, m)?)?;
     m.add_function(wrap_pyfunction!(keyword_registry_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(compress_openai_responses_live_zone, m)?)?;
+    m.add_function(wrap_pyfunction!(tiktoken_bundled_encodings, m)?)?;
+    m.add_function(wrap_pyfunction!(tiktoken_count, m)?)?;
+    m.add_function(wrap_pyfunction!(tiktoken_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(tiktoken_decode, m)?)?;
     Ok(())
 }
