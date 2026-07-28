@@ -240,14 +240,15 @@ class TestPruneDanglingToolReferences:
         assert pruned == {"WaitForMcpServers"}
         assert out[0]["content"] and out[0]["content"][0]["type"] == "text"
 
-    def test_absent_tools_shape_is_a_noop(self):
-        """Missing tools is ambiguous, so preserve the byte-stable history."""
+    def test_omitted_tools_prunes_all_references(self):
+        """No tools field means the outgoing request declares zero tools."""
         messages = self._messages_with_reference("WaitForMcpServers")
 
         out, pruned = prune_dangling_tool_references(messages, None)
 
-        assert pruned == set()
-        assert out is messages
+        assert pruned == {"Bash", "WaitForMcpServers"}
+        result = out[1]["content"][0]["content"]
+        assert result["tool_references"] == []
 
     def test_unrecognized_nonempty_tools_shape_is_a_noop(self):
         messages = self._messages_with_reference("WaitForMcpServers")

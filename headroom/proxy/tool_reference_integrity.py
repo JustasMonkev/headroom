@@ -157,12 +157,16 @@ def prune_dangling_tool_references(
     if not isinstance(messages, list) or not messages:
         return messages, set()
 
-    if not isinstance(tools, list):
-        # Absent or unknown top-level shape: do not guess that the request is
-        # tool-free.
+    if tools is None:
+        # An omitted tools field has the same outgoing wire semantics as an
+        # explicitly empty list: this request declares no callable tools.
+        declared: set[str] = set()
+    elif not isinstance(tools, list):
+        # Preserve fail-open behavior only for genuinely unrecognized shapes.
         return messages, set()
-    declared = collect_declared_tool_names(tools)
-    if tools and not declared:
+    else:
+        declared = collect_declared_tool_names(tools)
+    if isinstance(tools, list) and tools and not declared:
         # A non-empty list with no understood declarations is likewise an
         # unknown shape. An explicitly empty list is different: it is a known
         # declaration of zero tools, so every tool_reference must be pruned.

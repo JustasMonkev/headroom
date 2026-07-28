@@ -105,16 +105,21 @@ def test_multi_block_parallel_branch_fails_open_at_deadline(monkeypatch, caplog)
     monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "4")
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "50")
 
+    release = threading.Event()
+
     def slow_compress(content, *, context="", bias=1.0):
-        time.sleep(5.0)
+        release.wait(timeout=5.0)
         return _compression_result(content, "compressed output")
 
     monkeypatch.setattr(router, "compress", slow_compress)
 
     original = _messages()
     started = time.perf_counter()
-    result = _apply(router, original)
-    elapsed = time.perf_counter() - started
+    try:
+        result = _apply(router, original)
+        elapsed = time.perf_counter() - started
+    finally:
+        release.set()
 
     # Bounded by the budget, not by the 5s sleep.
     assert elapsed < 2.0, f"stage took {elapsed:.2f}s — deadline did not bound the thread pool"
@@ -130,16 +135,21 @@ def test_multi_block_inline_branch_fails_open_at_deadline(monkeypatch, caplog):
     monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "1")
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "50")
 
+    release = threading.Event()
+
     def slow_compress(content, *, context="", bias=1.0):
-        time.sleep(5.0)
+        release.wait(timeout=5.0)
         return _compression_result(content, "compressed output")
 
     monkeypatch.setattr(router, "compress", slow_compress)
 
     original = _messages()
     started = time.perf_counter()
-    result = _apply(router, original)
-    elapsed = time.perf_counter() - started
+    try:
+        result = _apply(router, original)
+        elapsed = time.perf_counter() - started
+    finally:
+        release.set()
 
     assert elapsed < 2.0, f"stage took {elapsed:.2f}s — deadline did not bound the inline loop"
     for i in range(1, len(original)):
@@ -277,3 +287,69 @@ def test_timed_out_workers_are_bounded_across_requests(monkeypatch):
         deadline = time.monotonic() + 1.0
         while active and time.monotonic() < deadline:
             time.sleep(0.01)
+
+
+def test_short_lived_routers_reuse_the_process_worker_pool():
+    """Standalone optimize calls must not leave one idle pool per router."""
+    first = _router()
+    second = _router()
+
+    first_executor = first._get_stage_compression_executor(3)
+    second_executor = second._get_stage_compression_executor(3)
+
+    assert first_executor is second_executor
+    assert len(first_executor._threads) == 3
+
+
+def test_burst_larger_than_queue_drains_in_waves(monkeypatch):
+    """Healthy work beyond running+queued capacity still runs before deadline."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "2")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "2000")
+
+    def fast_compress(content, *, context="", bias=1.0):
+        time.sleep(0.01)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", fast_compress)
+
+    result = _apply(router, _messages(pending=12))
+
+    for message in result.messages[1:]:
+        assert message["content"] == "compressed output"
+
+
+def test_deadline_fallback_is_retried_instead_of_skip_cached(monkeypatch):
+    """A timeout says nothing about whether the same content can compress later."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "3")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "30")
+    release = threading.Event()
+
+    def wedged_compress(content, *, context="", bias=1.0):
+        release.wait(timeout=2.0)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", wedged_compress)
+    original = _messages(pending=1)
+    try:
+        first = _apply(router, original)
+    finally:
+        release.set()
+    assert first.messages[1]["content"] == original[1]["content"]
+
+    # Allow the timed-out worker to leave the shared executor before retrying.
+    deadline = time.monotonic() + 1.0
+    executor = router._stage_compression_executor
+    assert executor is not None
+    while executor._queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, *, context="", bias=1.0: _compression_result(content, "compressed output"),
+    )
+    second = _apply(router, original)
+
+    assert second.messages[1]["content"] == "compressed output"
