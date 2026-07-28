@@ -33,8 +33,8 @@ from headroom.transforms.lossless_compaction import (
     compact_lossless,
     search_dir_heading,
     search_dir_unheading,
+    search_fold_recovers,
     search_heading,
-    search_unfold,
     search_unheading,
 )
 
@@ -118,8 +118,8 @@ def main() -> int:
         before = previous_best(content)
         after = compact_lossless(content, "search")
         # Both must be exactly recoverable or the number is meaningless.
-        assert search_unfold(before) == content or before == content, label
-        assert search_unfold(after) == content or after == content, label
+        assert before == content or search_fold_recovers(before, content), label
+        assert after == content or search_fold_recovers(after, content), label
 
         raw_t, before_t, after_t = (
             _estimate_tokens(content),

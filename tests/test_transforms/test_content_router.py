@@ -22,7 +22,7 @@ from headroom.transforms.content_router import (
     RouterCompressionResult,
     RoutingDecision,
 )
-from headroom.transforms.lossless_compaction import search_unfold
+from headroom.transforms.lossless_compaction import search_fold_recovers
 
 # =============================================================================
 # Test Fixtures
@@ -1061,7 +1061,7 @@ class TestExcludeTools:
         # Excluded from lossy compression; search results get a byte-lossless
         # heading fold. Verify byte-exact recovery (Anthropic block format).
         original = messages[1]["content"][0]["content"]
-        assert search_unfold(tool_result_block["content"]) == original
+        assert search_fold_recovers(tool_result_block["content"], original)
         assert "router:excluded:lossless_search" in result.transforms_applied
 
     def test_anthropic_tool_result_runtime_window_allows_old_excluded_tools(self, tokenizer):

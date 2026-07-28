@@ -687,7 +687,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output():
     """Excluded tools skip *lossy* compression, but grep/log/json output is still
     byte/data-losslessly compacted on the Responses path (matches chat/Anthropic).
     """
-    from headroom.transforms.lossless_compaction import search_unfold
+    from headroom.transforms.lossless_compaction import search_fold_recovers
 
     router = ContentRouter()
     router.config.exclude_tools = {"grep"}
@@ -718,11 +718,11 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output():
     assert "router:excluded:lossless" in transforms
     folded = new_payload["input"][1]["output"]
     assert len(folded) < len(grep_out)  # byte-smaller (real guarantee)
-    assert search_unfold(folded) == grep_out  # byte-exact recovery
+    assert search_fold_recovers(folded, grep_out)  # byte-exact recovery
 
 
 def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts():
-    from headroom.transforms.lossless_compaction import search_unfold
+    from headroom.transforms.lossless_compaction import search_fold_recovers
 
     router = ContentRouter()
     router.config.exclude_tools = {"grep"}
@@ -761,7 +761,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
     assert len(folded) == 1
     assert isinstance(folded[0], dict) and folded[0].get("type") == "output_text"
     assert len(folded[0]["text"]) < len(grep_out)
-    assert search_unfold(folded[0]["text"]) == grep_out
+    assert search_fold_recovers(folded[0]["text"], grep_out)
 
 
 def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_parts_with_non_text():
@@ -771,7 +771,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_
     refusals), the lossless fold should only update output_text/input_text parts
     and leave everything else intact.
     """
-    from headroom.transforms.lossless_compaction import search_unfold
+    from headroom.transforms.lossless_compaction import search_fold_recovers
 
     router = ContentRouter()
     router.config.exclude_tools = {"grep"}
@@ -816,7 +816,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_
     # output_text part was compressed
     assert folded_list[0]["type"] == "output_text"
     assert len(folded_list[0]["text"]) < len(grep_out)
-    assert search_unfold(folded_list[0]["text"]) == grep_out
+    assert search_fold_recovers(folded_list[0]["text"], grep_out)
     # Non-text parts are byte-identical
     assert folded_list[1]["type"] == "input_image"
     assert folded_list[1]["image_url"] == "https://example.com/img.png"

@@ -29,7 +29,7 @@ __all__ = [
     "search_dir_unheading",
     "search_tree_heading",
     "search_tree_unheading",
-    "search_unfold",
+    "search_fold_recovers",
     "diff_strip_index",
     "compact_lossless",
 ]
@@ -369,12 +369,30 @@ def search_dir_unheading(text: str) -> str:
 # (``12:body`` / ``12,40,73:body``) or an *increment* row (``:body``) meaning
 # "previous line number + 1". The separator is ``:`` for grep match rows and
 # ``-`` for ripgrep context rows (``-C``/``-A``/``-B``).
-_TREE_NUMS_RE = re.compile(r"^(?P<nums>\d+(?:,\d+)*)(?P<sep>[:-])(?P<content>.*)$")
+#
+# Digits are ASCII and length-bounded on purpose. ``str.isdigit()`` is true for
+# 108 non-decimal characters (``²``, ``፩``, …) that ``\d`` does not match and
+# ``int()`` rejects, and CPython refuses ``int()`` on runs longer than 4300
+# digits — either mismatch turns a parse into a ValueError halfway through the
+# fold. ``[0-9]{1,18}`` makes the scanner, the regexes and ``int()`` agree on
+# exactly one definition of "digit run", and 18 digits is already far past any
+# line number a file can have.
+_TREE_NUMS_RE = re.compile(r"^(?P<nums>[0-9]{1,18}(?:,[0-9]{1,18})*)(?P<sep>[:-])(?P<content>.*)$")
 _TREE_INC_RE = re.compile(r"^(?P<sep>[:-])(?P<content>.*)$")
+_TREE_MAX_DIGITS = 18
 # ripgrep's between-groups separator. It is also a syntactically valid
 # increment row (``-`` separator, body ``-``), so both directions special-case
 # it: the fold never emits it as an increment, the unfold never reads it as one.
 _RG_GROUP_SEP = "--"
+# Bounds on the line-number-marker scan. A marker past `_TREE_MAX_PATH` chars is
+# beyond any real path (PATH_MAX is 4096), and a line needing more than
+# `_TREE_MAX_MARKERS` rejected candidates is not grep output. Without them the
+# scan is quadratic in line length — `"a" + "-1"*k + "/x"` is a single line of
+# nothing but accepted-then-rejected dash markers, and at 31 KB it already costs
+# ~250ms with a clean 4x per doubling. Failing to parse is free: the line
+# becomes passthrough, so the bounds cost savings at worst, never correctness.
+_TREE_MAX_PATH = 4096
+_TREE_MAX_MARKERS = 64
 
 
 def _tree_split_row(line: str) -> tuple[str, str, str, str] | None:
@@ -396,6 +414,10 @@ def _tree_split_row(line: str) -> tuple[str, str, str, str] | None:
 
     Returns ``None`` for any line that isn't a data row.
     """
+    limit = min(len(line), _TREE_MAX_PATH)
+    # A path never contains a space, so the first one bounds every colon-tier
+    # candidate. Computed once instead of re-scanning the prefix per candidate.
+    first_space = line.find(" ")
     for sep in (":", "-"):
         start = 0
         # Skip a Windows drive colon (``C:\Users\...``) so it is never mistaken
@@ -409,33 +431,39 @@ def _tree_split_row(line: str) -> tuple[str, str, str, str] | None:
         ):
             start = 2
         pos = line.find(sep, start)
-        while pos != -1:
+        seen = 0
+        while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
+            seen += 1
             end = pos + 1
-            while end < len(line) and line[end].isdigit():
+            while end < len(line) and end - pos <= _TREE_MAX_DIGITS and line[end] in "0123456789":
                 end += 1
             if end > pos + 1 and end < len(line) and line[end] == sep:
-                path = line[:pos]
-                if path and (sep == "-" or " " not in path):
-                    if sep == ":" or not _tree_dash_continues(path, line[end + 1 :]):
-                        return path, sep, line[pos + 1 : end], line[end + 1 :]
+                if pos > 0 and (sep == "-" or first_space == -1 or first_space >= pos):
+                    if sep == ":" or not _tree_dash_continues(line, pos, end):
+                        return line[:pos], sep, line[pos + 1 : end], line[end + 1 :]
             pos = line.find(sep, pos + 1)
     return None
 
 
-def _tree_dash_continues(path: str, rest: str) -> bool:
-    """True when a dash marker looks like it sits *inside* the path.
+def _tree_dash_continues(line: str, pos: int, end: int) -> bool:
+    """True when the dash marker at ``pos`` looks like it sits *inside* the path.
 
     Positive evidence only: the path so far has no extension on its last
     segment (``logs/2026``) and the text after the marker still carries path
     structure (a ``/`` or an extension dot) before the first space. Absent that
     evidence the caller stops at this marker, which is what the plain
     leftmost-wins rule would do anyway.
+
+    Takes indices rather than slices so a long line doesn't get copied once per
+    candidate marker — that copying is what made the scan quadratic.
     """
-    tail = path.rsplit("/", 1)[-1]
-    if "." in tail:
+    segment = line.rfind("/", 0, pos) + 1
+    if line.find(".", segment, pos) != -1:
         return False
-    token = rest.split(" ", 1)[0]
-    return "/" in token or "." in token
+    stop = line.find(" ", end + 1)
+    if stop == -1:
+        stop = len(line)
+    return line.find("/", end + 1, stop) != -1 or line.find(".", end + 1, stop) != -1
 
 
 def _tree_is_data_row(line: str) -> bool:
@@ -637,28 +665,36 @@ def search_tree_unheading(text: str) -> str:
     return _join(out, had_trailing)
 
 
-def search_unfold(text: str) -> str:
-    """Expand any ``kind="search"`` fold back to the original grep output.
+def search_fold_recovers(folded: str, original: str) -> bool:
+    """True when some search fold's inverse turns ``folded`` back into ``original``.
 
-    ``compact_lossless`` picks whichever of the search folds is smallest for a
-    given payload, so a caller holding a folded blob cannot know which inverse
-    applies. This tries each one and accepts the first whose expansion *re-folds*
-    to exactly the input — the same self-check ``compact_lossless`` runs, in the
-    other direction. Text that isn't a fold (or that no inverse claims) is
-    returned unchanged, so this is safe to call on arbitrary content.
+    This is the exact guarantee ``compact_lossless`` enforces when it picks a
+    ``kind="search"`` candidate, restated so callers (chiefly tests) can assert
+    it without knowing which of the three folds won.
+
+    There is deliberately no ``search_unfold(folded) -> original`` counterpart.
+    Recovering a fold *without* the original is unsound: the inverses are not
+    mutually exclusive, so more than one can claim the same blob, and an inverse
+    that did not produce it can still expand it into text that re-folds to
+    exactly the input. That check therefore accepts a wrong answer rather than
+    rejecting it — e.g. ``'docs/\\nREADME.md\\n12:h\\n40:w\\n'`` is what the file
+    fold emits for a grep result preceded by a literal ``docs/`` banner line, but
+    the tree inverse claims it first and fabricates ``docs/`` onto both paths
+    while destroying the banner. Nothing in the compression path ever needs to
+    unfold — the folded text is what the model reads — so the ambiguity is only
+    worth resolving where the original is on hand, which is what this does.
     """
-    for fold, unfold in (
+    for _fold, unfold in (
         (search_tree_heading, search_tree_unheading),
         (search_heading, search_unheading),
         (search_dir_heading, search_dir_unheading),
     ):
         try:
-            expanded = unfold(text)
+            if unfold(folded) == original:
+                return True
         except Exception:
             continue
-        if expanded != text and fold(expanded) == text:
-            return expanded
-    return text
+    return False
 
 
 def diff_strip_index(text: str) -> str:

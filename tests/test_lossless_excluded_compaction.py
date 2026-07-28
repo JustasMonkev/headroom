@@ -21,7 +21,7 @@ import pytest
 from headroom.providers import OpenAIProvider
 from headroom.tokenizer import Tokenizer
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.lossless_compaction import expand_runs, search_unfold, strip_ansi
+from headroom.transforms.lossless_compaction import expand_runs, search_fold_recovers, strip_ansi
 from headroom.transforms.lossless_provider import (
     get_lossless_provider,
     set_lossless_provider,
@@ -62,7 +62,7 @@ def test_grep_search_fold_is_byte_lossless():
     out, kind = _compact(GREP)
     assert kind == "search"
     assert len(out) < len(GREP)
-    assert search_unfold(out) == GREP  # byte-exact
+    assert search_fold_recovers(out, GREP)  # byte-exact
 
 
 def test_log_compaction_recovers_modulo_ansi():
@@ -103,7 +103,7 @@ def _run(content: str, tool: str, tokenizer):
 def test_pipeline_folds_grep_and_recovers(tokenizer):
     out, transforms = _run(GREP, "grep", tokenizer)
     assert "router:excluded:lossless_search" in transforms
-    assert search_unfold(out) == GREP
+    assert search_fold_recovers(out, GREP)
 
 
 def test_pipeline_compacts_log_read(tokenizer):
@@ -137,7 +137,7 @@ def test_default_no_provider_uses_builtin():
     # Unset (default) → built-in folds run; GREP compacts via search-heading.
     assert get_lossless_provider() is None
     out, kind = _compact(GREP)
-    assert kind == "search" and search_unfold(out) == GREP
+    assert kind == "search" and search_fold_recovers(out, GREP)
 
 
 def test_registered_provider_is_authoritative():
@@ -157,4 +157,4 @@ def test_provider_exception_falls_back_to_builtin():
     set_lossless_provider(boom)
     # Falls back to the built-in fold rather than crashing or passing through raw.
     out, kind = _compact(GREP)
-    assert kind == "search" and search_unfold(out) == GREP
+    assert kind == "search" and search_fold_recovers(out, GREP)

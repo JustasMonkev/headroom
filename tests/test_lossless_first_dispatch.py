@@ -10,7 +10,7 @@ stage.
 """
 
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.lossless_compaction import search_unfold
+from headroom.transforms.lossless_compaction import search_fold_recovers
 
 
 def _grep_block() -> str:
@@ -67,7 +67,7 @@ def test_flag_on_search_folds_lossless_byte_exact():
     assert tr == ["router:tool_result:lossless_search"]
     assert len(out) < len(block)
     # fully recoverable
-    assert search_unfold(out) == block
+    assert search_fold_recovers(out, block)
 
 
 def test_flag_on_search_fold_accepted_when_word_count_is_flat():
@@ -87,7 +87,7 @@ def test_flag_on_search_fold_accepted_when_word_count_is_flat():
     assert tr == ["router:tool_result:lossless_search"]
     assert len(out) < len(block)
     assert len(out.split()) >= len(block.split())
-    assert search_unfold(out) == block
+    assert search_fold_recovers(out, block)
 
 
 def test_flag_on_search_fold_is_deterministic():
@@ -109,7 +109,7 @@ def test_flag_off_still_keeps_lossless_floor_for_foldable():
     out, was, tr = _compress(block, lossless=False)
     assert was is True
     assert tr == ["router:tool_result:lossless_search"]
-    assert search_unfold(out) == block
+    assert search_fold_recovers(out, block)
 
 
 def test_has_lossless_fold_admits_small_block_below_size_floor():

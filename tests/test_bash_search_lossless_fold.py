@@ -23,9 +23,9 @@ from headroom.transforms.content_router import (
     _bash_program,
 )
 from headroom.transforms.lossless_compaction import (
+    search_fold_recovers,
     search_heading,
     search_tree_unheading,
-    search_unfold,
     search_unheading,
 )
 
@@ -261,8 +261,8 @@ def test_search_dir_fold_roundtrips_mixed_and_passthrough() -> None:
         "src/b/z.py:3:content with a colon: value\nnoslash.py:4:pathless row\n"
     )
     out = compact_lossless(mixed, "search")
-    # Whichever candidate wins, search_unfold finds the inverse that applies.
-    assert search_unfold(out) == mixed or out == mixed
+    # Whichever candidate wins, some inverse recovers the original exactly.
+    assert search_fold_recovers(out, mixed) or out == mixed
 
 
 def test_search_file_fold_wins_for_many_matches_one_file() -> None:
