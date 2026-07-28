@@ -328,50 +328,65 @@ def test_braces_and_quotes_in_a_body_do_not_block_the_fold():
     assert search_tree_unheading(folded) == grep
 
 
-# A row can fit more than one anchored path when one file's name is a prefix of
-# another's. Both readings are legitimate, so the row is resolved by where it
-# sits — grep emits a file's rows contiguously — and left alone when that does
-# not settle it. Preferring the longer path looked like a tie-break but was a
-# coin toss that landed the same way every time, tearing genuine context rows
-# out of their own block.
+# A row that reads as two different files is left unparsed. Three tie-breaks
+# were tried before this — longest path, then the surrounding block, then
+# ascending line order — and each fixed one shape by breaking another, because
+# the competing shapes are textually identical with opposite right answers.
 
 
-def test_ambiguous_context_row_follows_the_block_it_sits_in():
-    rg = "report.log:2025:MATCH\nreport.log-2026-backup-1-before\nreport.log-2026-backup:2:OTHER\n"
-    folded = search_tree_heading(rg)
-    # Stays with report.log (as line 2026), rather than opening a new heading.
-    assert folded.startswith("report.log\n2025:MATCH\n-backup-1-before\n")
-    assert search_tree_unheading(folded) == rg
-
-
-def test_ambiguous_context_row_follows_the_other_block_just_as_readily():
-    rg = (
+@pytest.mark.parametrize(
+    "rg",
+    [
+        # The same three rows in both orders: any tie-break gets one of them wrong.
+        "report.log:2025:MATCH\nreport.log-2026-backup-1-before\nreport.log-2026-backup:2:OTHER\n",
         "report.log:1:MATCH one\n"
         "report.log-2026-backup:2:MATCH two\n"
-        "report.log-2026-backup-1-before\n"
-    )
+        "report.log-2026-backup-1-before\n",
+        # Nothing around the row at all.
+        "report.log:1:a\nreport.log-2026-backup:2:b\n== banner ==\n"
+        "report.log-2026-backup-1-before\n",
+    ],
+)
+def test_rows_that_read_as_two_files_are_left_unparsed(rg):
     folded = search_tree_heading(rg)
-    assert folded.rstrip("\n").endswith("2:MATCH two\n1-before")
+    assert "report.log-2026-backup-1-before" in folded  # emitted verbatim
     assert search_tree_unheading(folded) == rg
 
 
-def test_ambiguous_context_row_is_left_unparsed_without_block_context():
-    # The banner ends the block, so the row opens a new one with nothing to
-    # resolve it. Declining costs one row of folding; guessing files a line
-    # under a path it never came from.
-    rg = (
-        "report.log:1:a\n"
-        "report.log-2026-backup:2:b\n"
-        "== banner ==\n"
-        "report.log-2026-backup-1-before\n"
-    )
+def test_a_quoted_file_line_reference_in_a_context_body_is_left_unparsed():
+    # `src/app.py-40-other.py:12:foo` is a match row in `src/app.py-40-other.py`
+    # or context in `src/app.py`. Taking the colon reading folded the block
+    # under a fabricated heading; taking the dash reading breaks the mirror
+    # case below. Neither, then — and the rest of the block still folds.
+    rg = "src/app.py-40-other.py:12:foo\nsrc/app.py:41:MATCH\nsrc/app.py-42-after\n"
     folded = search_tree_heading(rg)
-    assert folded.rstrip("\n").endswith("report.log-2026-backup-1-before")
+    assert "src/app.py-40-other.py:12:foo" in folded
+    assert "app.py-40-other.py\n" not in folded  # no fabricated heading
+    assert search_tree_unheading(folded) == rg
+    assert len(folded) < len(rg)
+
+
+def test_a_match_row_extending_an_anchored_path_is_left_unparsed():
+    # The mirror image: `src/a-1-b.py:12:x` is a real match row, but with
+    # `src/a` anchored it also reads as context in `src/a` at line 1.
+    rg = "src/a:5:established\nsrc/a-1-b.py:12:real match row\n"
+    folded = search_tree_heading(rg)
+    assert "src/a-1-b.py:12:real match row" in folded
     assert search_tree_unheading(folded) == rg
 
 
-def test_unambiguous_context_rows_are_unaffected_by_the_block_rule():
-    # Only one anchored path fits, so no context is needed to resolve it.
+@pytest.mark.parametrize("body", ["t = 12:34:56", "d = {'k': 12}", "raise ValueError('x: 1')"])
+def test_context_bodies_holding_colons_still_fold(body):
+    # The common case, and it must keep folding: a space precedes the colon
+    # marker, so the colon tier never claims these and nothing is ambiguous.
+    rg = f"s/a.py-9-{body}\ns/a.py:10:MATCH\ns/a.py-11-{body}\n"
+    folded = search_tree_heading(rg)
+    assert len(folded) < len(rg)
+    assert search_tree_unheading(folded) == rg
+
+
+def test_unambiguous_context_rows_still_fold():
+    # Only one anchored path fits and the colon tier does not claim it.
     rg = "src/app.py-40-before\nsrc/app.py:41:MATCH\nsrc/app.py-42-after\n"
     folded = search_tree_heading(rg)
     assert len(folded) < len(rg)

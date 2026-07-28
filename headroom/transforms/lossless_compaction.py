@@ -472,7 +472,6 @@ def _tree_dash_row(
     line: str,
     known_paths: frozenset[str],
     known_lengths: frozenset[int],
-    block_path: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Parse a ``path-line-content`` context row, anchored on ``known_paths``.
 
@@ -493,16 +492,9 @@ def _tree_dash_row(
     Anchoring narrows the field but does not always empty it: a result set
     holding both ``report.log:1:…`` and ``report.log-2026-backup:2:…`` makes both
     prefixes members, and ``report.log-2026-backup-1-before`` reads equally well
-    as either file. Preferring the longer path is not a tie-break, it is a coin
-    toss that happens to land the same way every time — it tears a genuine
-    ``report.log`` context row out of a run of ``report.log`` rows.
-
-    The one real signal is where the row sits: grep emits a file's rows
-    contiguously, so ``block_path`` — the file the rows around this one belong
-    to — settles it whenever it is one of the candidates. When it isn't (the row
-    opens a block, or the neighbours disagree) and more than one path still
-    fits, the row is left unparsed. Declining costs one row of folding; picking
-    wrong puts a line under a file it never came from.
+    as either file. Nothing in the text settles that, so the row is left
+    unparsed. Declining costs one row of folding; picking wrong puts a line
+    under a file it never came from, and the byte round-trip cannot see it.
 
     ``known_lengths`` lets the scan reject a candidate marker on an integer
     compare instead of slicing the prefix, keeping the walk linear.
@@ -520,27 +512,62 @@ def _tree_dash_row(
             if end > pos + 1 and end < len(line) and line[end] == "-":
                 path = line[:pos]
                 if path in known_paths:
-                    if path == block_path:
-                        return path, "-", line[pos + 1 : end], line[end + 1 :]
                     candidates.append((path, "-", line[pos + 1 : end], line[end + 1 :]))
+                    if len(candidates) > 1:
+                        return None
         pos = line.find("-", pos + 1)
-    return candidates[0] if len(candidates) == 1 else None
+    return candidates[0] if candidates else None
 
 
 def _tree_split_row(
     line: str,
     known_paths: frozenset[str] = frozenset(),
     known_lengths: frozenset[int] = frozenset(),
-    block_path: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Split a grep/ripgrep row into ``(path, sep, line_digits, content)``.
 
-    Returns ``None`` for any line that isn't a data row. Context rows need the
-    ``known_*`` sets from the colon pass, and ``block_path`` (the file the
-    surrounding rows belong to) to resolve a row that fits more than one of
-    them — see :func:`_tree_dash_row`.
+    Returns ``None`` for any line that isn't a data row, **or that is two rows
+    at once**.
+
+    A ``:`` marker is decisive on its own — a path cannot contain one — so a row
+    only the colon tier claims is a match row, and a row only the anchored dash
+    tier claims is a context row. The hard case is the row both tiers claim,
+    and it has no textual answer:
+
+    * ``src/app.py-40-other.py:12:foo`` — a context line quoting a
+      ``file:line:`` reference, which is what most log and error output looks
+      like — reads as a match in ``src/app.py-40-other.py`` or as context in
+      ``src/app.py``.
+    * ``src/a-1-b.py:12:x`` with ``src/a`` anchored reads as a match in
+      ``src/a-1-b.py`` or as context in ``src/a``, line 1.
+
+    They are the same shape with opposite right answers, so no ordering of the
+    tiers is correct, and successive tie-breaks — longest path, then the
+    surrounding block, then ascending line order — each fixed one and broke
+    another. This one declines instead: a row that reads as two different files
+    is left unparsed. Passthrough costs one row of folding; a fabricated heading
+    puts a line under a file it never came from, and the byte round-trip cannot
+    tell the difference.
     """
-    return _tree_colon_row(line) or _tree_dash_row(line, known_paths, known_lengths, block_path)
+    colon = _tree_colon_row(line)
+    dash = _tree_dash_row(line, known_paths, known_lengths)
+    if colon is None:
+        return dash
+    if dash is None or dash[0] == colon[0]:
+        return colon
+    return None
+
+
+def _tree_anchor_paths(lines: list[str]) -> tuple[frozenset[str], frozenset[int]]:
+    """The files a payload establishes, used to anchor its context rows.
+
+    A quoted reference in a context body can put a path in here that was never
+    in the result set (``src/app.py-40-other.py``). That is harmless on its own:
+    the only row such an anchor can claim is one the colon tier also claims, and
+    :func:`_tree_split_row` declines those.
+    """
+    paths = frozenset(row[0] for line in lines if (row := _tree_colon_row(line)))
+    return paths, frozenset(len(p) for p in paths)
 
 
 def _tree_is_data_row(line: str) -> bool:
@@ -571,11 +598,7 @@ def search_tree_heading(text: str) -> str:
     if not lines:
         return text
 
-    # Colon pass first: context rows are only recognised for files that already
-    # produced a match row, which is what keeps the ambiguous dash form from
-    # guessing. See :func:`_tree_dash_row`.
-    known_paths = frozenset(row[0] for line in lines if (row := _tree_colon_row(line)))
-    known_lengths = frozenset(len(p) for p in known_paths)
+    known_paths, known_lengths = _tree_anchor_paths(lines)
 
     out: list[str] = []
     # Mirrors the inverse's state: "" means no directory header is in effect.
@@ -594,9 +617,7 @@ def search_tree_heading(text: str) -> str:
         path = row[0]
         block: list[tuple[str, str, str, str]] = []
         while i < n:
-            # `path` is the block context: a row that fits several anchored
-            # paths belongs to the one its neighbours already established.
-            nxt = _tree_split_row(lines[i], known_paths, known_lengths, path)
+            nxt = _tree_split_row(lines[i], known_paths, known_lengths)
             if nxt is None or nxt[0] != path:
                 break
             block.append(nxt)
