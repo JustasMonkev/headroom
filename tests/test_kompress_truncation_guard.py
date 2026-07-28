@@ -34,3 +34,21 @@ def test_no_coverage_keeps_whole_chunk() -> None:
     kept: set[int] = set()
     _keep_tokenizer_truncated_tail(kept, [None, None], chunk_len=3, chunk_start=7)
     assert kept == {7, 8, 9}
+
+
+def test_sequence_full_preserves_final_word() -> None:
+    """Truncation INSIDE the chunk's final word leaves every word ID present;
+    the max-length signal must still preserve that word."""
+    kept: set[int] = set()
+    # All 3 words covered, but the sequence hit the cap: keep the boundary word.
+    word_ids = [None, 0, 1, 2, 2, None]
+    _keep_tokenizer_truncated_tail(kept, word_ids, chunk_len=3, chunk_start=10, sequence_full=True)
+    assert kept == {12}
+
+
+def test_full_coverage_without_cap_keeps_nothing() -> None:
+    kept: set[int] = set()
+    _keep_tokenizer_truncated_tail(
+        kept, [None, 0, 1, 2, None], chunk_len=3, chunk_start=10, sequence_full=False
+    )
+    assert kept == set()

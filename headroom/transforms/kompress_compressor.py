@@ -78,6 +78,7 @@ def _keep_tokenizer_truncated_tail(
     word_ids: list[int | None],
     chunk_len: int,
     chunk_start: int,
+    sequence_full: bool = False,
 ) -> None:
     """Keep verbatim any chunk words the tokenizer truncated away.
 
@@ -94,12 +95,15 @@ def _keep_tokenizer_truncated_tail(
     for wid in word_ids:
         if wid is not None and wid > max_covered:
             max_covered = wid
-    if max_covered < chunk_len - 1:
+    if max_covered < chunk_len - 1 or sequence_full:
         # Keep from the BOUNDARY word (max_covered), not the one after it:
         # when truncation lands mid-word, that word's ID still appears in
         # word_ids, so it looks covered — but the classifier only scored its
         # retained sub-word prefix and may drop the whole word on that
-        # partial evidence.
+        # partial evidence. ``sequence_full`` (the encoded sequence hit the
+        # max_length cap) catches the case a missing-word check cannot:
+        # truncation INSIDE the chunk's final word, where every word ID is
+        # present yet the last word was only partially encoded.
         kept_ids.update(range(chunk_start + max(max_covered, 0), chunk_start + chunk_len))
 
 
@@ -1445,7 +1449,16 @@ class KompressCompressor(Transform):
 
                 # Words past the 512-sub-word-token cap got no score/mask at
                 # all — keep them verbatim instead of silently deleting them.
-                _keep_tokenizer_truncated_tail(kept_ids, word_ids, len(chunk_words), chunk_start)
+                _keep_tokenizer_truncated_tail(
+                    kept_ids,
+                    word_ids,
+                    len(chunk_words),
+                    chunk_start,
+                    # Single-chunk batch: padded length == real length, so
+                    # hitting max_length means the tokenizer (possibly) cut
+                    # inside the final word.
+                    sequence_full=len(word_ids) >= 512,
+                )
 
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
@@ -1789,9 +1802,19 @@ class KompressCompressor(Transform):
 
                     # Words past the 512-sub-word-token cap got no score at
                     # all — keep them verbatim instead of silently deleting
-                    # them (see _keep_tokenizer_truncated_tail).
+                    # them (see _keep_tokenizer_truncated_tail). Batch padding
+                    # inflates len(word_ids) for every item, so the per-item
+                    # real length comes from the attention mask.
+                    mask_row = attention_mask[batch_idx]
+                    real_len = (
+                        int(mask_row.sum()) if hasattr(mask_row, "sum") else int(sum(mask_row))
+                    )
                     _keep_tokenizer_truncated_tail(
-                        kept_ids_per_text[text_idx], word_ids, len(chunk_words), chunk_start
+                        kept_ids_per_text[text_idx],
+                        word_ids,
+                        len(chunk_words),
+                        chunk_start,
+                        sequence_full=real_len >= 512,
                     )
 
                     if not word_scores:

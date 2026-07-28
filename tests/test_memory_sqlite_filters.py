@@ -297,3 +297,29 @@ async def test_bounded_path_matches_nested_objects_and_numerics(
     wrong["nested"] = {"y": 3, "x": 1}
     found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": wrong}))
     assert found == []
+
+
+async def test_bounded_path_structural_at_arbitrary_depth(store: SQLiteMemoryStore) -> None:
+    """The bounded path's recursive-CTE comparison must stay key-order
+    insensitive for objects at ANY depth (here: three levels down inside a
+    65+-entry container), while array order still matters."""
+    big = {f"k{i}": i for i in range(65)}
+    big["k0"] = {"wrap": {"deep": {"a": 1, "b": 2}, "arr": [1, 2]}}
+    await store.save(Memory(id="deep3", content="deep", user_id="u1", metadata={"cfg": big}))
+
+    flt = dict(big)
+    flt["k0"] = {"wrap": {"arr": [1, 2], "deep": {"b": 2, "a": 1}}}  # reordered at depths 2 and 3
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": flt}))
+    assert [m.id for m in found] == ["deep3"]
+
+    # Array order three levels down still matters.
+    wrong = dict(big)
+    wrong["k0"] = {"wrap": {"deep": {"a": 1, "b": 2}, "arr": [2, 1]}}
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": wrong}))
+    assert found == []
+
+    # A missing deep entry fails; an extra stored entry fails via the count.
+    subset = dict(big)
+    subset["k0"] = {"wrap": {"deep": {"a": 1}, "arr": [1, 2]}}
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": subset}))
+    assert found == []

@@ -567,75 +567,56 @@ class SQLiteMemoryStore:
 
         return conditions, params
 
-    @staticmethod
-    def _entry_mismatch_sql(s: str, f: str, depth: int) -> str:
-        """SQL fragment: true when json_each rows ``s`` and ``f`` differ.
-
-        Integer and real are grouped as one numeric class (matching the
-        per-entry scalar branch, so results don't flip with container size).
-        Containers recurse ``depth`` more structural join levels — each level
-        keys objects by entry NAME (order-insensitive) and arrays by index
-        (order enforced) — then compare as minified text below that. The
-        nested json_each calls are guarded by CASE, which SQLite evaluates
-        lazily, so they never run against a scalar value.
-        """
-        numeric = "('integer', 'real')"
-        type_mismatch = (
-            f"({s}.type != {f}.type AND NOT ({s}.type IN {numeric} AND {f}.type IN {numeric}))"
-        )
-        scalar_mismatch = (
-            f"({f}.type IN ('integer', 'real', 'text') AND {s}.value IS NOT {f}.value)"
-        )
-        if depth <= 0:
-            inner = f"{s}.value != {f}.value"
-        else:
-            s2, f2 = f"{s}x", f"{f}x"
-            inner = (
-                f"(SELECT COUNT(*) FROM json_each({s}.value))"
-                f" != (SELECT COUNT(*) FROM json_each({f}.value))"
-                f" OR EXISTS (SELECT 1 FROM json_each({f}.value) AS {f2}"
-                f" LEFT JOIN json_each({s}.value) AS {s2} ON {s2}.key = {f2}.key"
-                f" WHERE {s2}.key IS NULL"
-                f" OR {SQLiteMemoryStore._entry_mismatch_sql(s2, f2, depth - 1)})"
-            )
-        container_mismatch = (
-            f"({f}.type IN ('object', 'array')"
-            f" AND CASE WHEN {s}.type = {f}.type THEN ({inner}) ELSE 1 END)"
-        )
-        return f"{type_mismatch} OR {scalar_mismatch} OR {container_mismatch}"
-
     def _bounded_container_equality(
         self, json_path: str, value: Any, conditions: list[str], params: list[Any]
     ) -> None:
-        """Constant-size structural equality for a container filter value.
+        """Constant-size, full-depth structural equality for a container.
 
         Used when per-entry predicates would grow the SQL expression tree
         beyond SQLite's MAX_EXPR_DEPTH (oversized containers, spent predicate
-        budget, or nested keys unsafe for JSON paths). Joins the filter's
-        entries against the stored container's entries via json_each — on key
-        for objects (key order stays irrelevant even for huge objects) and on
-        index for arrays (order stays enforced) — and one more structural
-        join level below that, so objects nested directly inside the
-        container also match key-order-insensitively. Only containers three
-        levels down compare as minified text (the remaining bounded
-        compromise). Keys are joined as DATA, not interpolated into paths,
-        so arbitrary key names are safe here. The SQL is constant-size
-        regardless of container size.
+        budget, or nested keys unsafe for JSON paths). A recursive CTE
+        enumerates every node path of the FILTER json (via json_each's
+        properly-escaped ``fullkey``), and each path is checked against the
+        stored container: presence, type (integer/real grouped as one numeric
+        class, matching the per-entry branch), scalar value, and per-container
+        entry count. Object entries are addressed by NAME at every depth —
+        key order never matters — while array entries are addressed by index,
+        so array order is enforced. Extra stored entries fail the count check
+        of their parent container; missing ones fail the presence check.
+
+        The SQL is constant-size regardless of container size or nesting
+        depth (the CTE's row count follows the filter's node count, which is
+        data, not expression depth). Filter-derived paths are bound as
+        parameters, never interpolated, so arbitrary key names are safe.
         """
         json_kind = "array" if isinstance(value, (list, tuple)) else "object"
         serialized = json.dumps(value, separators=(",", ":"))
+        stored = f"json_extract(metadata, '{json_path}')"
         conditions.append(f"json_type(metadata, '{json_path}') = '{json_kind}'")
-        conditions.append(f"(SELECT COUNT(*) FROM json_each(metadata, '{json_path}')) = ?")
-        params.append(len(value))
         conditions.append(
             "NOT EXISTS ("
-            " SELECT 1 FROM json_each(?) AS f"
-            f" LEFT JOIN json_each(metadata, '{json_path}') AS s ON s.key = f.key"
-            " WHERE s.key IS NULL"
-            f" OR {self._entry_mismatch_sql('s', 'f', 1)}"
+            " WITH RECURSIVE fnodes(p) AS ("
+            "   SELECT '$'"
+            "   UNION ALL"
+            "   SELECT fe.fullkey FROM fnodes, json_each(?, fnodes.p) AS fe"
+            "   WHERE json_type(?, fnodes.p) IN ('object', 'array')"
+            " )"
+            " SELECT 1 FROM fnodes"
+            f" WHERE json_type({stored}, fnodes.p) IS NULL"
+            f" OR (json_type({stored}, fnodes.p) != json_type(?, fnodes.p)"
+            f"     AND NOT (json_type({stored}, fnodes.p) IN ('integer', 'real')"
+            "              AND json_type(?, fnodes.p) IN ('integer', 'real')))"
+            " OR (json_type(?, fnodes.p) IN ('integer', 'real', 'text')"
+            f"    AND json_extract({stored}, fnodes.p) IS NOT json_extract(?, fnodes.p))"
+            " OR (json_type(?, fnodes.p) IN ('object', 'array')"
+            f"    AND CASE WHEN json_type({stored}, fnodes.p) = json_type(?, fnodes.p)"
+            f"        THEN (SELECT COUNT(*) FROM json_each({stored}, fnodes.p))"
+            "             != (SELECT COUNT(*) FROM json_each(?, fnodes.p))"
+            "        ELSE 1 END)"
             ")"
         )
-        params.append(serialized)
+        # One bind per '?' in the condition above, in order of appearance.
+        params.extend([serialized] * 9)
 
     def _append_metadata_condition(
         self,
