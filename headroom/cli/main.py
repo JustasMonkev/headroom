@@ -47,8 +47,10 @@ def main(ctx: click.Context) -> None:
 
     # Fire a rate-limited, opt-out background check for newer releases so other
     # surfaces (e.g. the proxy banner) can show an "update available" notice.
-    # Never blocks, never raises; skipped for `update` (it checks explicitly).
-    if ctx.invoked_subcommand != "update":
+    # Never blocks, never raises. `update` checks explicitly. `proxy` defers
+    # this until its callback so `proxy --offline` can set the egress gate
+    # before the first possible update-check request.
+    if ctx.invoked_subcommand not in ("update", "proxy"):
         try:
             from headroom.update_check import maybe_check_async
 

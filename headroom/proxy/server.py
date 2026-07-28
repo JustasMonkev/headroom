@@ -2384,7 +2384,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # upstream unless that upstream is itself a local endpoint. See
     # headroom/offline.py for the full statement of the guarantee.
     if config.offline:
-        os.environ.setdefault("HEADROOM_OFFLINE", "1")
+        # Config can represent an explicit CLI flag, which must override a
+        # false environment default such as HEADROOM_OFFLINE=0.
+        os.environ["HEADROOM_OFFLINE"] = "1"
     if is_offline():
         apply_offline_env()
         logger.warning(

@@ -40,12 +40,13 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import sys
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -94,6 +95,58 @@ _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 _detect_native_verified = False  # native detect has returned once -> skip the watchdog
+
+
+class _DaemonBoundedExecutor:
+    """Small fixed worker pool whose bounded queue and daemon workers can be abandoned.
+
+    ``ThreadPoolExecutor`` registers its workers for an interpreter-exit join,
+    so one permanently wedged compressor can prevent process shutdown even
+    when requests fail open. These workers are daemon threads and therefore do
+    not participate in that join. The queue holds at most one pending wave.
+    """
+
+    def __init__(self, max_workers: int, max_pending: int) -> None:
+        self._queue: queue.Queue[
+            tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+        ] = queue.Queue(maxsize=max_pending)
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"headroom-router-compress-{index}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        ]
+        for worker in self._threads:
+            worker.start()
+
+    def _worker(self) -> None:
+        while True:
+            future, fn, args, kwargs = self._queue.get()
+            try:
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - Future transports worker errors
+                    future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        block: bool,
+        **kwargs: Any,
+    ) -> Future[Any] | None:
+        future: Future[Any] = Future()
+        try:
+            self._queue.put((future, fn, args, kwargs), block=block)
+        except queue.Full:
+            return None
+        return future
 
 
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
@@ -1733,9 +1786,8 @@ class ContentRouter(Transform):
         # across requests; initialization is lazy because many router uses
         # never enter the parallel compression path.
         self._stage_compression_executor_lock = threading.Lock()
-        self._stage_compression_executor: ThreadPoolExecutor | None = None
+        self._stage_compression_executor: _DaemonBoundedExecutor | None = None
         self._stage_compression_executor_workers = 0
-        self._stage_compression_admission: threading.BoundedSemaphore | None = None
         self._stage_compression_admission_capacity = 0
 
         # Name-addressable compressor inventory: built-in metadata + opt-in
@@ -2076,28 +2128,25 @@ class ContentRouter(Transform):
         result = self.compress(content, context=context, bias=bias)
         return result, (time.perf_counter() - t0) * 1000
 
-    def _get_stage_compression_executor(self, max_workers: int) -> ThreadPoolExecutor:
-        """Return the router's bounded, reusable pass-2 executor.
+    def _get_stage_compression_executor(self, max_workers: int) -> _DaemonBoundedExecutor:
+        """Return the router's bounded, abandonable pass-2 executor.
 
         A per-request executor leaks another live worker set whenever a
-        compressor outlives its request deadline: Python cannot preempt a
-        running thread, and ``shutdown(wait=False)`` only cancels queued work.
-        Keeping one pool per router caps that timeout debt at the configured
-        worker count. Pending futures are still cancelled by the caller.
+        compressor outlives its request deadline. Keeping one daemon pool per
+        router caps that timeout debt at the configured worker count, while
+        daemon workers let the process terminate even if compressor code never
+        returns.
         """
         with self._stage_compression_executor_lock:
             if self._stage_compression_executor is None:
-                self._stage_compression_executor = ThreadPoolExecutor(
+                self._stage_compression_executor = _DaemonBoundedExecutor(
                     max_workers=max_workers,
-                    thread_name_prefix="headroom-router-compress",
+                    max_pending=max_workers,
                 )
                 self._stage_compression_executor_workers = max_workers
                 # Bound total retained work to running workers plus one small
-                # pending wave. ThreadPoolExecutor's own queue is unbounded.
+                # pending wave.
                 self._stage_compression_admission_capacity = max_workers * 2
-                self._stage_compression_admission = threading.BoundedSemaphore(
-                    self._stage_compression_admission_capacity
-                )
             return self._stage_compression_executor
 
     def _submit_stage_compression(
@@ -2111,30 +2160,18 @@ class ContentRouter(Transform):
     ) -> Future[tuple[RouterCompressionResult, float]] | None:
         """Submit only when the shared executor has bounded admission capacity.
 
-        Timed-out futures deliberately remain queued: cancelling a Future marks
-        it done but does not remove its work item from ThreadPoolExecutor's
-        unbounded queue. The wrapper releases admission only when the work item
-        actually runs to completion, keeping retained request contents bounded
-        even while every worker is wedged.
+        Timed-out futures deliberately remain in the executor's bounded queue;
+        running and retained request contents can never exceed two worker
+        waves, even while every worker is wedged.
         """
         executor = self._get_stage_compression_executor(max_workers)
-        admission = self._stage_compression_admission
-        if admission is None:  # pragma: no cover - initialized with executor
-            return None
-        if not admission.acquire(blocking=block_for_capacity):
-            return None
-
-        def _run() -> tuple[RouterCompressionResult, float]:
-            try:
-                return self._timed_compress(content, context, bias)
-            finally:
-                admission.release()
-
-        try:
-            return executor.submit(_run)
-        except BaseException:
-            admission.release()
-            raise
+        return executor.submit(
+            self._timed_compress,
+            content,
+            context,
+            bias,
+            block=block_for_capacity,
+        )
 
     def compress(
         self,

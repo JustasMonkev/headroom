@@ -130,6 +130,28 @@ class TestOfflineOption:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].offline is True
 
+    def test_flag_overrides_false_env_before_update_check(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        observed: list[str | None] = []
+
+        def fake_update_check():
+            import os
+
+            observed.append(os.environ.get("HEADROOM_OFFLINE"))
+
+        with patch("headroom.update_check.maybe_check_async", fake_update_check):
+            result = runner.invoke(
+                main,
+                ["proxy", "--offline"],
+                env={"HEADROOM_OFFLINE": "0"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert observed == ["1"]
+        assert mock_run_server["config"].offline is True
+
     def test_offline_env_still_reaches_proxy_config(
         self, runner: CliRunner, mock_run_server: dict
     ) -> None:

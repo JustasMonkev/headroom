@@ -254,12 +254,14 @@ def test_timed_out_workers_are_bounded_across_requests(monkeypatch):
         executor = router._stage_compression_executor
         assert executor is not None
         original_submit = executor.submit
-        later_submits = 0
+        later_accepted = 0
 
         def count_submit(*args, **kwargs):
-            nonlocal later_submits
-            later_submits += 1
-            return original_submit(*args, **kwargs)
+            nonlocal later_accepted
+            future = original_submit(*args, **kwargs)
+            if future is not None:
+                later_accepted += 1
+            return future
 
         monkeypatch.setattr(executor, "submit", count_submit)
         for _ in range(3):
@@ -268,7 +270,8 @@ def test_timed_out_workers_are_bounded_across_requests(monkeypatch):
         assert max_active <= 4
         assert router._stage_compression_executor_workers == 4
         assert router._stage_compression_admission_capacity == 8
-        assert later_submits == 0, "saturated executor accepted more retained request work"
+        assert later_accepted == 0, "saturated executor accepted more retained request work"
+        assert all(worker.daemon for worker in executor._threads)
     finally:
         release.set()
         deadline = time.monotonic() + 1.0

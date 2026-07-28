@@ -1030,6 +1030,19 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    # The root callback deliberately defers its update check for this
+    # subcommand. Apply the explicit flag first so no auxiliary egress can race
+    # ahead of it, and override a false HEADROOM_OFFLINE inherited from shell
+    # defaults or settings.
+    if offline:
+        os.environ["HEADROOM_OFFLINE"] = "1"
+    try:
+        from headroom.update_check import maybe_check_async
+
+        maybe_check_async()
+    except Exception:  # noqa: BLE001 - update checks never block proxy startup
+        pass
+
     # Import here to avoid slow startup
     try:
         from headroom.proxy.server import (
