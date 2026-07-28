@@ -2451,8 +2451,7 @@ class AnthropicHandlerMixin:
                                 optimized_tokens = tokenizer.count_messages(body["messages"])
                                 tokens_saved = max(0, original_tokens - optimized_tokens)
                                 logger.info(
-                                    "[%s] thinking compaction: %d turns, %d blocks, "
-                                    "%d->%d words",
+                                    "[%s] thinking compaction: %d turns, %d blocks, %d->%d words",
                                     request_id,
                                     _tc_stats["turns_compacted"],
                                     _tc_stats["blocks"],

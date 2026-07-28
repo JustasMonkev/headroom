@@ -49,9 +49,7 @@ def test_lossless_router_never_compacts_tool_inputs_end_to_end() -> None:
         {"role": "user", "content": "go"},
         {
             "role": "assistant",
-            "content": [
-                {"type": "tool_use", "id": "toolu_1", "name": "Grep", "input": big_args}
-            ],
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "Grep", "input": big_args}],
         },
         {
             "role": "user",

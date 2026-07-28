@@ -2600,7 +2600,16 @@ class OpenAIHandlerMixin:
         _add_timing("compression_transform_dedupe", dedupe_started)
 
         output_serialization_started = time.perf_counter()
-        output_bytes = json.dumps(working).encode("utf-8")
+        # F10: when nothing was modified, `working` is still the *same object*
+        # as `payload` (every mutating stage deep-copies before writing), so a
+        # second full serialization is guaranteed byte-identical to
+        # `input_bytes`. Reuse it instead — on a large Codex payload that is a
+        # whole redundant `json.dumps` of the entire request on every pass that
+        # found nothing to compress, which is the common case.
+        if working is payload:
+            output_bytes = input_bytes
+        else:
+            output_bytes = json.dumps(working).encode("utf-8")
         _add_timing("compression_output_json_dump", output_serialization_started)
         output_context_budget = _openai_responses_context_budget(working) if debug_enabled else None
         # One-line summary at INFO — the single event a human reading

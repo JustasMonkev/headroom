@@ -49,9 +49,7 @@ def _conversation(call_id: str, pattern: str) -> list[dict[str, Any]]:
         },
         {
             "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": call_id, "content": "hit\n" * 40}
-            ],
+            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "hit\n" * 40}],
         },
     ]
 

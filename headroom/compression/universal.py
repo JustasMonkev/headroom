@@ -44,6 +44,20 @@ from headroom.compression.masks import (
 
 logger = logging.getLogger(__name__)
 
+# Marker left where `_simple_compress` removed bytes.
+#
+# It is short, but NOT a bare `…`. This fallback path stores no CCR hash, so
+# the marker is the only signal that anything was removed at all — a bare
+# ellipsis is indistinguishable from one the source text already contained,
+# and the model would read truncated content as complete. The brackets make it
+# unambiguously an insertion; `c` is enough to name it once the reader has seen
+# it anywhere. Costs ~4 tokens against the ~7 of ` ...[compressed]... `.
+_ELISION_MARKER = "…[c]…"
+
+# Minimum non-structural span worth compressing. Every compressed span pays
+# for one `_ELISION_MARKER`, so below this the framing dominates the saving.
+_MIN_SPAN_TO_COMPRESS = 200
+
 
 @dataclass
 class UniversalCompressorConfig:
@@ -218,7 +232,7 @@ class UniversalCompressor:
         # text[-0:] is the WHOLE string, so a target under 3 chars would emit
         # the full input plus the banner — "compression" that grows the span.
         tail = text[len(text) - keep_end :] if keep_end > 0 else ""
-        return text[:keep_start] + " ...[compressed]... " + tail
+        return text[:keep_start] + _ELISION_MARKER + tail
 
     def compress(
         self,
@@ -335,8 +349,11 @@ class UniversalCompressor:
                 # Preserve structural content
                 result_parts.append(span_content)
             else:
-                # Compress non-structural content
-                if len(span_content) > 50:  # Only compress if substantial
+                # Compress non-structural content. The threshold is high
+                # because each compressed span pays for its own elision marker:
+                # at the old 51-char floor the marker was ~40% of the span, and
+                # 40 such spans were ~200 tokens of identical framing.
+                if len(span_content) > _MIN_SPAN_TO_COMPRESS:
                     compressed = self._compress_fn(span_content)
                     result_parts.append(compressed)
                 else:

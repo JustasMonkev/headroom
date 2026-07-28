@@ -122,8 +122,11 @@ _SQL_MUTATION_RE = re.compile(
 _HEREDOC_RE = re.compile(r"<<-?\s*[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?\s*(?:\\n|\n|\\\\n)")
 
 #: Shell write-redirection / in-place edit / destructive file ops.
+#: The redirection alternative excludes arrows/comparisons (``->``, ``=>``,
+#: ``>=``, ``>>=``) so an ordinary search pattern like ``def f() -> int`` is not
+#: mistaken for a write.
 _SHELL_MUTATION_RE = re.compile(
-    r"(?:>>?\s*[\w./~$-]*[\w/])"  # `> path` / `>> path` redirection
+    r"(?:(?<![-=<>])>>?(?![=>])\s*[\w./~$-]*[\w/])"  # `> path` / `>> path`
     r"|(?:\btee\b)"
     r"|(?:\bsed\b[^|;&]*\s-i\b)"
     r"|(?:\bperl\b[^|;&]*\s-i\b)"
@@ -131,6 +134,45 @@ _SHELL_MUTATION_RE = re.compile(
     r"|(?:\bgit\s+(?:commit|apply|checkout|reset|push|rebase|merge|am|revert|clean)\b)"
     r"|(?:\b(?:npm|pnpm|yarn|pip|uv|cargo|apt|apt-get|brew)\s+(?:install|add|remove|"
     r"uninstall|publish)\b)",
+)
+
+
+#: Verb prefixes that mark an arbitrary (e.g. MCP) tool as mutating. A fixed
+#: denylist cannot enumerate every third-party server's write operations, so
+#: the leading verb is used as the safety net. Conservative by design: a false
+#: positive only forgoes savings, a false negative destroys a record.
+_MUTATING_NAME_PREFIXES: tuple[str, ...] = (
+    "add",
+    "append",
+    "apply",
+    "archive",
+    "assign",
+    "close",
+    "comment",
+    "create",
+    "delete",
+    "destroy",
+    "edit",
+    "insert",
+    "merge",
+    "modify",
+    "move",
+    "patch",
+    "post",
+    "publish",
+    "push",
+    "put",
+    "remove",
+    "rename",
+    "replace",
+    "send",
+    "set",
+    "submit",
+    "transfer",
+    "update",
+    "upload",
+    "upsert",
+    "write",
 )
 
 
@@ -148,12 +190,12 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
     only missed savings, a false negative costs an unrecoverable record.
     """
     normalized = _normalize_tool_name(tool_name)
-    if normalized in MUTATING_TOOL_NAMES:
+    # `mcp__server__write_file` and friends: judge the trailing component,
+    # never the server label (`mcp__github__get_file` must stay compactable).
+    leaf = _normalize_tool_name(tool_name.rsplit("__", 1)[-1]) if "__" in tool_name else normalized
+    if normalized in MUTATING_TOOL_NAMES or leaf in MUTATING_TOOL_NAMES:
         return True
-    # `mcp__server__write_file` and friends: check the trailing component too.
-    if "__" in tool_name and _normalize_tool_name(tool_name.rsplit("__", 1)[-1]) in (
-        MUTATING_TOOL_NAMES
-    ):
+    if leaf.startswith(_MUTATING_NAME_PREFIXES):
         return True
     if _SQL_MUTATION_RE.search(serialized_args):
         return True
@@ -438,9 +480,7 @@ class ToolInputCompactor:
             logger.warning("tool_input_compaction: CCR store failed for %s: %s", tool_call_id, e)
             return None
         if not isinstance(ccr_hash, str) or not ccr_hash:
-            logger.warning(
-                "tool_input_compaction: CCR store returned no hash for %s", tool_call_id
-            )
+            logger.warning("tool_input_compaction: CCR store returned no hash for %s", tool_call_id)
             return None
         # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
         # the hash collectors in ccr/tool_injection.py match it, which keeps the

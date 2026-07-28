@@ -1814,9 +1814,7 @@ LOSSLESS_FOLD_MIN_CHARS = 80
 # Outer dict is keyed by ``id(router)`` so two routers active on the same
 # context (a pipeline holding more than one, a nested standalone router) keep
 # separate state. Inner dict is attribute name -> value.
-_REQUEST_SCOPE: ContextVar[dict[int, dict[str, Any]]] = ContextVar(
-    "headroom_router_request_scope"
-)
+_REQUEST_SCOPE: ContextVar[dict[int, dict[str, Any]]] = ContextVar("headroom_router_request_scope")
 
 #: Ceiling on distinct routers tracked in one context before the scope is
 #: recycled. Requests normally involve a single router; the cap only bounds the

@@ -384,11 +384,141 @@ struct SymbolAnalysis {
     bare_names: HashMap<String, String>,
     /// qname → body line count.
     body_line_counts: HashMap<String, i64>,
+    /// Memoized `ubiquitous_callees()` — `make_omitted_comment` runs once per
+    /// compressed function, and recomputing the file-wide histogram each time
+    /// would make the pass quadratic in function count.
+    ubiquitous: std::sync::OnceLock<BTreeSet<String>>,
 }
 
 impl SymbolAnalysis {
     fn calls_of(&self, qname: &str) -> Option<&BTreeSet<String>> {
         self.calls.iter().find(|(k, _)| k == qname).map(|(_, v)| v)
+    }
+
+    /// Callees named by more than half the file's functions. For *this* file
+    /// they are background noise: a helper everything routes through says
+    /// nothing about any one body.
+    fn ubiquitous_callees(&self) -> &BTreeSet<String> {
+        self.ubiquitous.get_or_init(|| {
+            let total = self.calls.len();
+            if total < MIN_FUNCS_FOR_UBIQUITY {
+                return BTreeSet::new();
+            }
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for (_, called) in &self.calls {
+                for name in called {
+                    *counts.entry(name.as_str()).or_insert(0) += 1;
+                }
+            }
+            let threshold = total as f64 * UBIQUITOUS_CALLEE_RATIO;
+            counts
+                .into_iter()
+                .filter(|(_, n)| *n as f64 > threshold)
+                .map(|(name, _)| name.to_string())
+                .collect()
+        })
+    }
+}
+
+/// At most this many callees are listed in an omitted-body comment. The list
+/// is a hint about what the body reached for, not an index of it.
+const MAX_CALLS_LISTED: usize = 3;
+
+/// A callee named by more than this fraction of the file's functions carries
+/// no information about any one of them.
+const UBIQUITOUS_CALLEE_RATIO: f64 = 0.5;
+
+/// Below this many functions, "most of them" does not mean anything.
+const MIN_FUNCS_FOR_UBIQUITY: usize = 4;
+
+/// Callees that are noise in every language we compress: builtins, type
+/// constructors/converters, and logging. They dominated the `calls:` lists
+/// while saying nothing about what a body does. Mirrors Python
+/// `_NOISE_CALLEES`.
+const NOISE_CALLEES: &[&str] = &[
+    // Python builtins
+    "abs",
+    "all",
+    "any",
+    "bool",
+    "bytes",
+    "callable",
+    "dict",
+    "dir",
+    "enumerate",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "hasattr",
+    "hash",
+    "id",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "list",
+    "map",
+    "max",
+    "min",
+    "next",
+    "open",
+    "print",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "sorted",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip", // Logging
+    "debug",
+    "info",
+    "warning",
+    "warn",
+    "error",
+    "exception",
+    "critical",
+    "log",
+    "logger.debug",
+    "logger.info",
+    "logger.warning",
+    "logger.warn",
+    "logger.error",
+    "logger.exception",
+    "logger.critical",
+    "console.log",
+    "console.error",
+    "console.warn",
+    "console.debug",
+    // JS/TS ubiquitous
+    "Array",
+    "Boolean",
+    "Number",
+    "Object",
+    "String",
+    "JSON.parse",
+    "JSON.stringify",
+    "parseInt",
+    "parseFloat",
+    "require",
+];
+
+fn is_noise_callee(name: &str) -> bool {
+    if NOISE_CALLEES.contains(&name) {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((_, tail)) => NOISE_CALLEES.contains(&tail),
+        None => false,
     }
 }
 
@@ -456,6 +586,12 @@ fn leading_ws(line: &str) -> &str {
 }
 
 /// Build the omitted-body comment with call info. Mirrors `_make_omitted_comment`.
+///
+/// The `calls:` list is what the reader gets *instead of* the body, so it has
+/// to carry signal: builtins/logging are dropped, callees named by more than
+/// half the file's functions are dropped, the list is capped at
+/// [`MAX_CALLS_LISTED`], and the `+N more` suffix is gone (~5 tokens to say
+/// the hint was truncated, which a hint implies anyway).
 fn make_omitted_comment(
     func_name: Option<&str>,
     omitted_count: i64,
@@ -474,16 +610,18 @@ fn make_omitted_comment(
                 candidates.push(k.as_str());
             }
         }
+        let common = analysis.ubiquitous_callees();
         for key in candidates {
             if let Some(called) = analysis.calls_of(key) {
-                if !called.is_empty() {
-                    // BTreeSet iterates sorted == Python sorted(called).
-                    let sorted_calls: Vec<&str> =
-                        called.iter().take(5).map(|s| s.as_str()).collect();
-                    calls_info = format!("; calls: {}", sorted_calls.join(", "));
-                    if called.len() > 5 {
-                        calls_info.push_str(&format!(" +{} more", called.len() - 5));
-                    }
+                // BTreeSet iterates sorted == Python sorted(called).
+                let informative: Vec<&str> = called
+                    .iter()
+                    .filter(|name| !is_noise_callee(name) && !common.contains(*name))
+                    .take(MAX_CALLS_LISTED)
+                    .map(|s| s.as_str())
+                    .collect();
+                if !informative.is_empty() {
+                    calls_info = format!("; calls: {}", informative.join(", "));
                 }
                 break;
             }
@@ -1139,6 +1277,7 @@ impl CodeAwareCompressor {
             calls: function_calls,
             bare_names,
             body_line_counts,
+            ubiquitous: std::sync::OnceLock::new(),
         }
     }
 
@@ -1650,10 +1789,10 @@ impl<'a> Ctx<'a> {
         if let Some(ob) = opening_brace_line {
             result_parts.push(ob.to_string());
         }
-        if !docstring_text.is_empty()
+        let emitted_docstring = !docstring_text.is_empty()
             && self.config.docstring_mode != DocstringMode::None
-            && self.config.docstring_mode != DocstringMode::Remove
-        {
+            && self.config.docstring_mode != DocstringMode::Remove;
+        if emitted_docstring {
             result_parts.push(docstring_text);
         }
         if !kept_lines.is_empty() {
@@ -1667,7 +1806,12 @@ impl<'a> Ctx<'a> {
                 self.lang.comment_prefix,
                 self.analysis,
             ));
-            if self.lang.uses_colon_after_signature {
+            // `pass` is only needed when the body would otherwise be EMPTY: a
+            // comment is not a statement, so a colon-suffixed language needs a
+            // filler. With a docstring or any kept line present the block
+            // already has a body, and the extra `pass` is ~4 wasted tokens per
+            // compressed function that also misreads as real control flow.
+            if self.lang.uses_colon_after_signature && kept_lines.is_empty() && !emitted_docstring {
                 result_parts.push(format!("{indent}pass"));
             }
         }

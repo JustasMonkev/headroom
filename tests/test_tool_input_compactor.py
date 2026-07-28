@@ -276,9 +276,9 @@ def test_sql_mutation_input_is_never_compacted():
 
 
 def test_select_query_input_is_still_compacted():
-    sql = "SELECT id, name FROM users WHERE name IN (" + ",".join(
-        f"'n{i}'" for i in range(300)
-    ) + ")"
+    sql = (
+        "SELECT id, name FROM users WHERE name IN (" + ",".join(f"'n{i}'" for i in range(300)) + ")"
+    )
     result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
         _openai_call("run_query", json.dumps({"sql": sql}))
     )
@@ -331,3 +331,56 @@ def test_anthropic_mutating_block_is_never_compacted():
     ]
     result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(messages)
     assert result.compacted_count == 0
+
+
+def test_arrow_in_a_search_pattern_is_not_mistaken_for_redirection():
+    """`->` / `=>` must not read as a write redirection (missed savings)."""
+    pattern = "def handler(self) -> dict[str, Any]:  # " + "z" * 1500
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Grep", json.dumps({"pattern": pattern}))
+    )
+    assert result.compacted_count == 1
+
+
+def test_is_mutating_tool_input_unit_cases():
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    assert is_mutating_tool_input("Write", "{}") is True
+    assert is_mutating_tool_input("apply_patch", "{}") is True
+    assert is_mutating_tool_input("Grep", '{"pattern":"a -> b"}') is False
+    assert is_mutating_tool_input("Bash", '{"command":"ls -la | wc -l"}') is False
+    assert is_mutating_tool_input("Bash", '{"command":"echo hi > out.txt"}') is True
+    assert is_mutating_tool_input("Bash", '{"command":"sed -i s/a/b/ f.py"}') is True
+    assert is_mutating_tool_input("Bash", '{"command":"git commit -m x"}') is True
+    assert is_mutating_tool_input("Bash", '{"command":"git log --oneline -3"}') is False
+    assert is_mutating_tool_input("q", '{"sql":"SELECT * FROM t"}') is False
+    assert is_mutating_tool_input("q", '{"sql":"DELETE FROM t WHERE id=1"}') is True
+
+
+def test_unknown_mcp_write_verbs_are_treated_as_mutating():
+    """A fixed denylist can't enumerate every MCP server's write ops, so the
+    leading verb is the safety net."""
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    for name in (
+        "mcp__linear__create_issue",
+        "mcp__notion__update_page",
+        "mcp__github__push_files",
+        "mcp__slack__post_message",
+        "upload_artifact",
+    ):
+        assert is_mutating_tool_input(name, "{}") is True, name
+
+
+def test_read_only_mcp_tools_are_still_compactable():
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    for name in (
+        "mcp__github__get_file_contents",
+        "mcp__github__search_code",
+        "mcp__linear__list_issues",
+        "Grep",
+        "Read",
+        "WebFetch",
+    ):
+        assert is_mutating_tool_input(name, "{}") is False, name
