@@ -295,3 +295,24 @@ def test_sqlite_storage_get_conn_reuses_connection_and_create_storage_entrypoint
         lambda group: [SimpleNamespace(name="custom", load=lambda: lambda url: created)],
     )
     assert create_storage("custom://db") is created
+
+
+def test_jsonl_paging_matches_sqlite_and_stays_bounded(tmp_path: Path) -> None:
+    """JSONL paging mirrors SQLite (newest-first) across offsets/limits, and
+    the bounded-heap implementation handles edge cases (offset past the end,
+    zero-size pages) identically."""
+    jsonl = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite = SQLiteStorage(str(tmp_path / "metrics.db"))
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    for i in range(10):
+        m = _metrics(str(i), now - timedelta(hours=9 - i))
+        jsonl.save(m)
+        sqlite.save(m)
+
+    for offset, limit in [(0, 3), (2, 3), (0, 100), (9, 5), (20, 3), (0, 1)]:
+        got_jsonl = [m.request_id for m in jsonl.query(limit=limit, offset=offset)]
+        got_sqlite = [m.request_id for m in sqlite.query(limit=limit, offset=offset)]
+        assert got_jsonl == got_sqlite, (offset, limit)
+
+    assert jsonl.query(limit=0) == []
+    sqlite.close()

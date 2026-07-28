@@ -94,6 +94,40 @@ def test_unknown_encoding_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         tc.load_encoding("not-a-real-encoding")
 
 
+def test_lone_surrogates_are_normalized_like_tiktoken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid JSON can carry lone surrogates (clipped emoji); PyO3's &str
+    extraction rejects them, so the shim must apply tiktoken's own fixup
+    (utf-16 surrogatepass -> replace) instead of raising."""
+    import tiktoken
+
+    monkeypatch.setattr(tiktoken, "get_encoding", _network_down_get_encoding)
+
+    enc = tc.load_encoding("o200k_base")
+    text = "bad \ud83d surrogate"
+    assert enc.count_tokens(text) >= 1
+    ids = enc.encode(text)
+    # The replacement char round-trips; the request is never aborted.
+    assert "�" in enc.decode(ids)
+
+
+def test_decode_replaces_invalid_utf8_like_tiktoken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tiktoken's Encoding.decode defaults to errors='replace'; a token slice
+    that splits a multibyte character must decode with U+FFFD, not raise."""
+    import tiktoken
+
+    monkeypatch.setattr(tiktoken, "get_encoding", _network_down_get_encoding)
+
+    enc = tc.load_encoding("o200k_base")
+    ids = enc.encode("héllo wörld ✨ 日本語")
+    for cut in range(1, len(ids)):
+        # Every truncation point must decode without raising.
+        assert isinstance(enc.decode(ids[:cut]), str)
+
+
 def test_counter_uses_bundled_count_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
     import tiktoken
 

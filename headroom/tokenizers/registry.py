@@ -254,9 +254,9 @@ class TokenizerRegistry:
 
     @classmethod
     def list_registered(cls) -> list[str]:
-        """List explicitly registered models."""
+        """List explicitly registered models (instances and factories)."""
         registry = cls()
-        return list(registry._tokenizers.keys())
+        return sorted(set(registry._tokenizers) | set(registry._model_factories))
 
     @classmethod
     def clear_cache(cls) -> None:

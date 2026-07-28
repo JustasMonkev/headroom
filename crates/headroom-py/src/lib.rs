@@ -1608,11 +1608,20 @@ fn tiktoken_encode(py: Python<'_>, encoding_name: &str, text: &str) -> PyResult<
 }
 
 /// Decode token IDs back to text under `encoding_name`.
+///
+/// Matches Python tiktoken's `Encoding.decode` default (`errors="replace"`):
+/// a token slice whose bytes split a multibyte character decodes with U+FFFD
+/// replacement instead of raising — callers routinely decode truncated token
+/// sequences. An unknown token ID still raises (KeyError, like tiktoken's
+/// `decode_bytes`).
 #[pyfunction]
 fn tiktoken_decode(py: Python<'_>, encoding_name: &str, tokens: Vec<u32>) -> PyResult<String> {
     let bpe = bundled_bpe(encoding_name)?;
-    py.detach(move || bpe.decode(&tokens))
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("decode failed: {e}")))
+    py.detach(move || {
+        bpe.decode_bytes(&tokens)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    })
+    .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("decode failed: {e}")))
 }
 
 // ─── Module init ───────────────────────────────────────────────────────────

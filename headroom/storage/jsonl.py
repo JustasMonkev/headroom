@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Iterator
 from datetime import datetime
@@ -103,29 +104,33 @@ class JSONLStorage(Storage):
     ) -> list[RequestMetrics]:
         """Query metrics with filters.
 
-        Sort must happen before offset/limit: the file is in append (ascending)
-        order, so slicing first would return the OLDEST matches — the opposite
-        of SQLiteStorage's ``ORDER BY timestamp DESC LIMIT ? OFFSET ?``, which
-        this backend must mirror (both sit behind the same Storage interface).
+        Ordering must be applied before offset/limit: the file is in append
+        (ascending) order, so slicing first would return the OLDEST matches —
+        the opposite of SQLiteStorage's ``ORDER BY timestamp DESC LIMIT ?
+        OFFSET ?``, which this backend must mirror (both sit behind the same
+        Storage interface). A bounded heap keeps only the newest
+        ``offset + limit`` matches so memory doesn't grow with full history.
         """
-        matches: list[RequestMetrics] = []
+        page_end = offset + limit
+        if page_end <= 0:
+            return []
 
-        for metrics in self.iter_all():
-            # Apply filters
-            if start_time is not None and metrics.timestamp < start_time:
-                continue
-            if end_time is not None and metrics.timestamp > end_time:
-                continue
-            if model is not None and metrics.model != model:
-                continue
-            if mode is not None and metrics.mode != mode:
-                continue
+        def _matches() -> Any:
+            for idx, metrics in enumerate(self.iter_all()):
+                if start_time is not None and metrics.timestamp < start_time:
+                    continue
+                if end_time is not None and metrics.timestamp > end_time:
+                    continue
+                if model is not None and metrics.model != model:
+                    continue
+                if mode is not None and metrics.mode != mode:
+                    continue
+                # Tie-break equal timestamps by earlier file position first,
+                # matching the previous stable descending sort.
+                yield (metrics.timestamp, -idx), metrics
 
-            matches.append(metrics)
-
-        # Sort by timestamp descending, then page
-        matches.sort(key=lambda m: m.timestamp, reverse=True)
-        return matches[offset : offset + limit]
+        newest = heapq.nlargest(page_end, _matches(), key=lambda pair: pair[0])
+        return [metrics for _, metrics in newest[offset:]]
 
     def count(
         self,

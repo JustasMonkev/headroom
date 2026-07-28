@@ -98,13 +98,15 @@ class TestRegistryModelFactory:
                 return 999
 
         try:
-            register_tokenizer("my-custom-model", factory=lambda m: FakeCounter())
-            counter = TokenizerRegistry.get("my-custom-model")
+            register_tokenizer("factory-backed-model-x", factory=lambda m: FakeCounter())
+            counter = TokenizerRegistry.get("factory-backed-model-x")
             assert counter.count_text("hello") == 999
-            # The model factory must not leak into the backend namespace.
-            assert "my-custom-model" not in TokenizerRegistry.list_backends()
+            # The model factory must not leak into the backend namespace...
+            assert "factory-backed-model-x" not in TokenizerRegistry.list_backends()
+            # ...but must show up as an explicit registration.
+            assert "factory-backed-model-x" in TokenizerRegistry.list_registered()
         finally:
-            TokenizerRegistry._model_factories.pop("my-custom-model", None)
+            TokenizerRegistry._model_factories.pop("factory-backed-model-x", None)
             TokenizerRegistry.clear_cache()
 
     def test_explicit_backend_still_bypasses_model_factory(self) -> None:
@@ -113,12 +115,12 @@ class TestRegistryModelFactory:
 
         try:
             register_tokenizer(
-                "my-custom-model-2", factory=lambda m: (_ for _ in ()).throw(RuntimeError)
+                "factory-backed-model-y", factory=lambda m: (_ for _ in ()).throw(RuntimeError)
             )
-            counter = TokenizerRegistry.get("my-custom-model-2", backend="estimation")
+            counter = TokenizerRegistry.get("factory-backed-model-y", backend="estimation")
             assert isinstance(counter, EstimatingTokenCounter)
         finally:
-            TokenizerRegistry._model_factories.pop("my-custom-model-2", None)
+            TokenizerRegistry._model_factories.pop("factory-backed-model-y", None)
             TokenizerRegistry.clear_cache()
 
 

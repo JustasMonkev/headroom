@@ -56,8 +56,19 @@ class _RustBundledEncoding:
         self.name = name
         self._core = core
 
+    @staticmethod
+    def _normalize_surrogates(text: str) -> str:
+        # Same fixup Python tiktoken applies before handing text to ITS Rust
+        # core: lone surrogates (valid JSON can produce them, e.g. a clipped
+        # emoji "\ud83d") are not valid UTF-8, and PyO3's &str extraction
+        # rightfully rejects them. Replace instead of raising.
+        return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
     def encode(self, text: str, **_kwargs: Any) -> list[int]:
-        return self._core.tiktoken_encode(self.name, text)
+        try:
+            return self._core.tiktoken_encode(self.name, text)
+        except UnicodeEncodeError:
+            return self._core.tiktoken_encode(self.name, self._normalize_surrogates(text))
 
     def decode(self, tokens: list[int]) -> str:
         return self._core.tiktoken_decode(self.name, list(tokens))
@@ -65,7 +76,10 @@ class _RustBundledEncoding:
     def count_tokens(self, text: str) -> int:
         # Fast path: counts without materializing the token-id list across the
         # FFI boundary. TiktokenCounter.count_text prefers this when present.
-        return self._core.tiktoken_count(self.name, text)
+        try:
+            return self._core.tiktoken_count(self.name, text)
+        except UnicodeEncodeError:
+            return self._core.tiktoken_count(self.name, self._normalize_surrogates(text))
 
     def __repr__(self) -> str:
         return f"_RustBundledEncoding(name={self.name!r})"
