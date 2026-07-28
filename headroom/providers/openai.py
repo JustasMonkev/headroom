@@ -29,12 +29,7 @@ _PRICING_STALE_DAYS = 60  # Warn if pricing data is older than this
 _PRICING_WARNING_SHOWN = False
 _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
+TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
@@ -251,12 +246,43 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached."""
+    """Get tiktoken encoding, cached.
+
+    Routed through the shared bounded loader: tiktoken's vocab download has no
+    network timeout, so a raw ``tiktoken.get_encoding`` here could hang a
+    request indefinitely on a stalled connection (GH #956). The shared loader
+    bounds the load and, when the download is unreachable, falls back to the
+    exact BPE table bundled in ``headroom._core`` instead of failing.
+    """
     if not TIKTOKEN_AVAILABLE:
+        from headroom.tokenizers.tiktoken_counter import _rust_bundled_encoding
+
+        bundled = _rust_bundled_encoding(encoding_name)
+        if bundled is not None:
+            return bundled
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
-    return tiktoken.get_encoding(encoding_name)
+    from headroom.tokenizers.tiktoken_counter import load_encoding
+
+    return load_encoding(encoding_name)
+
+
+def _longest_prefix_match(model: str, table: dict[str, Any]) -> str | None:
+    """Longest key in ``table`` that prefixes ``model``, or None.
+
+    First-match iteration over a dict is insertion-order-dependent and wrong
+    for overlapping keys: "gpt-4o-mini-2024-07-18" would resolve via "gpt-4o"
+    (16.7x the real price) and "o1-mini-2024-09-12" via "o1" (a 200k context
+    claim for a 128k model). Longest prefix always picks the most specific
+    entry regardless of table ordering. Same hazard already documented and
+    fixed in headroom/tokenizers/tiktoken_counter.py:get_encoding_for_model.
+    """
+    best: str | None = None
+    for prefix in table:
+        if model.startswith(prefix) and (best is None or len(prefix) > len(best)):
+            best = prefix
+    return best
 
 
 def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
@@ -270,9 +296,9 @@ def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | 
         return _MODEL_ENCODINGS[model]
 
     # Prefix match for versioned models
-    for prefix, encoding in _MODEL_ENCODINGS.items():
-        if model.startswith(prefix):
-            return encoding
+    prefix = _longest_prefix_match(model, _MODEL_ENCODINGS)
+    if prefix is not None:
+        return _MODEL_ENCODINGS[prefix]
 
     # Pattern-based inference
     family = _infer_model_family(model)
@@ -305,6 +331,11 @@ class OpenAITokenCounter:
         """Count tokens in text."""
         if not text:
             return 0
+        count_tokens = getattr(self._encoding, "count_tokens", None)
+        if count_tokens is not None:
+            # Rust-bundled fallback encoding: count without materializing the
+            # token-id list across the FFI boundary.
+            return int(count_tokens(text))
         try:
             return len(self._encoding.encode(text))
         except ValueError:
@@ -490,10 +521,10 @@ class OpenAIProvider(Provider):
         if model in self._context_limits:
             return self._context_limits[model]
 
-        # Prefix match
-        for prefix, limit in self._context_limits.items():
-            if model.startswith(prefix):
-                return limit
+        # Prefix match (longest wins — see _longest_prefix_match)
+        prefix = _longest_prefix_match(model, self._context_limits)
+        if prefix is not None:
+            return self._context_limits[prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)
@@ -595,10 +626,10 @@ class OpenAIProvider(Provider):
         if model in self._pricing:
             return self._pricing[model]
 
-        # Prefix match
-        for model_prefix, pricing in self._pricing.items():
-            if model.startswith(model_prefix):
-                return pricing
+        # Prefix match (longest wins — see _longest_prefix_match)
+        model_prefix = _longest_prefix_match(model, self._pricing)
+        if model_prefix is not None:
+            return self._pricing[model_prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)
