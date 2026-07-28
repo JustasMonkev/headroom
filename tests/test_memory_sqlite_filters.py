@@ -101,6 +101,23 @@ async def test_metadata_filters_distinguish_bool_from_number(store: SQLiteMemory
     assert await ids(flag=0) == ["n0"]
 
 
+async def test_container_filters_do_not_match_stringified_json(store: SQLiteMemoryStore) -> None:
+    """json_extract exposes arrays/objects AND strings as SQL text, so an
+    array filter must not match a string that holds the same minified JSON
+    representation (and vice versa)."""
+    await store.save(Memory(id="arr", content="real array", user_id="u1", metadata={"tags": ["a"]}))
+    await store.save(
+        Memory(id="strfied", content="stringified", user_id="u1", metadata={"tags": '["a"]'})
+    )
+
+    async def ids(**metadata_filters):
+        found = await store.query(MemoryFilter(user_id="u1", metadata_filters=metadata_filters))
+        return sorted(m.id for m in found)
+
+    assert await ids(tags=["a"]) == ["arr"]
+    assert await ids(tags='["a"]') == ["strfied"]
+
+
 async def test_none_filter_requires_explicit_json_null(store: SQLiteMemoryStore) -> None:
     """json_extract maps an explicit JSON null AND a missing key to SQL NULL;
     a None filter must match only memories that explicitly set the key to

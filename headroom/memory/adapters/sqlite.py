@@ -578,9 +578,18 @@ class SQLiteMemoryStore:
                     conditions.append(f"json_type(metadata, '$.{key}') IN ('integer', 'real')")
                     params.append(value)
                 elif isinstance(value, str):
+                    # Require the text type: json_extract exposes arrays and
+                    # objects as SQL text too, so a string filter that happens
+                    # to hold minified JSON (e.g. '["a"]') would otherwise
+                    # also match a real container with that representation.
+                    conditions.append(f"json_type(metadata, '$.{key}') = 'text'")
                     params.append(value)
                 else:
-                    # Lists/dicts: json_extract returns their minified JSON text.
+                    # Lists/dicts: json_extract returns their minified JSON
+                    # text. Pin the container type so the filter doesn't also
+                    # match a STRING holding the same minified representation.
+                    json_kind = "array" if isinstance(value, (list, tuple)) else "object"
+                    conditions.append(f"json_type(metadata, '$.{key}') = '{json_kind}'")
                     params.append(json.dumps(value, separators=(",", ":")))
 
         return conditions, params
