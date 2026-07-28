@@ -181,11 +181,28 @@ class TestPruneDanglingToolReferences:
         assert out is not messages
         assert len(messages[1]["content"][0]["content"]) == 2, "input was mutated"
 
-    def test_no_declared_tools_is_a_noop(self):
-        """A tool-free request must not have its history rewritten."""
+    def test_explicitly_empty_tools_prunes_all_references(self):
+        """An understood empty tool surface makes every reference dangling."""
         messages = self._messages_with_reference("WaitForMcpServers")
 
         out, pruned = prune_dangling_tool_references(messages, [])
+
+        assert pruned == {"Bash", "WaitForMcpServers"}
+        assert out[1]["content"][0]["content"] == []
+
+    def test_absent_tools_shape_is_a_noop(self):
+        """Missing tools is ambiguous, so preserve the byte-stable history."""
+        messages = self._messages_with_reference("WaitForMcpServers")
+
+        out, pruned = prune_dangling_tool_references(messages, None)
+
+        assert pruned == set()
+        assert out is messages
+
+    def test_unrecognized_nonempty_tools_shape_is_a_noop(self):
+        messages = self._messages_with_reference("WaitForMcpServers")
+
+        out, pruned = prune_dangling_tool_references(messages, [{"unknown": True}])
 
         assert pruned == set()
         assert out is messages

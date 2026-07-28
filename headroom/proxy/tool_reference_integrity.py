@@ -95,11 +95,15 @@ def prune_dangling_tool_references(
     if not isinstance(messages, list) or not messages:
         return messages, set()
 
+    if not isinstance(tools, list):
+        # Absent or unknown top-level shape: do not guess that the request is
+        # tool-free.
+        return messages, set()
     declared = collect_declared_tool_names(tools)
-    if not declared:
-        # No tools declared at all: either a tool-free request (nothing to
-        # reference) or a shape we don't understand. Either way, pruning every
-        # reference would be a bigger change than the bug — leave it alone.
+    if tools and not declared:
+        # A non-empty list with no understood declarations is likewise an
+        # unknown shape. An explicitly empty list is different: it is a known
+        # declaration of zero tools, so every tool_reference must be pruned.
         return messages, set()
 
     pruned: set[str] = set()

@@ -10,6 +10,7 @@ to the outer handler and turned a perfectly good upstream reply into
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -245,6 +246,107 @@ def test_buffered_stream_ccr_with_sse_upstream_passes_through() -> None:
     # The buffered path did force a non-streaming upstream request.
     if captured.get("body"):
         assert captured["body"].get("stream") is False
+
+
+def test_delayed_buffered_sse_is_appended_after_keepalive() -> None:
+    """A raw SSE result must survive when the keepalive already started."""
+    from headroom.ccr import CCR_TOOL_NAME
+
+    app = _make_app()
+    server = app.state.proxy
+
+    async def delayed_retry(method, url, headers, body_, stream=False, **kwargs):
+        await asyncio.sleep(1.1)
+        return httpx.Response(
+            200,
+            content=SSE_BODY.encode(),
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request(method, url),
+        )
+
+    server._retry_request = delayed_retry
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-5.4",
+                "stream": True,
+                "input": "hello",
+                "tools": [{"type": "function", "name": CCR_TOOL_NAME, "parameters": {}}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert '"type":"ping"' in resp.text
+    assert "response.completed" in resp.text
+    assert "proxy_error" not in resp.text
+
+
+def test_buffered_sse_terminal_response_is_used_for_ccr_interception() -> None:
+    """A retrieval call inside upstream SSE must be handled before replay."""
+    from headroom.ccr import CCR_TOOL_NAME
+
+    terminal = {
+        "id": "resp_with_retrieve",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "name": CCR_TOOL_NAME,
+                "call_id": "call_retrieve",
+                "arguments": '{"hash":"abc"}',
+            }
+        ],
+        "usage": {"input_tokens": 2, "output_tokens": 1},
+    }
+    upstream_sse = (
+        "event: response.completed\n"
+        f"data: {json.dumps({'type': 'response.completed', 'response': terminal})}\n\n"
+    )
+    final_response = {
+        "id": "resp_after_retrieve",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": []}],
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+    }
+
+    class _CCRSpy:
+        config = type("C", (), {"enabled": True})()
+
+        def __init__(self):
+            self.handled = []
+
+        def has_ccr_tool_calls(self, response, provider):  # noqa: ANN001
+            return any(
+                isinstance(item, dict) and item.get("name") == CCR_TOOL_NAME
+                for item in response.get("output", [])
+            )
+
+        async def handle_response(self, response, *args, **kwargs):  # noqa: ANN001
+            self.handled.append(response)
+            return final_response
+
+    app = _make_app()
+    spy = _CCRSpy()
+    app.state.proxy.ccr_response_handler = spy
+    with TestClient(app) as client:
+        _patch_sse_upstream(app, body=upstream_sse)
+        resp = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-5.4",
+                "stream": True,
+                "input": "hello",
+                "tools": [{"type": "function", "name": CCR_TOOL_NAME, "parameters": {}}],
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert spy.handled == [terminal]
+    assert "resp_after_retrieve" in resp.text
+    assert "call_retrieve" not in resp.text
 
 
 def test_sse_body_is_not_reparsed_as_json_by_ccr(monkeypatch) -> None:

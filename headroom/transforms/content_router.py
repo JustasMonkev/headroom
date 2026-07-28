@@ -1728,6 +1728,13 @@ class ContentRouter(Transform):
             self.config.ccr_inject_marker = False
             self.config.smart_crusher_lossless_only = True
         self._observer = observer
+        # Reused by deadline-bound pass-2 compression.  A single bounded pool
+        # prevents timed-out compressor threads from growing without limit
+        # across requests; initialization is lazy because many router uses
+        # never enter the parallel compression path.
+        self._stage_compression_executor_lock = threading.Lock()
+        self._stage_compression_executor: ThreadPoolExecutor | None = None
+        self._stage_compression_executor_workers = 0
 
         # Name-addressable compressor inventory: built-in metadata + opt-in
         # discovery of `headroom.compressor` entry points. Inventory only —
@@ -2066,6 +2073,24 @@ class ContentRouter(Transform):
         t0 = time.perf_counter()
         result = self.compress(content, context=context, bias=bias)
         return result, (time.perf_counter() - t0) * 1000
+
+    def _get_stage_compression_executor(self, max_workers: int) -> ThreadPoolExecutor:
+        """Return the router's bounded, reusable pass-2 executor.
+
+        A per-request executor leaks another live worker set whenever a
+        compressor outlives its request deadline: Python cannot preempt a
+        running thread, and ``shutdown(wait=False)`` only cancels queued work.
+        Keeping one pool per router caps that timeout debt at the configured
+        worker count. Pending futures are still cancelled by the caller.
+        """
+        with self._stage_compression_executor_lock:
+            if self._stage_compression_executor is None:
+                self._stage_compression_executor = ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="headroom-router-compress",
+                )
+                self._stage_compression_executor_workers = max_workers
+            return self._stage_compression_executor
 
     def compress(
         self,
@@ -4908,9 +4933,8 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
-            max_workers = min(
-                len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
-            )
+            configured_workers = max(1, int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4")))
+            max_workers = min(len(pending_tasks), configured_workers)
             t_parallel_start = time.perf_counter()
 
             # Issue #7: ``HEADROOM_COMPRESSION_DEADLINE_MS`` has to bound the WHOLE
@@ -4954,41 +4978,27 @@ class ContentRouter(Transform):
                         task_results.append((_stage_passthrough(task_content), 0.0))
                         continue
                     if deadline_s is not None:
-                        box: dict[str, Any] = {}
-
-                        def _run(
-                            _box: dict[str, Any] = box,
-                            _content: str = task_content,
-                            _context: str = task_ctx,
-                            _bias: float = task_bias,
-                        ) -> None:
-                            try:
-                                _box["result"] = self.compress(
-                                    _content, context=_context, bias=_bias
-                                )
-                            except BaseException as exc:  # noqa: BLE001
-                                _box["error"] = exc
-
-                        # ponytail: daemon watchdog cannot stop native GIL holds; native layer owns that fix.
-                        worker = threading.Thread(
-                            target=_run, name="headroom-single-compress-watchdog", daemon=True
+                        executor = self._get_stage_compression_executor(configured_workers)
+                        future = executor.submit(
+                            self._timed_compress,
+                            task_content,
+                            task_ctx,
+                            task_bias,
                         )
-                        worker.start()
-                        worker.join(deadline_s)
-                        if worker.is_alive():
+                        try:
+                            r, compress_ms = future.result(timeout=deadline_s)
+                        except FuturesTimeoutError:
+                            future.cancel()
                             logger.warning(
                                 "ContentRouter inline compression exceeded its %.1fs share of "
                                 "the compression stage budget; failing open via PASSTHROUGH",
                                 deadline_s,
                             )
                             r = _stage_passthrough(task_content)
-                        elif "error" in box:
-                            raise box["error"]
-                        else:
-                            r = box["result"]
+                            compress_ms = (time.perf_counter() - t0) * 1000
                     else:
                         r = self.compress(task_content, context=task_ctx, bias=task_bias)
-                    compress_ms = (time.perf_counter() - t0) * 1000
+                        compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
                 # Parallel compression via thread pool. The stage budget has to
@@ -4997,38 +5007,37 @@ class ContentRouter(Transform):
                 # ``shutdown(wait=True)`` that ``ThreadPoolExecutor.__exit__`` performs,
                 # is what let a single wedged compressor block the request forever.
                 # Collect within the remaining budget, fail open for whatever has not
-                # landed, and tear the pool down without waiting on stuck workers.
-                executor = ThreadPoolExecutor(max_workers=max_workers)
-                try:
-                    futures = [
-                        executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
-                        for _, task_content, task_ctx, task_bias, _, _ in pending_tasks
-                    ]
-                    task_results = []
-                    budget_spent = False
-                    for future, (_, task_content, _, _, _, _) in zip(futures, pending_tasks):
-                        if not budget_spent:
-                            try:
-                                task_results.append(future.result(timeout=_stage_remaining()))
-                                continue
-                            except FuturesTimeoutError:
-                                budget_spent = True
-                                logger.warning(
-                                    "ContentRouter parallel compression exceeded the %.1fs "
-                                    "compression stage budget; failing open via PASSTHROUGH "
-                                    "for the remaining %d block(s)",
-                                    stage_deadline_s,
-                                    len(pending_tasks) - len(task_results),
-                                )
-                        # Budget gone: don't wait on this future at all.
-                        future.cancel()
-                        task_results.append((_stage_passthrough(task_content), 0.0))
-                finally:
-                    # Never block on a wedged worker. Python cannot preempt a
-                    # running thread, so drop the pool and let any leaked worker
-                    # run out into the void — the same trade-off the inline
-                    # watchdog above already makes.
-                    executor.shutdown(wait=False, cancel_futures=True)
+                # landed, and reuse one bounded pool so stuck workers cannot grow
+                # without limit across requests.
+                executor = self._get_stage_compression_executor(configured_workers)
+                futures = [
+                    executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks
+                ]
+                task_results = []
+                budget_spent = False
+                for future, (_, task_content, _, _, _, _) in zip(futures, pending_tasks):
+                    if not budget_spent:
+                        try:
+                            task_results.append(future.result(timeout=_stage_remaining()))
+                            continue
+                        except FuturesTimeoutError:
+                            budget_spent = True
+                            logger.warning(
+                                "ContentRouter parallel compression exceeded the %.1fs "
+                                "compression stage budget; failing open via PASSTHROUGH "
+                                "for unfinished blocks",
+                                stage_deadline_s,
+                            )
+
+                    # Submission order must not hide work that already completed:
+                    # after an earlier timeout, harvest later finished futures
+                    # before failing open only the genuinely pending work.
+                    if future.done():
+                        task_results.append(future.result())
+                        continue
+                    future.cancel()
+                    task_results.append((_stage_passthrough(task_content), 0.0))
 
             parallel_ms = (time.perf_counter() - t_parallel_start) * 1000
             compressor_timing["parallel_compress_total"] = parallel_ms

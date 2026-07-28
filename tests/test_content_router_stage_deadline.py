@@ -15,6 +15,7 @@ These tests pin the multi-block shape on both branches.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -202,3 +203,58 @@ def test_multi_block_disabled_deadline_still_compresses(monkeypatch):
 
     for i in range(1, len(_messages())):
         assert result.messages[i]["content"] == "compressed output"
+
+
+def test_completed_later_futures_survive_earlier_timeout(monkeypatch):
+    """Only unfinished work fails open after the shared deadline expires."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "4")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "50")
+
+    def first_is_slow(content, *, context="", bias=1.0):
+        if "number 0" in content:
+            time.sleep(0.3)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", first_is_slow)
+    original = _messages()
+    result = _apply(router, original)
+
+    assert result.messages[1]["content"] == original[1]["content"]
+    assert result.messages[2]["content"] == "compressed output"
+    assert result.messages[3]["content"] == "compressed output"
+
+
+def test_timed_out_workers_are_bounded_across_requests(monkeypatch):
+    """Repeated deadlines reuse one pool instead of leaking worker sets."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "4")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "30")
+    release = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def wedged_compress(content, *, context="", bias=1.0):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            release.wait(timeout=2.0)
+            return _compression_result(content, "compressed output")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(router, "compress", wedged_compress)
+    try:
+        for _ in range(3):
+            _apply(router, _messages())
+        assert max_active <= 4
+        assert router._stage_compression_executor_workers == 4
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while active and time.monotonic() < deadline:
+            time.sleep(0.01)

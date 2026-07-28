@@ -5272,11 +5272,22 @@ class OpenAIHandlerMixin:
                     # tool_calls. Runs before memory tool handling below so a
                     # retrieve call never gets treated as an unresolved tool_call
                     # by the memory-tool branch.
+                    ccr_response_source = resp_json
+                    if buffered_stream_ccr and upstream_is_sse and usage_source is not None:
+                        # A few OpenAI-compatible upstreams ignore the forced
+                        # ``stream:false`` and still return SSE.  The terminal
+                        # response extracted above is authoritative enough for
+                        # CCR interception, while ``resp_json`` intentionally
+                        # remains unset so a response with no retrieval call can
+                        # still pass through with its original event sequence.
+                        ccr_response_source = usage_source
                     if (
                         _ccr_response_handler
-                        and resp_json
+                        and ccr_response_source
                         and response.status_code == 200
-                        and _ccr_response_handler.has_ccr_tool_calls(resp_json, "openai_responses")
+                        and _ccr_response_handler.has_ccr_tool_calls(
+                            ccr_response_source, "openai_responses"
+                        )
                     ):
                         logger.info(
                             f"[{request_id}] CCR: Detected retrieval tool call (responses), handling..."
@@ -5329,7 +5340,7 @@ class OpenAIHandlerMixin:
 
                         try:
                             final_resp_json = await _ccr_response_handler.handle_response(
-                                resp_json,
+                                ccr_response_source,
                                 _responses_input_to_items(body.get("input")),
                                 body.get("tools"),
                                 api_call_fn,
@@ -5639,6 +5650,23 @@ class OpenAIHandlerMixin:
                                             {
                                                 "type": "http.response.body",
                                                 "body": b"",
+                                                "more_body": False,
+                                            }
+                                        )
+                                        return
+
+                                    # The upstream may ignore the forced
+                                    # ``stream:false`` and return raw SSE.  Once
+                                    # the keepalive has started we cannot invoke
+                                    # a plain Response (it would emit a second
+                                    # response-start), but its successful body is
+                                    # still safe to append to the open stream.
+                                    body_bytes = getattr(result, "body", None)
+                                    if result.status_code == 200 and body_bytes is not None:
+                                        await send(
+                                            {
+                                                "type": "http.response.body",
+                                                "body": body_bytes,
                                                 "more_body": False,
                                             }
                                         )
