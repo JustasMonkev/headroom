@@ -384,6 +384,13 @@ def _maybe_compact(target: Path) -> None:
     # working set is simply that big), don't rewrite the whole file again on
     # every append — wait until it has regrown meaningfully.
     floor = _last_compact_sizes.get(str(target), 0)
+    if floor and size < floor:
+        # The file shrank below our recorded floor: another process compacted
+        # it, or it was rotated/recreated. The cached floor is stale — keeping
+        # it would suppress retention enforcement until the new file regrew
+        # past the OLD working-set size. Forget it and re-evaluate fresh.
+        _last_compact_sizes.pop(str(target), None)
+        floor = 0
     if floor and size <= floor + _COMPACT_REGROWTH_BYTES:
         return
 

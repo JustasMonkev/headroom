@@ -555,9 +555,13 @@ class SQLiteMemoryStore:
                 # text like 'true' or '3' never equals integer 1 or 3 and made
                 # every non-string filter silently match nothing.
                 if value is None:
-                    # `= NULL` never matches in SQL; JSON null (and a missing
-                    # key) extract to SQL NULL, so use IS NULL.
-                    conditions.append(f"json_extract(metadata, '$.{key}') IS NULL")
+                    # `= NULL` never matches in SQL, and json_extract() maps
+                    # BOTH an explicit JSON null and a missing key to SQL NULL
+                    # — an IS NULL filter would return every memory that merely
+                    # omits the key. json_type() names an explicit null 'null'
+                    # and returns SQL NULL for a missing path, so equality
+                    # matches only memories that set the key to null.
+                    conditions.append(f"json_type(metadata, '$.{key}') = 'null'")
                     continue
                 if isinstance(value, bool):
                     # json_extract() collapses JSON true/1 (and false/0) to the

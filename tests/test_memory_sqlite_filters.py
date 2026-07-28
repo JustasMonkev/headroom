@@ -99,3 +99,19 @@ async def test_metadata_filters_distinguish_bool_from_number(store: SQLiteMemory
     assert await ids(flag=1) == ["n1"]
     assert await ids(flag=False) == ["b0"]
     assert await ids(flag=0) == ["n0"]
+
+
+async def test_none_filter_requires_explicit_json_null(store: SQLiteMemoryStore) -> None:
+    """json_extract maps an explicit JSON null AND a missing key to SQL NULL;
+    a None filter must match only memories that explicitly set the key to
+    null, not every memory that omits it."""
+    await store.save(
+        Memory(id="explicit", content="archived: null", user_id="u1", metadata={"archived": None})
+    )
+    await store.save(Memory(id="missing", content="no archived key", user_id="u1", metadata={}))
+    await store.save(
+        Memory(id="set", content="archived: x", user_id="u1", metadata={"archived": "x"})
+    )
+
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"archived": None}))
+    assert sorted(m.id for m in found) == ["explicit"]

@@ -107,3 +107,28 @@ def test_compaction_not_rerun_until_regrowth(tmp_path: Path, monkeypatch) -> Non
     for _ in range(5):
         sl._maybe_compact(target)
     assert calls == []
+
+
+def test_stale_floor_is_reset_after_external_shrink(tmp_path: Path, monkeypatch) -> None:
+    """A floor recorded by this process must not suppress retention after
+    another process compacts (or rotates) the file to a much smaller size —
+    otherwise the ledger could regrow toward the old working-set size with
+    expired events never pruned."""
+    target = tmp_path / "events.jsonl"
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=sl.DEFAULT_RETENTION_DAYS + 5)
+    for _ in range(50):
+        _write_event_line(target, ts=old)
+    _write_event_line(target, ts=now, saved=42)
+
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 128)
+    sl._last_compact_sizes.clear()
+    # Simulate a floor left over from when this process saw a much larger
+    # working set (before another process compacted / the file was rotated).
+    sl._last_compact_sizes[str(target)] = 100 * 1024 * 1024
+
+    sl._maybe_compact(target)
+
+    lines = [ln for ln in target.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1  # expired events pruned despite the stale floor
+    assert sl._last_compact_sizes[str(target)] < 100 * 1024 * 1024
