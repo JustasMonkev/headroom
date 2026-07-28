@@ -586,9 +586,15 @@ class LogCompressor:
             )
             if dropped > 0:
                 parts.append(f"{dropped} {label}")
+        # "compressed away", not "omitted". The word ``compressed`` is
+        # load-bearing: ``ccr/tool_injection.py``'s marker scanner only
+        # recognises a bracket marker containing it, and after the merge this
+        # line is the ONLY place the retrieval hash appears. A footer saying
+        # "omitted" would leave the model holding a hash the retrieve tool was
+        # never injected for (#1006).
         if not parts:
-            return f"{omitted} lines omitted"
-        return f"{omitted} lines omitted: {', '.join(parts)}"
+            return f"{omitted} lines compressed away"
+        return f"{omitted} lines compressed away: {', '.join(parts)}"
 
     def _store_in_ccr(self, original: str, compressed: str, original_count: int) -> str | None:
         """Backwards-compat shim — the legacy callsite name. Now

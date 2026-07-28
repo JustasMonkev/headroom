@@ -739,7 +739,7 @@ class TestOutputFormatting:
         result = compressor.compress(content)
 
         # Should have omission summary
-        assert "lines omitted" in result.compressed
+        assert "compressed away" in result.compressed
 
 
 class TestC2EmissionWaste:
@@ -767,9 +767,29 @@ class TestC2EmissionWaste:
         trailing = [ln for ln in result.compressed.splitlines() if ln.startswith("[")]
         assert len(trailing) == 1, trailing
         # Both facts on the one line, and the scanner token is intact.
-        assert "lines omitted" in trailing[0]
+        assert "lines compressed away" in trailing[0]
         assert "Retrieve more: hash=" in trailing[0]
         assert "lines compressed to" not in result.compressed
+
+    def test_fused_footer_is_still_seen_by_the_ccr_marker_scanner(self):
+        """The merge must not cost the model its retrieve tool (#1006).
+
+        `ccr/tool_injection.py` only recognises a bracket marker containing the
+        word `compressed`. After the merge this footer is the ONLY place the
+        retrieval hash appears, so a footer that said "omitted" would leave the
+        model holding a hash the retrieve tool was never injected for.
+        """
+        from headroom.ccr.tool_injection import CCRToolInjector
+
+        lines = [f"INFO: step {i}" for i in range(200)]
+        lines.append("ERROR: boom")
+        result = LogCompressor(
+            config=LogCompressorConfig(min_lines_for_ccr=50, enable_ccr=True)
+        ).compress("\n".join(lines))
+        assert result.cache_key is not None
+
+        patterns = CCRToolInjector()._marker_patterns
+        assert any(p.search(result.compressed) for p in patterns), result.compressed[-200:]
 
     def test_footer_does_not_advertise_errors_that_are_still_present(self):
         """The old footer counted ALL lines, so it named errors printed above."""
@@ -778,13 +798,13 @@ class TestC2EmissionWaste:
         result = self._compress("\n".join(lines))
 
         assert "ERROR: the only error" in result.compressed
-        footer = next(ln for ln in result.compressed.splitlines() if "lines omitted" in ln)
+        footer = next(ln for ln in result.compressed.splitlines() if "compressed away" in ln)
         assert "ERROR" not in footer, footer
 
     def test_footer_never_mentions_info(self):
         lines = [f"INFO: step {i}" for i in range(300)]
         result = self._compress("\n".join(lines))
-        footer = next(ln for ln in result.compressed.splitlines() if "lines omitted" in ln)
+        footer = next(ln for ln in result.compressed.splitlines() if "compressed away" in ln)
         assert "INFO" not in footer, footer
 
     def test_byte_identical_errors_fold_with_a_count(self):

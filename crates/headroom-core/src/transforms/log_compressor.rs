@@ -992,6 +992,9 @@ impl LogCompressor {
                         selected.len(),
                         key
                     ),
+                    // NOTE: whichever branch runs, the emitted line must
+                    // contain both `compressed` and `Retrieve more: hash=` —
+                    // see `omission_summary`.
                 };
                 cache_key = Some(key);
                 stats.ccr_emitted = true;
@@ -1395,10 +1398,19 @@ fn omission_summary(selected: &[LogLine], all_lines: &[LogLine]) -> Option<Strin
             parts.push(format!("{} {}", dropped, label));
         }
     }
+    // "compressed away", not "omitted". The word `compressed` is load-bearing:
+    // `ccr/tool_injection.py`'s marker scanner only recognises a bracket
+    // marker that contains it, and this line is now the ONLY place the
+    // retrieval hash appears. A footer that says "omitted" leaves the model
+    // holding a hash the retrieve tool was never injected for (#1006).
     if parts.is_empty() {
-        Some(format!("{} lines omitted", omitted))
+        Some(format!("{} lines compressed away", omitted))
     } else {
-        Some(format!("{} lines omitted: {}", omitted, parts.join(", ")))
+        Some(format!(
+            "{} lines compressed away: {}",
+            omitted,
+            parts.join(", ")
+        ))
     }
 }
 
@@ -1780,7 +1792,7 @@ mod tests {
         // one ERROR is right above, so advertising it would send the model
         // retrieving for something it already has. INFO is never listed.
         assert!(
-            output.contains("[3 lines omitted: 1 WARN]"),
+            output.contains("[3 lines compressed away: 1 WARN]"),
             "unexpected footer: {output}"
         );
         // The `stats` map still reports whole-log level totals.
@@ -1797,7 +1809,7 @@ mod tests {
         b.level = LogLevel::Info;
         let all_lines = vec![a.clone(), b];
         let (output, _) = c.format_output(&[a], &all_lines);
-        assert_eq!(output, "ERROR boom\n[1 lines omitted]");
+        assert_eq!(output, "ERROR boom\n[1 lines compressed away]");
     }
 
     #[test]
