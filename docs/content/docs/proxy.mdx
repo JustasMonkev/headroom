@@ -321,7 +321,8 @@ is itself local (Ollama, vLLM, LM Studio, …).
 <Callout type="warn" title="Offline mode is not an egress firewall">
 Setting `HEADROOM_OFFLINE=1` while pointing Headroom at a remote provider still sends
 prompts to that provider. For a true air gap, combine it with a local upstream
-(`--api-base http://localhost:11434`, for example) or with a network-level egress block.
+(`--openai-api-url http://127.0.0.1:8000`, see [Local LLM prefill](/docs/local-llm-prefill))
+or with a network-level egress block.
 </Callout>
 
 ### Performance

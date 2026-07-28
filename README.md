@@ -27,6 +27,7 @@
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility-matrix">Agents</a> ·
+  <a href="#what-local-first-means-and-what-it-doesnt">Privacy</a> ·
   <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
   <a href="llms.txt">llms.txt</a>
 </p>
