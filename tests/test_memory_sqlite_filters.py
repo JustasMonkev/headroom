@@ -132,3 +132,32 @@ async def test_none_filter_requires_explicit_json_null(store: SQLiteMemoryStore)
 
     found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"archived": None}))
     assert sorted(m.id for m in found) == ["explicit"]
+
+
+async def test_object_filters_match_regardless_of_key_order(store: SQLiteMemoryStore) -> None:
+    """JSON objects are unordered: a filter dict built in a different key
+    order than the stored metadata must still match (and structural equality
+    must stay exact — subset objects or extra keys must not match)."""
+    await store.save(
+        Memory(id="obj", content="prefs", user_id="u1", metadata={"prefs": {"a": 1, "b": "x"}})
+    )
+    await store.save(
+        Memory(
+            id="obj3",
+            content="prefs+extra",
+            user_id="u1",
+            metadata={"prefs": {"a": 1, "b": "x", "c": True}},
+        )
+    )
+
+    async def ids(**metadata_filters):
+        found = await store.query(MemoryFilter(user_id="u1", metadata_filters=metadata_filters))
+        return sorted(m.id for m in found)
+
+    # Same pairs, opposite insertion order.
+    assert await ids(prefs={"b": "x", "a": 1}) == ["obj"]
+    assert await ids(prefs={"a": 1, "b": "x"}) == ["obj"]
+    # Subset must not match the 3-key object; the full 3-key filter must.
+    assert await ids(prefs={"a": 1, "b": "x", "c": True}) == ["obj3"]
+    # Nested type discipline still applies inside objects.
+    assert await ids(prefs={"a": True, "b": "x"}) == []

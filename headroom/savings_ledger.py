@@ -216,16 +216,21 @@ def _read_events(
     cutoff = now - timedelta(days=retention_days) if retention_days else None
     events: list[dict[str, Any]] = []
     try:
-        # errors="replace": one undecodable byte (a torn write from a crashed
-        # process) must degrade to skipping that line via the json.loads guard
-        # below, not raise UnicodeDecodeError mid-iteration and zero out the
-        # whole report through the outer except.
-        with open(target, encoding="utf-8", errors="replace") as handle:
+        # Binary mode with strict per-line decoding: one undecodable byte (a
+        # torn write from a crashed process) must skip THAT LINE ONLY — not
+        # raise mid-iteration and zero out the whole report, and not be
+        # "repaired" by errors="replace" (a U+FFFD inside a quoted string
+        # still parses as JSON, silently counting an event with corrupted
+        # fields, e.g. savings moved into a bogus model bucket).
+        with open(target, "rb") as handle:
             if _HAS_FCNTL and fcntl is not None:
                 fcntl.flock(handle, fcntl.LOCK_SH)
             try:
-                for raw in handle:
-                    raw = raw.strip()
+                for raw_bytes in handle:
+                    try:
+                        raw = raw_bytes.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        continue
                     if not raw:
                         continue
                     try:
@@ -375,7 +380,38 @@ def aggregate_savings(
     )
 
 
-def _should_compact(path_key: str, st: os.stat_result) -> bool:
+def _floor_sidecar_path(target: Path) -> Path:
+    return Path(str(target) + ".floor")
+
+
+def _read_shared_floor(target: Path) -> tuple[int, int, int] | None:
+    """Read the cross-process compaction floor sidecar, or None.
+
+    The floor cache is process-local, so without this a fleet of worker
+    processes sharing one over-threshold ledger would each perform its own
+    full-file rewrite once per regrowth window — the lock only serializes
+    that burst, it doesn't deduplicate it. The sidecar is advisory:
+    unreadable/torn/missing all degrade to "no floor known".
+    """
+    try:
+        data = json.loads(_floor_sidecar_path(target).read_text(encoding="utf-8"))
+        return (int(data["dev"]), int(data["ino"]), int(data["size"]))
+    except Exception:
+        return None
+
+
+def _write_shared_floor(target: Path, floor: tuple[int, int, int]) -> None:
+    try:
+        dev, ino, size = floor
+        _floor_sidecar_path(target).write_text(
+            json.dumps({"dev": dev, "ino": ino, "size": size}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _should_compact(target: Path, st: os.stat_result) -> bool:
     """Whether the ledger described by ``st`` needs a compaction rewrite.
 
     Central so the decision can be re-evaluated both before AND after taking
@@ -386,8 +422,13 @@ def _should_compact(path_key: str, st: os.stat_result) -> bool:
         return False
     # If a previous compaction couldn't get below the threshold (the 30-day
     # working set is simply that big), don't rewrite the whole file again on
-    # every append — wait until it has regrown meaningfully.
+    # every append — wait until it has regrown meaningfully. The floor comes
+    # from this process's cache, or the cross-process sidecar when another
+    # worker did the compaction.
+    path_key = str(target)
     cached = _last_compact_sizes.get(path_key)
+    if cached is None:
+        cached = _read_shared_floor(target)
     if cached is None:
         return True
     dev, ino, floor = cached
@@ -411,13 +452,13 @@ def _maybe_compact(target: Path) -> None:
         st = target.stat()
     except OSError:
         return
-    if not _should_compact(str(target), st):
+    if not _should_compact(target, st):
         return
 
     now = _utc_now()
     cutoff = now - timedelta(days=DEFAULT_RETENTION_DAYS)
     try:
-        with open(target, "r+", encoding="utf-8", errors="replace") as handle:
+        with open(target, "rb+") as handle:
             if _HAS_FCNTL and fcntl is not None:
                 fcntl.flock(handle, fcntl.LOCK_EX)
             try:
@@ -429,12 +470,18 @@ def _maybe_compact(target: Path) -> None:
                     locked_st = os.fstat(handle.fileno())
                 except OSError:
                     return
-                if not _should_compact(str(target), locked_st):
+                if not _should_compact(target, locked_st):
                     return
                 kept: list[str] = []
                 handle.seek(0)
-                for raw in handle:
-                    stripped = raw.strip()
+                for raw_bytes in handle:
+                    # Strict per-line decode — see _read_events: a torn line
+                    # must be dropped, not "repaired" into a corrupted event
+                    # that compaction would then persist.
+                    try:
+                        stripped = raw_bytes.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        continue
                     if not stripped:
                         continue
                     try:
@@ -448,7 +495,7 @@ def _maybe_compact(target: Path) -> None:
                 handle.seek(0)
                 handle.truncate()
                 if kept:
-                    handle.write("\n".join(kept) + "\n")
+                    handle.write(("\n".join(kept) + "\n").encode("utf-8"))
                 # Flush before releasing the lock — see record_savings_event.
                 # An unflushed rewrite tail draining at close() (after LOCK_UN)
                 # could overwrite a line another process appended in between.
@@ -459,11 +506,12 @@ def _maybe_compact(target: Path) -> None:
                 # compaction of a file this process never compacted.
                 try:
                     final = os.fstat(handle.fileno())
-                    _last_compact_sizes[str(target)] = (
-                        final.st_dev,
-                        final.st_ino,
-                        final.st_size,
-                    )
+                    floor = (final.st_dev, final.st_ino, final.st_size)
+                    _last_compact_sizes[str(target)] = floor
+                    # Publish for other worker processes too (their caches
+                    # are process-local); written while still holding the
+                    # ledger lock so queued writers see it on their recheck.
+                    _write_shared_floor(target, floor)
                 except OSError:
                     pass
             finally:

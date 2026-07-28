@@ -175,8 +175,12 @@ class JSONLStorage(Storage):
                 try:
                     data = json.loads(line)
                     yield self._dict_to_metrics(data)
-                except json.JSONDecodeError:
-                    # Skip malformed lines
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                    # Skip malformed lines AND structurally invalid records
+                    # (missing required fields -> KeyError, bad timestamps ->
+                    # ValueError): query() exhausts this iterator to find the
+                    # newest records, so a single bad record anywhere in the
+                    # history must not break every page.
                     continue
 
     def get_summary_stats(

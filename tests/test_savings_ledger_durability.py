@@ -97,7 +97,7 @@ def test_compaction_not_rerun_until_regrowth(tmp_path: Path, monkeypatch) -> Non
     real_open = open
 
     def counting_open(file, mode="r", *args, **kwargs):
-        if str(file) == str(target) and "r+" in mode:
+        if str(file) == str(target) and "+" in mode:
             calls.append(mode)
         return real_open(file, mode, *args, **kwargs)
 
@@ -121,23 +121,23 @@ def test_should_compact_decision_logic(monkeypatch) -> None:
     sl._last_compact_sizes.clear()
 
     # Below threshold: never compact.
-    assert not sl._should_compact("p", _stat(1000))
+    assert not sl._should_compact(Path("p"), _stat(1000))
     # Above threshold, no floor recorded: compact.
-    assert sl._should_compact("p", _stat(1001))
+    assert sl._should_compact(Path("p"), _stat(1001))
     # Floor recorded, within the regrowth window: skip.
     sl._last_compact_sizes["p"] = (1, 1, 1500)
-    assert not sl._should_compact("p", _stat(1550))
+    assert not sl._should_compact(Path("p"), _stat(1550))
     # Regrown past the window: compact.
-    assert sl._should_compact("p", _stat(1601))
+    assert sl._should_compact(Path("p"), _stat(1601))
     # Shrank below the floor (external compaction): stale floor is dropped
     # and compaction proceeds.
     sl._last_compact_sizes["p"] = (1, 1, 1500)
-    assert sl._should_compact("p", _stat(1200))
+    assert sl._should_compact(Path("p"), _stat(1200))
     assert "p" not in sl._last_compact_sizes
     # Same size but a different inode (rotation/replacement): the pathname
     # refers to a never-compacted file — the floor must not suppress it.
     sl._last_compact_sizes["p"] = (1, 1, 1500)
-    assert sl._should_compact("p", _stat(1550, ino=2))
+    assert sl._should_compact(Path("p"), _stat(1550, ino=2))
     assert "p" not in sl._last_compact_sizes
 
 
@@ -161,7 +161,7 @@ def test_compaction_rechecks_under_lock(tmp_path: Path, monkeypatch) -> None:
     truncations: list[str] = []
 
     def racing_open(file, mode="r", *args, **kwargs):
-        if str(file) == str(target) and "r+" in mode:
+        if str(file) == str(target) and "+" in mode:
             # Simulate another writer compacting while we waited for the lock.
             truncations.append(mode)
             with real_open(target, "w", encoding="utf-8") as fh:
@@ -236,3 +236,57 @@ def test_floor_invalidated_when_inode_changes(tmp_path: Path, monkeypatch) -> No
     dev, ino, _size = sl._last_compact_sizes[str(target)]
     fresh = target.stat()
     assert (dev, ino) == (fresh.st_dev, fresh.st_ino)
+
+
+def test_shared_floor_suppresses_other_process_rewrites(tmp_path: Path, monkeypatch) -> None:
+    """A compaction publishes its floor to a sidecar so OTHER worker
+    processes (whose in-memory caches are empty) skip the redundant
+    full-file rewrite within the regrowth window."""
+    target = tmp_path / "events.jsonl"
+    now = datetime.now(timezone.utc)
+    for _ in range(200):
+        _write_event_line(target, ts=now)
+
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 128)
+    monkeypatch.setattr(sl, "_COMPACT_REGROWTH_BYTES", 64 * 1024)
+    sl._last_compact_sizes.clear()
+
+    sl._maybe_compact(target)  # "process A" compacts and publishes the floor
+    assert sl._floor_sidecar_path(target).exists()
+
+    # "Process B": empty local cache, must pick the floor up from the sidecar.
+    sl._last_compact_sizes.clear()
+    real_open = open
+    rewrites: list[str] = []
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        if str(file) == str(target) and "+" in mode:
+            rewrites.append(mode)
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", counting_open)
+    for _ in range(5):
+        sl._maybe_compact(target)
+    assert rewrites == []
+
+
+def test_corrupt_utf8_line_is_skipped_not_repaired(tmp_path: Path) -> None:
+    """A bad byte INSIDE a JSON string must drop that line, not survive as a
+    U+FFFD-'repaired' event counted under a corrupted model bucket."""
+    target = tmp_path / "events.jsonl"
+    now = datetime.now(timezone.utc)
+    _write_event_line(target, ts=now, saved=100)
+    # A torn line whose damage (a raw 0xFF byte, invalid UTF-8) sits inside
+    # the quoted model field: with errors='replace' this would decode to a
+    # U+FFFD, parse as valid JSON, and be counted.
+    torn = (
+        b'{"v":1,"ts":"' + now.isoformat().encode() + b'","before":110,"after":10,'
+        b'"saved":9999,"cost_usd":9.0,"model":"gpt\xff4o","client":"t","source":"t","pid":1}'
+    )
+    with open(target, "ab") as fh:
+        fh.write(torn + b"\n")
+    _write_event_line(target, ts=now, saved=200)
+
+    report = sl.aggregate_savings(target, now=now)
+    assert report.lifetime["tokens_saved"] == 300  # torn line dropped entirely
+    assert report.lifetime["calls"] == 2

@@ -549,50 +549,78 @@ class SQLiteMemoryStore:
                 # while blocking malicious attempts like "'] OR 1=1--"
                 if not _validate_metadata_key(key):
                     continue
-                # Use JSON extraction for metadata filtering.
-                # json_extract() returns typed SQL values (INTEGER for ints and
-                # booleans, REAL for floats), so bind comparable types: JSON
-                # text like 'true' or '3' never equals integer 1 or 3 and made
-                # every non-string filter silently match nothing.
-                if value is None:
-                    # `= NULL` never matches in SQL, and json_extract() maps
-                    # BOTH an explicit JSON null and a missing key to SQL NULL
-                    # — an IS NULL filter would return every memory that merely
-                    # omits the key. json_type() names an explicit null 'null'
-                    # and returns SQL NULL for a missing path, so equality
-                    # matches only memories that set the key to null.
-                    conditions.append(f"json_type(metadata, '$.{key}') = 'null'")
-                    continue
-                if isinstance(value, bool):
-                    # json_extract() collapses JSON true/1 (and false/0) to the
-                    # same SQL integer, so equality alone can't tell a boolean
-                    # flag from a numeric one. json_type() names booleans
-                    # 'true'/'false' directly — the type IS the value.
-                    conditions.append(f"json_type(metadata, '$.{key}') = ?")
-                    params.append("true" if value else "false")
-                    continue
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                if isinstance(value, (int, float)):
-                    # Require a numeric JSON type so {"active": true} doesn't
-                    # match a filter of 1 (the mirror of the boolean case).
-                    conditions.append(f"json_type(metadata, '$.{key}') IN ('integer', 'real')")
-                    params.append(value)
-                elif isinstance(value, str):
-                    # Require the text type: json_extract exposes arrays and
-                    # objects as SQL text too, so a string filter that happens
-                    # to hold minified JSON (e.g. '["a"]') would otherwise
-                    # also match a real container with that representation.
-                    conditions.append(f"json_type(metadata, '$.{key}') = 'text'")
-                    params.append(value)
-                else:
-                    # Lists/dicts: json_extract returns their minified JSON
-                    # text. Pin the container type so the filter doesn't also
-                    # match a STRING holding the same minified representation.
-                    json_kind = "array" if isinstance(value, (list, tuple)) else "object"
-                    conditions.append(f"json_type(metadata, '$.{key}') = '{json_kind}'")
-                    params.append(json.dumps(value, separators=(",", ":")))
+                self._append_metadata_condition(f"$.{key}", value, conditions, params)
 
         return conditions, params
+
+    def _append_metadata_condition(
+        self, json_path: str, value: Any, conditions: list[str], params: list[Any]
+    ) -> None:
+        """Append typed equality conditions for one metadata JSON path.
+
+        json_extract() returns typed SQL values (INTEGER for ints and
+        booleans, REAL for floats, TEXT for strings AND for containers'
+        minified JSON), so every branch pins both the comparable value and
+        the JSON type — plain equality either silently matched nothing
+        (JSON text 'true' vs integer 1) or matched across types (a string
+        holding '["a"]' vs a real array).
+
+        ``json_path`` is built exclusively from _validate_metadata_key-vetted
+        segments, so interpolating it is injection-safe.
+        """
+        if value is None:
+            # `= NULL` never matches in SQL, and json_extract() maps BOTH an
+            # explicit JSON null and a missing key to SQL NULL — an IS NULL
+            # filter would return every memory that merely omits the key.
+            # json_type() names an explicit null 'null' and returns SQL NULL
+            # for a missing path, so equality matches only explicit nulls.
+            conditions.append(f"json_type(metadata, '{json_path}') = 'null'")
+            return
+        if isinstance(value, bool):
+            # json_extract() collapses JSON true/1 (and false/0) to the same
+            # SQL integer. json_type() names booleans 'true'/'false' directly
+            # — the type IS the value.
+            conditions.append(f"json_type(metadata, '{json_path}') = ?")
+            params.append("true" if value else "false")
+            return
+        if isinstance(value, (int, float)):
+            # Require a numeric JSON type so {"active": true} doesn't match a
+            # filter of 1 (the mirror of the boolean case).
+            conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+            conditions.append(f"json_type(metadata, '{json_path}') IN ('integer', 'real')")
+            params.append(value)
+            return
+        if isinstance(value, str):
+            # Require the text type: json_extract exposes arrays and objects
+            # as SQL text too, so a string filter holding minified JSON
+            # (e.g. '["a"]') would otherwise also match a real container.
+            conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+            conditions.append(f"json_type(metadata, '{json_path}') = 'text'")
+            params.append(value)
+            return
+        if isinstance(value, dict):
+            # JSON objects are unordered, but json_extract() preserves the
+            # STORED key order while json.dumps preserves the FILTER's — raw
+            # minified-text equality would miss logically equal objects.
+            # Compare structurally instead: object type, entry count, and
+            # each entry recursively (invalid sub-keys are skipped, matching
+            # the top-level policy).
+            conditions.append(f"json_type(metadata, '{json_path}') = 'object'")
+            conditions.append(f"(SELECT COUNT(*) FROM json_each(metadata, '{json_path}')) = ?")
+            params.append(len(value))
+            for sub_key, sub_value in value.items():
+                if not _validate_metadata_key(sub_key):
+                    continue
+                self._append_metadata_condition(
+                    f"{json_path}.{sub_key}", sub_value, conditions, params
+                )
+            return
+        # Arrays: JSON arrays are ordered, so minified-text equality is
+        # well-defined. Pin the container type so the filter doesn't match a
+        # STRING holding the same minified representation.
+        conditions.append(f"json_type(metadata, '{json_path}') = 'array'")
+        conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+        params.append(json.dumps(value, separators=(",", ":")))
 
     async def query(self, filter: MemoryFilter) -> list[Memory]:
         """Query memories matching the given filter.
