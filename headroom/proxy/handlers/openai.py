@@ -27,6 +27,7 @@ from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     extract_tags,
     jitter_delay_ms,
+    parse_sse_events_from_byte_buffer,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -1024,6 +1025,129 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     _emit("response.completed", {"response": response})
     events.append(b"data: [DONE]\n\n")
     return events
+
+
+# Terminal Responses SSE events, in preference order: a completed turn wins over
+# a truncated or failed one when an upstream emits more than one.
+_RESPONSES_SSE_TERMINAL_TYPES = (
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+)
+
+
+def _openai_responses_sse_to_response(raw: str | bytes) -> dict[str, Any] | None:
+    """Extract the terminal ``response`` object from a Responses SSE body.
+
+    The inverse of ``_openai_responses_to_sse``. Some OpenAI-compatible
+    upstreams answer a ``stream: false`` request with a ``200
+    text/event-stream`` body anyway (#8). The bytes are forwarded to the client
+    untouched, but Headroom still needs the final response object for usage and
+    telemetry accounting. Returns ``None`` when no terminal event is present, so
+    callers fall back to their pre-request token estimate.
+    """
+    buf = bytearray(raw.encode("utf-8", errors="replace") if isinstance(raw, str) else raw)
+    # The splitter only drains events ending in a blank line; a body whose last
+    # event has no trailing separator would otherwise be dropped. Events with no
+    # ``data:`` line are ignored, so the extra terminator is harmless.
+    if not buf.endswith(b"\n\n") and not buf.endswith(b"\r\n\r\n"):
+        buf.extend(b"\n\n")
+
+    try:
+        events = parse_sse_events_from_byte_buffer(buf)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+    best: dict[str, Any] | None = None
+    best_rank = len(_RESPONSES_SSE_TERMINAL_TYPES)
+    for event_name, data_str in events:
+        if data_str.strip() == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data_str)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = payload.get("type") or event_name
+        if event_type not in _RESPONSES_SSE_TERMINAL_TYPES:
+            continue
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            continue
+        rank = _RESPONSES_SSE_TERMINAL_TYPES.index(event_type)
+        # ``<=`` so the last event of the best-ranked type wins.
+        if rank <= best_rank:
+            best, best_rank = response, rank
+    return best
+
+
+def _is_event_stream_response(response: Any) -> bool:
+    """True when an upstream reply carries an SSE content type."""
+    try:
+        content_type = response.headers.get("content-type") or ""
+    except Exception:
+        return False
+    return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
+
+
+def _openai_responses_json_or_terminal_sse(response: Any) -> dict[str, Any]:
+    """Parse a buffered Responses reply, accepting terminal SSE as JSON.
+
+    Continuation calls are always requested with ``stream:false``, but
+    compatible upstreams can ignore that preference. Unlike the initial
+    passthrough response, a continuation cannot safely fall back to raw bytes:
+    it may contain proxy-private CCR or memory tool calls.
+    """
+    # `_retry_request` deliberately returns the final 429/5xx response after
+    # exhausting retries. Never convert a terminal SSE body from that response
+    # into a successful dict that the caller will rebuild as HTTP 200.
+    response.raise_for_status()
+    if _is_event_stream_response(response):
+        terminal = _openai_responses_sse_to_response(response.content)
+        if terminal is None:
+            raise ValueError("Responses SSE continuation had no terminal response event")
+        return terminal
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Responses continuation did not return a JSON object")
+    return payload
+
+
+def _openai_responses_upstream_error_sse(response: httpx.Response) -> bytes:
+    """Represent a late continuation HTTP failure on an already-started SSE stream.
+
+    Once a keepalive has started the HTTP status and headers are immutable, so
+    preserve the upstream retry signal in the terminal error event instead.
+    """
+    error: dict[str, Any] = {
+        "message": f"Upstream continuation failed with HTTP {response.status_code}.",
+        "type": "upstream_error",
+        "code": "upstream_http_error",
+        "status": response.status_code,
+    }
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        upstream_error = payload.get("error")
+        if isinstance(upstream_error, dict):
+            for key in ("message", "type", "code"):
+                value = upstream_error.get(key)
+                if value is not None:
+                    error[key] = value
+
+    retry_headers = {
+        key.lower(): value
+        for key, value in response.headers.items()
+        if key.lower() == "retry-after" or "ratelimit" in key.lower()
+    }
+    if retry_headers:
+        error["headers"] = retry_headers
+
+    event = {"type": "error", "error": error}
+    return f"event: error\ndata: {json.dumps(event)}\n\n".encode()
 
 
 def _output_shaping_holdout_fraction() -> float:
@@ -5140,9 +5264,43 @@ class OpenAIHandlerMixin:
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
                     cache_read_tokens = 0
+
+                    # A ``stream: false`` request is normally answered with JSON,
+                    # but some OpenAI-compatible upstreams reply with a valid
+                    # ``200 text/event-stream`` Responses body anyway (#8).
+                    # Parsing that as JSON used to raise JSONDecodeError out of
+                    # this handler and turn a *successful* upstream reply into
+                    # ``502 proxy_error``. Recover the terminal response object
+                    # for usage/telemetry and private-tool interception. Keep
+                    # ``resp_json`` unset so an SSE reply with no proxy-private
+                    # calls still passes through with its original event bytes.
+                    upstream_is_sse = _is_event_stream_response(response)
+                    # Bound the unbound-name risk: every consumer below is already
+                    # guarded on ``resp_json`` being truthy.
+                    resp_json: dict[str, Any] | None = None
+                    usage_source: dict[str, Any] | None = None
                     try:
-                        resp_json = response.json()
-                        usage = resp_json.get("usage", {})
+                        if upstream_is_sse:
+                            usage_source = _openai_responses_sse_to_response(response.content)
+                            if usage_source is None:
+                                logger.debug(
+                                    f"[{request_id}] Upstream returned text/event-stream with no "
+                                    "terminal response event; forwarding as-is"
+                                )
+                        else:
+                            resp_json = response.json()
+                            usage_source = resp_json
+                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+                        # Not JSON and not SSE (e.g. an HTML error page from a
+                        # proxy in front of the upstream). Forward the bytes
+                        # untouched rather than manufacturing a 502.
+                        logger.debug(
+                            f"[{request_id}] OpenAI responses upstream body was not JSON "
+                            f"({type(e).__name__}); forwarding without parsing"
+                        )
+
+                    try:
+                        usage = (usage_source or {}).get("usage", {}) or {}
 
                         def _usage_int(value: Any, default: int = 0) -> int:
                             try:
@@ -5173,12 +5331,24 @@ class OpenAIHandlerMixin:
                     # tool_calls. Runs before memory tool handling below so a
                     # retrieve call never gets treated as an unresolved tool_call
                     # by the memory-tool branch.
+                    ccr_response_source = resp_json
+                    if upstream_is_sse and usage_source is not None:
+                        # An OpenAI-compatible upstream can return SSE even for
+                        # a client ``stream:false`` request.  In every SSE path
+                        # the extracted terminal response is authoritative for
+                        # CCR interception, while ``resp_json`` intentionally
+                        # remains unset so a response with no retrieval call can
+                        # still pass through with its original event sequence.
+                        ccr_response_source = usage_source
                     if (
                         _ccr_response_handler
-                        and resp_json
+                        and ccr_response_source
                         and response.status_code == 200
-                        and _ccr_response_handler.has_ccr_tool_calls(resp_json, "openai_responses")
+                        and _ccr_response_handler.has_ccr_tool_calls(
+                            ccr_response_source, "openai_responses"
+                        )
                     ):
+                        ccr_continuation_error: httpx.HTTPStatusError | None = None
                         logger.info(
                             f"[{request_id}] CCR: Detected retrieval tool call (responses), handling..."
                         )
@@ -5187,6 +5357,7 @@ class OpenAIHandlerMixin:
                             items: list[dict[str, Any]],
                             tls: list[dict[str, Any]] | None,
                         ) -> dict[str, Any]:
+                            nonlocal ccr_continuation_error
                             continuation_body = {**body, "input": items}
                             if tls is not None:
                                 continuation_body["tools"] = tls
@@ -5226,24 +5397,43 @@ class OpenAIHandlerMixin:
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
                             )
-                            return cont_response.json()
+                            try:
+                                return _openai_responses_json_or_terminal_sse(cont_response)
+                            except httpx.HTTPStatusError as e:
+                                # CCRResponseHandler deliberately converts
+                                # continuation exceptions into a residual tool
+                                # call for provider-generic callers. Preserve
+                                # the concrete upstream failure here so this
+                                # HTTP proxy can return its status and headers.
+                                ccr_continuation_error = e
+                                raise
 
                         try:
                             final_resp_json = await _ccr_response_handler.handle_response(
-                                resp_json,
+                                ccr_response_source,
                                 _responses_input_to_items(body.get("input")),
                                 body.get("tools"),
                                 api_call_fn,
                                 provider="openai_responses",
                             )
+                            if ccr_continuation_error is not None:
+                                raise ccr_continuation_error
+                            if _ccr_response_handler.has_ccr_tool_calls(
+                                final_resp_json, "openai_responses"
+                            ):
+                                raise RuntimeError(
+                                    "Responses CCR continuation still contained headroom_retrieve"
+                                )
                             resp_json = final_resp_json
                             # Remove encoding headers since content is now
                             # uncompressed JSON we synthesized.
                             ccr_response_headers = {
                                 k: v
                                 for k, v in response.headers.items()
-                                if k.lower() not in ("content-encoding", "content-length")
+                                if k.lower()
+                                not in ("content-encoding", "content-length", "content-type")
                             }
+                            ccr_response_headers["content-type"] = "application/json"
                             response = httpx.Response(
                                 status_code=200,
                                 content=json.dumps(final_resp_json).encode(),
@@ -5263,20 +5453,25 @@ class OpenAIHandlerMixin:
                             # feedback_no_silent_fallbacks.
                             raise
 
-                    # Memory: handle memory tool calls in Responses API response
+                    # Memory: handle memory tool calls in Responses API response.
+                    # As with CCR, a terminal SSE response is authoritative when
+                    # an upstream ignored the client's ``stream:false``.
+                    memory_response_source = resp_json or usage_source
                     if (
                         self.memory_handler
                         and memory_user_id
                         and responses_memory_tools_allowed
-                        and resp_json
+                        and memory_response_source
                         and response.status_code == 200
-                        and self.memory_handler.has_memory_tool_calls(resp_json, "openai")
+                        and self.memory_handler.has_memory_tool_calls(
+                            memory_response_source, "openai"
+                        )
                     ):
                         try:
                             # Extract function_call items from output
                             from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES
 
-                            output_items = resp_json.get("output", [])
+                            output_items = memory_response_source.get("output", [])
                             memory_fc_items = [
                                 item
                                 for item in output_items
@@ -5314,7 +5509,7 @@ class OpenAIHandlerMixin:
 
                             if tool_outputs:
                                 # Make continuation request with tool results
-                                response_id = resp_json.get("id")
+                                response_id = memory_response_source.get("id")
                                 continuation_body = {
                                     "model": model,
                                     "input": tool_outputs,
@@ -5328,16 +5523,37 @@ class OpenAIHandlerMixin:
                                 cont_response = await self._retry_request(
                                     "POST", url, headers, continuation_body
                                 )
-                                resp_json = cont_response.json()
-                                response = cont_response
+                                resp_json = _openai_responses_json_or_terminal_sse(cont_response)
+                                if _is_event_stream_response(cont_response):
+                                    memory_response_headers = {
+                                        k: v
+                                        for k, v in cont_response.headers.items()
+                                        if k.lower()
+                                        not in (
+                                            "content-encoding",
+                                            "content-length",
+                                            "content-type",
+                                        )
+                                    }
+                                    memory_response_headers["content-type"] = "application/json"
+                                    response = httpx.Response(
+                                        status_code=cont_response.status_code,
+                                        content=json.dumps(resp_json).encode(),
+                                        headers=memory_response_headers,
+                                    )
+                                else:
+                                    response = cont_response
                                 logger.info(
                                     f"[{request_id}] Memory: Handled {len(tool_outputs)} "
                                     f"tool call(s) with continuation for user {memory_user_id} (responses)"
                                 )
                         except Exception as e:
-                            logger.warning(
+                            logger.error(
                                 f"[{request_id}] Memory tool handling failed (responses): {e}"
                             )
+                            # Memory functions are proxy-private. Never leak an
+                            # unresolved call to a client that cannot execute it.
+                            raise
 
                     # Cost is recorded once by the outcome funnel below; here we only
                     # compute the cache-write / uncached split the funnel needs.
@@ -5482,6 +5698,34 @@ class OpenAIHandlerMixin:
                                 if done:
                                     try:
                                         result = operation.result()
+                                    except httpx.HTTPStatusError as e:
+                                        await record_failed(provider="openai")
+                                        upstream_response = e.response
+                                        logger.warning(
+                                            f"[{request_id}] OpenAI responses continuation "
+                                            f"failed with upstream HTTP "
+                                            f"{upstream_response.status_code}"
+                                        )
+                                        if not started:
+                                            error_response = Response(
+                                                content=upstream_response.content,
+                                                status_code=upstream_response.status_code,
+                                                headers=_sanitize_forwarded_response_headers(
+                                                    upstream_response.headers
+                                                ),
+                                            )
+                                            await error_response(scope, receive, send)
+                                            return
+                                        await send(
+                                            {
+                                                "type": "http.response.body",
+                                                "body": _openai_responses_upstream_error_sse(
+                                                    upstream_response
+                                                ),
+                                                "more_body": False,
+                                            }
+                                        )
+                                        return
                                     except Exception as e:
                                         await record_failed(provider="openai")
                                         logger.error(
@@ -5545,6 +5789,31 @@ class OpenAIHandlerMixin:
                                         )
                                         return
 
+                                    # The upstream may ignore the forced
+                                    # ``stream:false`` and return raw SSE. Once
+                                    # the keepalive has started we cannot invoke
+                                    # a plain Response (it would emit a second
+                                    # response-start), but an actual SSE body is
+                                    # still safe to append to the open stream.
+                                    # A 200 HTML/text gateway response is not:
+                                    # appending it after a ping would corrupt the
+                                    # event stream, so let it take the structured
+                                    # SSE error path below.
+                                    body_bytes = getattr(result, "body", None)
+                                    if (
+                                        result.status_code == 200
+                                        and body_bytes is not None
+                                        and _is_event_stream_response(result)
+                                    ):
+                                        await send(
+                                            {
+                                                "type": "http.response.body",
+                                                "body": body_bytes,
+                                                "more_body": False,
+                                            }
+                                        )
+                                        return
+
                                     await send(
                                         {
                                             "type": "http.response.body",
@@ -5584,6 +5853,18 @@ class OpenAIHandlerMixin:
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
+        except httpx.HTTPStatusError as e:
+            await self.metrics.record_failed(provider="openai")
+            upstream_response = e.response
+            logger.warning(
+                f"[{request_id}] OpenAI responses continuation failed with upstream "
+                f"HTTP {upstream_response.status_code}"
+            )
+            return Response(
+                content=upstream_response.content,
+                status_code=upstream_response.status_code,
+                headers=_sanitize_forwarded_response_headers(upstream_response.headers),
+            )
         except Exception as e:
             await self.metrics.record_failed(provider="openai")
             logger.error(f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}")

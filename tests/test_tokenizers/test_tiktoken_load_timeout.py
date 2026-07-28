@@ -71,6 +71,25 @@ def test_fast_load_returns_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tc.load_encoding("fast-enc") is sentinel
 
 
+def test_offline_mode_never_calls_tiktoken_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tiktoken
+
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setattr(
+        tiktoken,
+        "get_encoding",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("offline mode attempted a tiktoken vocabulary load")
+        ),
+    )
+
+    with pytest.raises(tc.TiktokenLoadError, match="offline mode"):
+        tc.load_encoding("cold-offline-encoding")
+
+    counter = TokenizerRegistry()._create_tiktoken("gpt-4")
+    assert isinstance(counter, EstimatingTokenCounter)
+
+
 def test_registry_falls_back_to_estimator_on_stall(monkeypatch: pytest.MonkeyPatch) -> None:
     import tiktoken
 

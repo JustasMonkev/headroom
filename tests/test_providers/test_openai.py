@@ -2,12 +2,34 @@
 
 import pytest
 
+import headroom.providers.openai as openai_module
 from headroom.providers.openai import (
+    OpenAIProvider,
     _get_encoding_name_for_model,
 )
+from headroom.tokenizers import tiktoken_counter
+from headroom.tokenizers.estimator import EstimatingTokenCounter
 
 
 class TestOpenAITokenCounting:
+    def test_offline_provider_uses_estimator_without_loading_tiktoken(self, monkeypatch):
+        import tiktoken
+
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        openai_module._get_encoding.cache_clear()
+        tiktoken_counter._get_encoding.cache_clear()
+        monkeypatch.setattr(
+            tiktoken,
+            "get_encoding",
+            lambda _name: (_ for _ in ()).throw(
+                AssertionError("offline provider attempted a vocabulary load")
+            ),
+        )
+
+        counter = OpenAIProvider().get_token_counter("gpt-4o")
+
+        assert isinstance(counter, EstimatingTokenCounter)
+
     def test_count_text_empty(self, openai_tokenizer):
         assert openai_tokenizer.count_text("") == 0
 

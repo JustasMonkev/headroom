@@ -40,12 +40,14 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import sys
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, wait
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -93,6 +95,127 @@ _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 _detect_native_verified = False  # native detect has returned once -> skip the watchdog
+
+
+class _DaemonBoundedExecutor:
+    """Small fixed worker pool whose bounded queue and daemon workers can be abandoned.
+
+    ``ThreadPoolExecutor`` registers its workers for an interpreter-exit join,
+    so one permanently wedged compressor can prevent process shutdown even
+    when requests fail open. These workers are daemon threads and therefore do
+    not participate in that join. The queue holds at most one pending wave.
+    """
+
+    def __init__(self, max_workers: int, max_pending: int) -> None:
+        self._max_workers = max_workers
+        self._queue: queue.Queue[
+            tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+        ] = queue.Queue(maxsize=max_pending)
+        self._worker_lock = threading.Lock()
+        self._idle_workers = 0
+        self._threads: list[threading.Thread] = []
+
+    def _worker(self) -> None:
+        while True:
+            future, fn, args, kwargs = self._queue.get()
+            with self._worker_lock:
+                self._idle_workers -= 1
+            # A submitter can race between queue.get() and the idle decrement.
+            # Re-check after becoming busy so any work it left queued gets the
+            # additional worker capacity it needs.
+            self._ensure_workers_for_pending()
+            try:
+                if future.set_running_or_notify_cancel():
+                    try:
+                        future.set_result(fn(*args, **kwargs))
+                    except BaseException as exc:  # noqa: BLE001 - Future transports worker errors
+                        future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+                with self._worker_lock:
+                    self._idle_workers += 1
+            # Do not retain the Future, callable, arguments, or result payload
+            # in this idle thread's frame while it blocks for the next job.
+            del future, fn, args, kwargs
+
+    def _ensure_workers_for_pending(self) -> None:
+        """Start only enough daemon workers for currently queued work."""
+        with self._worker_lock:
+            pending = self._queue.qsize()
+            needed = max(0, pending - self._idle_workers)
+            to_start = min(needed, self._max_workers - len(self._threads))
+            workers = []
+            for _ in range(to_start):
+                index = len(self._threads)
+                worker = threading.Thread(
+                    target=self._worker,
+                    name=f"headroom-router-compress-{index}",
+                    daemon=True,
+                )
+                self._threads.append(worker)
+                # Count a newly created worker as available before start() so
+                # concurrent submissions cannot over-provision while it waits
+                # to be scheduled by the OS.
+                self._idle_workers += 1
+                workers.append(worker)
+        for worker in workers:
+            worker.start()
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        block: bool,
+        **kwargs: Any,
+    ) -> Future[Any] | None:
+        future: Future[Any] = Future()
+        try:
+            self._queue.put((future, fn, args, kwargs), block=block)
+        except queue.Full:
+            return None
+        self._ensure_workers_for_pending()
+        return future
+
+    def cancel_pending(self, futures: list[Future[Any]]) -> int:
+        """Cancel and remove queued work whose request can no longer use it."""
+        cancelled = {future for future in futures if future.cancel()}
+        if not cancelled:
+            return 0
+
+        # ``Future.cancel`` prevents execution but Queue entries would still
+        # occupy the one pending wave until a worker eventually dequeues them.
+        # Remove those entries under Queue's own mutex so a subsequent request
+        # can use the freed bounded capacity immediately. A worker that raced
+        # us and already dequeued an entry will observe the cancelled Future
+        # through ``set_running_or_notify_cancel`` and skip the callable.
+        with self._queue.mutex:
+            retained = [item for item in self._queue.queue if item[0] not in cancelled]
+            removed = len(self._queue.queue) - len(retained)
+            if removed:
+                self._queue.queue.clear()
+                self._queue.queue.extend(retained)
+                self._queue.unfinished_tasks -= removed
+                self._queue.not_full.notify_all()
+                if self._queue.unfinished_tasks == 0:
+                    self._queue.all_tasks_done.notify_all()
+        return len(cancelled)
+
+
+_STAGE_COMPRESSION_EXECUTORS_LOCK = threading.Lock()
+_STAGE_COMPRESSION_EXECUTORS: dict[int, _DaemonBoundedExecutor] = {}
+
+
+def _shared_stage_compression_executor(max_workers: int) -> _DaemonBoundedExecutor:
+    """Reuse one bounded worker set for every router with the same concurrency."""
+    with _STAGE_COMPRESSION_EXECUTORS_LOCK:
+        executor = _STAGE_COMPRESSION_EXECUTORS.get(max_workers)
+        if executor is None:
+            executor = _DaemonBoundedExecutor(
+                max_workers=max_workers,
+                max_pending=max_workers,
+            )
+            _STAGE_COMPRESSION_EXECUTORS[max_workers] = executor
+        return executor
 
 
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
@@ -1727,6 +1850,14 @@ class ContentRouter(Transform):
             self.config.ccr_inject_marker = False
             self.config.smart_crusher_lossless_only = True
         self._observer = observer
+        # Reused by deadline-bound pass-2 compression.  A single bounded pool
+        # prevents timed-out compressor threads from growing without limit
+        # across requests; initialization is lazy because many router uses
+        # never enter the parallel compression path.
+        self._stage_compression_executor_lock = threading.Lock()
+        self._stage_compression_executor: _DaemonBoundedExecutor | None = None
+        self._stage_compression_executor_workers = 0
+        self._stage_compression_admission_capacity = 0
 
         # Name-addressable compressor inventory: built-in metadata + opt-in
         # discovery of `headroom.compressor` entry points. Inventory only —
@@ -2065,6 +2196,48 @@ class ContentRouter(Transform):
         t0 = time.perf_counter()
         result = self.compress(content, context=context, bias=bias)
         return result, (time.perf_counter() - t0) * 1000
+
+    def _get_stage_compression_executor(self, max_workers: int) -> _DaemonBoundedExecutor:
+        """Return the process-shared, bounded, abandonable pass-2 executor.
+
+        Standalone integrations construct a fresh pipeline/router for every
+        call, so a per-router pool would leak another permanently waiting
+        worker set on every request. Sharing by configured concurrency caps
+        both idle workers and timeout debt process-wide, while daemon workers
+        still let the process terminate if compressor code never returns.
+        """
+        with self._stage_compression_executor_lock:
+            if self._stage_compression_executor is None:
+                self._stage_compression_executor = _shared_stage_compression_executor(max_workers)
+                self._stage_compression_executor_workers = max_workers
+                # Bound total retained work to running workers plus one small
+                # pending wave.
+                self._stage_compression_admission_capacity = max_workers * 2
+            return self._stage_compression_executor
+
+    def _submit_stage_compression(
+        self,
+        max_workers: int,
+        content: str,
+        context: str,
+        bias: float,
+        *,
+        block_for_capacity: bool,
+    ) -> Future[tuple[RouterCompressionResult, float]] | None:
+        """Submit only when the shared executor has bounded admission capacity.
+
+        Timed-out futures deliberately remain in the executor's bounded queue;
+        running and retained request contents can never exceed two worker
+        waves, even while every worker is wedged.
+        """
+        executor = self._get_stage_compression_executor(max_workers)
+        return executor.submit(
+            self._timed_compress,
+            content,
+            context,
+            bias,
+            block=block_for_capacity,
+        )
 
     def compress(
         self,
@@ -4907,67 +5080,194 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
-            max_workers = min(
-                len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
-            )
+            configured_workers = max(1, int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4")))
+            max_workers = min(len(pending_tasks), configured_workers)
             t_parallel_start = time.perf_counter()
 
+            # Issue #7: ``HEADROOM_COMPRESSION_DEADLINE_MS`` has to bound the WHOLE
+            # pass-2 compression stage, not just the single-cache-miss special case.
+            # Previously the watchdog was armed only when ``len(pending_tasks) == 1``:
+            # with two or more cache misses the inline loop ran unbounded and the
+            # thread-pool branch blocked on ``Future.result()`` with no timeout, so a
+            # single wedged compressor hung the request forever and the documented
+            # mitigation env var appeared to do nothing. The deadline is now a stage
+            # budget: whatever has not finished when it expires fails OPEN (the block
+            # is forwarded uncompressed) instead of blocking.
+            stage_deadline_s = _compression_deadline_seconds()
+            stage_expiry = (t_parallel_start + stage_deadline_s) if stage_deadline_s else None
+
+            def _stage_passthrough(content: str) -> RouterCompressionResult:
+                return RouterCompressionResult(
+                    compressed=content,
+                    original=content,
+                    strategy_used=CompressionStrategy.PASSTHROUGH,
+                )
+
+            def _stage_remaining() -> float | None:
+                """Seconds left in the stage budget (``None`` = deadline disabled)."""
+                if stage_expiry is None:
+                    return None
+                return max(0.0, stage_expiry - time.perf_counter())
+
+            transient_fallback_slots: set[int] = set()
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                for slot_idx, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                     t0 = time.perf_counter()
-                    deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
-                    if deadline_s:
-                        box: dict[str, Any] = {}
-
-                        def _run(
-                            _box: dict[str, Any] = box,
-                            _content: str = task_content,
-                            _context: str = task_ctx,
-                            _bias: float = task_bias,
-                        ) -> None:
-                            try:
-                                _box["result"] = self.compress(
-                                    _content, context=_context, bias=_bias
-                                )
-                            except BaseException as exc:  # noqa: BLE001
-                                _box["error"] = exc
-
-                        # ponytail: daemon watchdog cannot stop native GIL holds; native layer owns that fix.
-                        worker = threading.Thread(
-                            target=_run, name="headroom-single-compress-watchdog", daemon=True
+                    deadline_s = _stage_remaining()
+                    if deadline_s == 0.0:
+                        # Budget already spent by an earlier task — don't even start.
+                        logger.warning(
+                            "ContentRouter compression stage budget (%.1fs) exhausted; "
+                            "failing open via PASSTHROUGH",
+                            stage_deadline_s,
                         )
-                        worker.start()
-                        worker.join(deadline_s)
-                        if worker.is_alive():
+                        task_results.append((_stage_passthrough(task_content), 0.0))
+                        transient_fallback_slots.add(slot_idx)
+                        continue
+                    if deadline_s is not None:
+                        future = self._submit_stage_compression(
+                            configured_workers,
+                            task_content,
+                            task_ctx,
+                            task_bias,
+                            block_for_capacity=False,
+                        )
+                        if future is None:
                             logger.warning(
-                                "ContentRouter single-cache-miss compression exceeded %.1fs; "
-                                "failing open via PASSTHROUGH",
+                                "ContentRouter compression executor is saturated; "
+                                "failing open via PASSTHROUGH"
+                            )
+                            task_results.append((_stage_passthrough(task_content), 0.0))
+                            transient_fallback_slots.add(slot_idx)
+                            continue
+                        try:
+                            r, compress_ms = future.result(timeout=deadline_s)
+                        except FuturesTimeoutError:
+                            logger.warning(
+                                "ContentRouter inline compression exceeded its %.1fs share of "
+                                "the compression stage budget; failing open via PASSTHROUGH",
                                 deadline_s,
                             )
-                            r = RouterCompressionResult(
-                                compressed=task_content,
-                                original=task_content,
-                                strategy_used=CompressionStrategy.PASSTHROUGH,
+                            # If this call was waiting in the shared queue,
+                            # remove it now; its request can no longer use the
+                            # output. A callable already running cannot be
+                            # cancelled and remains bounded by the worker pool.
+                            self._get_stage_compression_executor(configured_workers).cancel_pending(
+                                [future]
                             )
-                        elif "error" in box:
-                            raise box["error"]
-                        else:
-                            r = box["result"]
+                            r = _stage_passthrough(task_content)
+                            compress_ms = (time.perf_counter() - t0) * 1000
+                            transient_fallback_slots.add(slot_idx)
                     else:
                         r = self.compress(task_content, context=task_ctx, bias=task_bias)
-                    compress_ms = (time.perf_counter() - t0) * 1000
+                        compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
-                # Parallel compression via thread pool
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
-                        futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                # Parallel compression via thread pool. The stage budget has to
+                # bound this branch too — it is the default one (HEADROOM_COMPRESS_WORKERS
+                # defaults to 4). An unbounded ``Future.result()``, plus the implicit
+                # ``shutdown(wait=True)`` that ``ThreadPoolExecutor.__exit__`` performs,
+                # is what let a single wedged compressor block the request forever.
+                # Collect within the remaining budget, fail open for whatever has not
+                # landed, and reuse one bounded pool so stuck workers cannot grow
+                # without limit across requests.
+                task_results_by_index: list[tuple[RouterCompressionResult, float] | None] = [
+                    None
+                ] * len(pending_tasks)
+                in_flight: dict[Future[tuple[RouterCompressionResult, float]], int] = {}
+                next_task_index = 0
+                stage_executor = self._get_stage_compression_executor(configured_workers)
+
+                def _submit_available() -> None:
+                    """Fill the bounded queue, leaving overflow for a later wave."""
+                    nonlocal next_task_index
+                    while next_task_index < len(pending_tasks):
+                        _, task_content, task_ctx, task_bias, _, _ = pending_tasks[next_task_index]
+                        future = self._submit_stage_compression(
+                            configured_workers,
+                            task_content,
+                            task_ctx,
+                            task_bias,
+                            # With no deadline, preserve the historical behavior
+                            # of waiting for capacity. A finite stage must retain
+                            # the ability to fail open at its budget.
+                            block_for_capacity=stage_expiry is None,
                         )
-                    task_results = [f.result() for f in futures]
+                        if future is None:
+                            break
+                        in_flight[future] = next_task_index
+                        next_task_index += 1
+
+                def _future_result_or_cancel_siblings(
+                    future: Future[tuple[RouterCompressionResult, float]],
+                ) -> tuple[RouterCompressionResult, float]:
+                    """Propagate one failure only after cancelling retained siblings."""
+                    try:
+                        return future.result()
+                    except BaseException:  # noqa: BLE001 - preserve compressor exception
+                        stage_executor.cancel_pending(list(in_flight))
+                        raise
+
+                _submit_available()
+                while in_flight:
+                    done, _ = wait(
+                        tuple(in_flight),
+                        timeout=_stage_remaining(),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        break
+                    for future in done:
+                        task_index = in_flight[future]
+                        task_results_by_index[task_index] = _future_result_or_cancel_siblings(
+                            future
+                        )
+                        in_flight.pop(future)
+                    # A queue that was full on the first wave now has room.
+                    # Admit the next work instead of permanently rejecting it.
+                    _submit_available()
+
+                # Catch completions racing the deadline, then fail open only
+                # work that is still running, queued, or not yet admitted.
+                for future, task_index in list(in_flight.items()):
+                    if future.done():
+                        task_results_by_index[task_index] = _future_result_or_cancel_siblings(
+                            future
+                        )
+                        in_flight.pop(future)
+
+                # Results cannot be used once the shared deadline has elapsed.
+                # Cancel admitted work that is still queued so it does not run
+                # an obsolete second wave and starve later requests. Already
+                # running callables remain bounded by the shared worker count.
+                if in_flight:
+                    stage_executor.cancel_pending(list(in_flight))
+
+                unfinished = [
+                    index
+                    for index, task_result in enumerate(task_results_by_index)
+                    if task_result is None
+                ]
+                if unfinished:
+                    logger.warning(
+                        "ContentRouter parallel compression exceeded the %.1fs "
+                        "compression stage budget or executor capacity; failing "
+                        "open via PASSTHROUGH for unfinished blocks",
+                        stage_deadline_s,
+                    )
+                    for task_index in unfinished:
+                        slot_idx, task_content, _, _, _, _ = pending_tasks[task_index]
+                        transient_fallback_slots.add(slot_idx)
+                        task_results_by_index[task_index] = (
+                            _stage_passthrough(task_content),
+                            0.0,
+                        )
+
+                task_results = [
+                    task_result for task_result in task_results_by_index if task_result is not None
+                ]
 
             parallel_ms = (time.perf_counter() - t_parallel_start) * 1000
             compressor_timing["parallel_compress_total"] = parallel_ms
@@ -4982,6 +5282,16 @@ class ContentRouter(Transform):
                 compressor_timing[strategy_key] = (
                     compressor_timing.get(strategy_key, 0.0) + compress_ms
                 )
+
+                # Deadline/capacity passthrough is a transient request outcome,
+                # not evidence that this content is non-compressible. Preserve
+                # it verbatim without poisoning the skip cache, so a later
+                # request can retry after the executor recovers.
+                if slot_idx in transient_fallback_slots:
+                    result_slots[slot_idx] = message
+                    route_counts.setdefault("compression_stage_fallback", 0)
+                    route_counts["compression_stage_fallback"] += 1
+                    continue
 
                 # Lossless folds (search/log/diff via compact_lossless) shrink by
                 # collapsing repeated path prefixes, but the gate's default ratio

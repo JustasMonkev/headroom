@@ -27,6 +27,7 @@
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility-matrix">Agents</a> ·
+  <a href="#what-local-first-means-and-what-it-doesnt">Privacy</a> ·
   <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
   <a href="llms.txt">llms.txt</a>
 </p>
@@ -348,9 +349,31 @@ Provider and tool-specific behavior lives under `headroom/providers/` so core or
 
 </details>
 
+## What "local-first" means (and what it doesn't)
+
+Headroom runs as a process on your machine. Compression, memory, CCR originals, logs, and
+stats are computed and stored locally, and **Headroom never sends your prompts to a
+Headroom-hosted service** — there is no Headroom cloud in the request path.
+
+What it does **not** mean is that requests stop at your machine:
+
+- **Your prompts still go to your model provider.** Headroom is a proxy; it compresses the
+  request and forwards it to whatever upstream you configured — Anthropic, OpenAI, Qwen, a
+  gateway, or a local server. Traffic only stays on your machine if that upstream is itself
+  local (Ollama, vLLM, LM Studio, …).
+- **`--offline` / `HEADROOM_OFFLINE=1` disables Headroom's *auxiliary* egress only** — the
+  telemetry beacon, the update check, license/usage reporting, and HuggingFace model
+  downloads. It does **not** block provider forwarding. Pair it with a local upstream, or
+  with a network-level egress block, if you need a true air gap.
+- **Optional integrations can add their own egress** if you turn them on (OpenTelemetry
+  export, Langfuse tracing, remote memory backends).
+
+Local telemetry (`--telemetry`) is local-only: it feeds your own `/stats` and `/metrics` and
+is not transmitted anywhere.
+
 ## Headroom for teams
 
-Headroom OSS is built for **individual developers**: run `headroom proxy` or `headroom wrap` on your laptop and start cutting tokens in minutes — free, local-first, your data never leaves your machine.
+Headroom OSS is built for **individual developers**: run `headroom proxy` or `headroom wrap` on your laptop and start cutting tokens in minutes — free, local-first, and with no Headroom-hosted service in the request path (see [What "local-first" means](#what-local-first-means-and-what-it-doesnt)).
 
 Running it across a **whole engineering org** is a different job: a shared, always-on deployment; centralized config and version rollout; org-wide savings dashboards; SSO and access controls; air-gapped / VPC installs; and someone to call when it matters. That's what we help companies with — self-hosted with support, or fully managed.
 

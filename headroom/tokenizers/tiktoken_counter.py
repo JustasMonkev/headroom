@@ -16,18 +16,21 @@ import threading
 from functools import lru_cache
 from typing import Any
 
+from headroom.offline import is_offline
+
 from .base import BaseTokenizer
 
 logger = logging.getLogger(__name__)
 
 
 class TiktokenLoadError(RuntimeError):
-    """Raised when a tiktoken encoding can't be loaded in time.
+    """Raised when a tiktoken encoding can't be loaded safely.
 
     tiktoken downloads its BPE vocab on first use via ``requests.get`` with no
     timeout, so a stalled/firewalled connection can block indefinitely. We bound
     that load and raise this instead, so callers fall back to estimation rather
-    than hanging the request (see GH #956).
+    than hanging the request (see GH #956). Offline mode raises the same error
+    before calling tiktoken, preventing a cold-cache vocabulary download.
     """
 
 
@@ -114,10 +117,20 @@ def _get_encoding(encoding_name: str):
     first timed-out encoding is remembered so later calls fail fast instead of
     re-blocking on every request.
     """
-    import tiktoken
-
     if encoding_name in _load_failed:
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
+    if is_offline():
+        # A cold ``tiktoken.get_encoding`` can download its BPE vocabulary.
+        # Offline mode must be cache-only; bypassing tiktoken entirely is the
+        # only stable public-API guarantee that no download is attempted.
+        # Callers already catch this error and use the local estimator. An
+        # encoding loaded before offline mode remains available through this
+        # function's lru_cache without re-entering this branch.
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} is unavailable in offline mode"
+        )
+
+    import tiktoken
 
     box: dict[str, Any] = {}
 
@@ -150,7 +163,8 @@ def load_encoding(encoding_name: str) -> Any:
     """Public, bounded tiktoken-encoding loader.
 
     Returns the tiktoken encoding, or raises :class:`TiktokenLoadError` if the
-    vocab can't be loaded within the timeout (see :func:`_get_encoding`, GH #956).
+    vocab can't be loaded within the timeout or offline mode forbids loading it
+    (see :func:`_get_encoding`, GH #956).
     """
     return _get_encoding(encoding_name)
 

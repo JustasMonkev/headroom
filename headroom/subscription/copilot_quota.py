@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
+from headroom.offline import is_offline
 from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
@@ -229,7 +230,7 @@ class _CopilotQuotaTracker(QuotaTracker):
 
     def is_available(self) -> bool:
         """Returns ``True`` when a GitHub token is available in the environment."""
-        return discover_github_token() is not None
+        return not is_offline() and discover_github_token() is not None
 
     def get_stats(self) -> dict[str, Any] | None:
         """Return the latest quota state dict, or ``None`` if no data yet."""
@@ -244,6 +245,8 @@ class _CopilotQuotaTracker(QuotaTracker):
 
     async def start(self) -> None:
         """Start the background polling loop."""
+        if not self.is_available():
+            return
         if self._task is not None and not self._task.done():
             return
         self._stop_event = asyncio.Event()
@@ -296,6 +299,11 @@ class _CopilotQuotaTracker(QuotaTracker):
                 pass  # normal: poll interval elapsed
 
     async def _maybe_poll(self) -> None:
+        # Re-check dynamically so switching to offline mode also stops an
+        # already-running tracker before it performs another request.
+        if is_offline():
+            return
+
         token = discover_github_token()
         if not token:
             return

@@ -2859,6 +2859,27 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "skill",
     }
 )
+
+
+def _normalize_tool_name(name: Any) -> str:
+    """Fold a tool name for core-set membership.
+
+    ``_TOOL_SEARCH_CORE_TOOLS`` is written in lower_snake_case, but Claude Code
+    ships PascalCase names (``Bash``, ``Read``, ``TodoWrite``, ``WebFetch``, …).
+    An exact, case-sensitive match therefore hit *nothing*, so with tool search
+    enabled every Claude Code tool -- including the core read/edit/run loop --
+    was marked ``defer_loading``. That both discarded the "core tools stay
+    resident" guarantee and maximised the number of tools reachable only through
+    a ``tool_reference`` round-trip.
+    """
+    if not isinstance(name, str):
+        return ""
+    return name.casefold().replace("_", "").replace("-", "")
+
+
+_TOOL_SEARCH_CORE_TOOLS_NORMALIZED = frozenset(
+    _normalize_tool_name(n) for n in _TOOL_SEARCH_CORE_TOOLS
+)
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
@@ -2897,16 +2918,26 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
-    last_resident_real: dict[str, Any] | None = None
+    last_resident_real_idx: int | None = None
     resident_has_cache_control = False
+    # Match core tools case- and separator-insensitively; see _normalize_tool_name.
+    core_normalized = (
+        _TOOL_SEARCH_CORE_TOOLS_NORMALIZED
+        if core_tools is _TOOL_SEARCH_CORE_TOOLS
+        else frozenset(_normalize_tool_name(n) for n in core_tools)
+    )
 
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type")
+            or _normalize_tool_name(tool.get("name")) in core_normalized
+        ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
             if isinstance(tool, dict) and not tool.get("type"):
-                last_resident_real = tool
+                last_resident_real_idx = len(out) - 1
                 resident_has_cache_control = resident_has_cache_control or bool(
                     tool.get("cache_control")
                 )
@@ -2923,8 +2954,18 @@ def inject_tool_search_deferral(
     # Preserve a tools cache breakpoint: if we stripped cache_control off a
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
-    if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
-        last_resident_real["cache_control"] = {"type": "ephemeral"}
+    if (
+        dropped_cache_control
+        and not resident_has_cache_control
+        and last_resident_real_idx is not None
+    ):
+        # Copy before writing: resident tools are appended by reference, so an
+        # in-place write would mutate the caller's list — and the tools that
+        # reach here can be the process-global schema-compaction cache entry,
+        # which is shared across every session with the same tools digest.
+        patched = dict(out[last_resident_real_idx])
+        patched["cache_control"] = {"type": "ephemeral"}
+        out[last_resident_real_idx] = patched
     return out
 
 
@@ -3011,18 +3052,29 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
+    # Case/separator-insensitive, same reason as the Anthropic path above: the
+    # allowlists are lower_snake_case and clients ship PascalCase names.
+    core_normalized = (
+        _TOOL_SEARCH_CORE_TOOLS_NORMALIZED
+        if core_tools is _TOOL_SEARCH_CORE_TOOLS
+        else frozenset(_normalize_tool_name(n) for n in core_tools)
+    )
+    resident_normalized = frozenset(
+        _normalize_tool_name(n) for n in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    )
     for tool in tools:
         if not isinstance(tool, dict):
             out.append(tool)
             continue
         ttype = tool.get("type")
+        normalized_name = _normalize_tool_name(tool.get("name"))
         # Deferrable: a non-core function, or an MCP server (OpenAI models are
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
             ttype == "function"
-            and tool.get("name") not in core_tools
-            and tool.get("name") not in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+            and normalized_name not in core_normalized
+            and normalized_name not in resident_normalized
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)
