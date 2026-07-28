@@ -69,6 +69,34 @@ def test_trim_pulls_context_rows_along_with_their_file():
     assert rows[:cut] == rows[:3]  # b.py's leading context row goes too
 
 
+def test_trim_drops_a_new_file_left_holding_only_leading_context():
+    # `-B`/`-C` context precedes its match row, so a cut inside a new file's
+    # leading context leaves the backward search pointing at the *previous*
+    # file and nothing to remove. The orphan rows — and the `--` above them —
+    # would leave a file represented by context alone, which ripgrep never
+    # emits.
+    rows = [
+        "a/grok.py:70:MATCH",
+        "a/grok.py-71-after",
+        "a/grok.py-72-after",
+        "--",
+        "a/opencode.py-127-leading",
+        "a/opencode.py-128-leading",
+        "a/opencode.py:129:MATCH",
+    ]
+    cut = _trim_to_file_boundary(rows, 6)  # inside opencode.py's leading context
+    assert rows[:cut] == rows[:3]
+    assert "--" not in rows[:cut]
+    assert not any("opencode" in r for r in rows[:cut])
+
+
+def test_trim_keeps_trailing_context_of_the_last_surviving_file():
+    # The second pass must not eat the kept file's own trailing context.
+    rows = ["a/grok.py:70:MATCH", "a/grok.py-71-after", "--", "a/next.py-9-leading"]
+    cut = _trim_to_file_boundary(rows, 4)
+    assert rows[:cut] == rows[:2]
+
+
 def test_trim_never_returns_an_empty_corpus():
     rows = [f"only/one.py:{n}:body" for n in range(1, 6)]
     assert _trim_to_file_boundary(rows, 3) > 0

@@ -113,18 +113,32 @@ def _row_file(row: str) -> str | None:
 def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
     """Back ``cut`` up so it lands between files, never inside one.
 
-    Context rows are attributed by path prefix rather than by "the nearest
-    match row" — treating every context row as part of the file being dropped
-    would also swallow the *previous* file's trailing context. A leading
-    context row whose match row fell outside the cut can
-    still survive as an orphan; the fold leaves such a row as passthrough, so it
-    costs a row of corpus, not a skewed ratio.
+    Two passes, because a file's rows straddle the cut in two different ways.
+
+    Backwards first, over the partial file the cut landed in. Its context rows
+    are attributed by path prefix rather than by "the nearest match row" —
+    treating every context row as part of the file being dropped would also
+    swallow the *previous* file's trailing context.
+
+    Then again, over what is now at the end. `-B`/`-C` context precedes its
+    match row, so when the cut falls inside a *new* file's leading context the
+    backward search finds the previous file and the first pass has nothing to
+    do: the orphan context rows, and the `--` separator above them, stay. That
+    leaves a file represented by context alone, which is not a shape ripgrep
+    emits — precisely what this helper exists to keep out of the corpus.
     """
     target = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
     if target is None:
         return cut
     prefix = target + "-"
     while cut > 1 and (_row_file(rows[cut - 1]) == target or rows[cut - 1].startswith(prefix)):
+        cut -= 1
+
+    kept = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
+    kept_prefix = f"{kept}-" if kept is not None else None
+    while cut > 1 and _row_file(rows[cut - 1]) is None:
+        if kept_prefix is not None and rows[cut - 1].startswith(kept_prefix):
+            break
         cut -= 1
     return cut or MAX_ROWS
 
