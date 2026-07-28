@@ -101,9 +101,14 @@ class JSONLStorage(Storage):
         limit: int = 100,
         offset: int = 0,
     ) -> list[RequestMetrics]:
-        """Query metrics with filters."""
-        results: list[RequestMetrics] = []
-        skipped = 0
+        """Query metrics with filters.
+
+        Sort must happen before offset/limit: the file is in append (ascending)
+        order, so slicing first would return the OLDEST matches — the opposite
+        of SQLiteStorage's ``ORDER BY timestamp DESC LIMIT ? OFFSET ?``, which
+        this backend must mirror (both sit behind the same Storage interface).
+        """
+        matches: list[RequestMetrics] = []
 
         for metrics in self.iter_all():
             # Apply filters
@@ -116,20 +121,11 @@ class JSONLStorage(Storage):
             if mode is not None and metrics.mode != mode:
                 continue
 
-            # Handle offset
-            if skipped < offset:
-                skipped += 1
-                continue
+            matches.append(metrics)
 
-            results.append(metrics)
-
-            # Handle limit
-            if len(results) >= limit:
-                break
-
-        # Sort by timestamp descending
-        results.sort(key=lambda m: m.timestamp, reverse=True)
-        return results
+        # Sort by timestamp descending, then page
+        matches.sort(key=lambda m: m.timestamp, reverse=True)
+        return matches[offset : offset + limit]
 
     def count(
         self,

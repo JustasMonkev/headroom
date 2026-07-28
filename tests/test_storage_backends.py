@@ -159,8 +159,11 @@ def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> Non
     assert storage.get("two") == second
     assert storage.get("missing") is None
 
+    # Paging is newest-first (sort desc, THEN offset/limit), matching
+    # SQLiteStorage's ORDER BY timestamp DESC LIMIT ? OFFSET ?: matches are
+    # ["three" (now), "two" (1h ago)], so offset=1 pages past "three".
     results = storage.query(start_time=now - timedelta(hours=1, minutes=30), offset=1, limit=1)
-    assert [item.request_id for item in results] == ["three"]
+    assert [item.request_id for item in results] == ["two"]
     assert storage.query(model="claude")[0].request_id == "two"
     assert storage.query(mode="optimize")[0].request_id == "two"
     assert storage.query(end_time=now - timedelta(hours=1, minutes=30))[0].request_id == "one"
