@@ -107,23 +107,19 @@ class _DaemonBoundedExecutor:
     """
 
     def __init__(self, max_workers: int, max_pending: int) -> None:
+        self._max_workers = max_workers
         self._queue: queue.Queue[
             tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
         ] = queue.Queue(maxsize=max_pending)
-        self._threads = [
-            threading.Thread(
-                target=self._worker,
-                name=f"headroom-router-compress-{index}",
-                daemon=True,
-            )
-            for index in range(max_workers)
-        ]
-        for worker in self._threads:
-            worker.start()
+        self._worker_lock = threading.Lock()
+        self._idle_workers = 0
+        self._threads: list[threading.Thread] = []
 
     def _worker(self) -> None:
         while True:
             future, fn, args, kwargs = self._queue.get()
+            with self._worker_lock:
+                self._idle_workers -= 1
             try:
                 if not future.set_running_or_notify_cancel():
                     continue
@@ -133,6 +129,31 @@ class _DaemonBoundedExecutor:
                     future.set_exception(exc)
             finally:
                 self._queue.task_done()
+                with self._worker_lock:
+                    self._idle_workers += 1
+
+    def _ensure_workers_for_pending(self) -> None:
+        """Start only enough daemon workers for currently queued work."""
+        with self._worker_lock:
+            pending = self._queue.qsize()
+            needed = max(0, pending - self._idle_workers)
+            to_start = min(needed, self._max_workers - len(self._threads))
+            workers = []
+            for _ in range(to_start):
+                index = len(self._threads)
+                worker = threading.Thread(
+                    target=self._worker,
+                    name=f"headroom-router-compress-{index}",
+                    daemon=True,
+                )
+                self._threads.append(worker)
+                # Count a newly created worker as available before start() so
+                # concurrent submissions cannot over-provision while it waits
+                # to be scheduled by the OS.
+                self._idle_workers += 1
+                workers.append(worker)
+        for worker in workers:
+            worker.start()
 
     def submit(
         self,
@@ -146,6 +167,7 @@ class _DaemonBoundedExecutor:
             self._queue.put((future, fn, args, kwargs), block=block)
         except queue.Full:
             return None
+        self._ensure_workers_for_pending()
         return future
 
     def cancel_pending(self, futures: list[Future[Any]]) -> int:
@@ -5150,6 +5172,7 @@ class ContentRouter(Transform):
                 ] * len(pending_tasks)
                 in_flight: dict[Future[tuple[RouterCompressionResult, float]], int] = {}
                 next_task_index = 0
+                stage_executor = self._get_stage_compression_executor(configured_workers)
 
                 def _submit_available() -> None:
                     """Fill the bounded queue, leaving overflow for a later wave."""
@@ -5171,6 +5194,16 @@ class ContentRouter(Transform):
                         in_flight[future] = next_task_index
                         next_task_index += 1
 
+                def _future_result_or_cancel_siblings(
+                    future: Future[tuple[RouterCompressionResult, float]],
+                ) -> tuple[RouterCompressionResult, float]:
+                    """Propagate one failure only after cancelling retained siblings."""
+                    try:
+                        return future.result()
+                    except BaseException:  # noqa: BLE001 - preserve compressor exception
+                        stage_executor.cancel_pending(list(in_flight))
+                        raise
+
                 _submit_available()
                 while in_flight:
                     done, _ = wait(
@@ -5181,8 +5214,11 @@ class ContentRouter(Transform):
                     if not done:
                         break
                     for future in done:
-                        task_index = in_flight.pop(future)
-                        task_results_by_index[task_index] = future.result()
+                        task_index = in_flight[future]
+                        task_results_by_index[task_index] = _future_result_or_cancel_siblings(
+                            future
+                        )
+                        in_flight.pop(future)
                     # A queue that was full on the first wave now has room.
                     # Admit the next work instead of permanently rejecting it.
                     _submit_available()
@@ -5191,7 +5227,9 @@ class ContentRouter(Transform):
                 # work that is still running, queued, or not yet admitted.
                 for future, task_index in list(in_flight.items()):
                     if future.done():
-                        task_results_by_index[task_index] = future.result()
+                        task_results_by_index[task_index] = _future_result_or_cancel_siblings(
+                            future
+                        )
                         in_flight.pop(future)
 
                 # Results cannot be used once the shared deadline has elapsed.
@@ -5199,9 +5237,7 @@ class ContentRouter(Transform):
                 # an obsolete second wave and starve later requests. Already
                 # running callables remain bounded by the shared worker count.
                 if in_flight:
-                    self._get_stage_compression_executor(configured_workers).cancel_pending(
-                        list(in_flight)
-                    )
+                    stage_executor.cancel_pending(list(in_flight))
 
                 unfinished = [
                     index

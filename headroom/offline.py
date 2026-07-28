@@ -2,7 +2,7 @@
 
 A single predicate the *auxiliary* egress paths consult so a regulated or
 air-gapped deployment can disable Headroom's own outbound network access with
-one flag. Seven auxiliary-egress categories honour it today:
+one flag. Eight auxiliary-egress categories honour it today:
 
 * ``headroom.telemetry.beacon.is_telemetry_enabled`` — telemetry beacon
 * ``headroom.update_check.is_update_check_enabled`` — release/update check
@@ -12,6 +12,7 @@ one flag. Seven auxiliary-egress categories honour it today:
 * ``headroom.subscription.copilot_quota`` — GitHub Copilot quota polling
 * ``headroom.subscription.codex_rate_limits.maybe_schedule_usage_poll`` —
   ChatGPT/Codex usage polling
+* ``headroom.tokenizers.tiktoken_counter`` — tiktoken BPE vocabulary downloads
 * ``apply_offline_env`` below — HuggingFace / Transformers model downloads
 
 This master switch overrides any path-specific eligibility or opt-out controls,

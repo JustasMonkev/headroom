@@ -298,7 +298,26 @@ def test_short_lived_routers_reuse_the_process_worker_pool():
     second_executor = second._get_stage_compression_executor(3)
 
     assert first_executor is second_executor
-    assert len(first_executor._threads) == 3
+    assert len(first_executor._threads) <= 3
+
+
+def test_large_worker_setting_starts_only_workers_needed_for_one_block(monkeypatch):
+    """A large tuning ceiling must not eagerly allocate every daemon thread."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "64")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "2000")
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, *, context="", bias=1.0: _compression_result(content, "compressed output"),
+    )
+
+    result = _apply(router, _messages(pending=1))
+    executor = router._stage_compression_executor
+
+    assert result.messages[1]["content"] == "compressed output"
+    assert executor is not None
+    assert len(executor._threads) == 1
 
 
 def test_burst_larger_than_queue_drains_in_waves(monkeypatch):
@@ -431,3 +450,36 @@ def test_inline_deadline_cancels_work_waiting_in_shared_queue(monkeypatch):
         time.sleep(0.01)
 
     assert compression_calls == []
+
+
+def test_parallel_exception_cancels_retained_siblings(monkeypatch):
+    """A failing compressor must clean up queued siblings before propagating."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "2")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "2000")
+    release = threading.Event()
+    executor = router._get_stage_compression_executor(2)
+    original_cancel = executor.cancel_pending
+    cancelled_batch_sizes: list[int] = []
+
+    def record_cancel(futures):
+        cancelled_batch_sizes.append(len(futures))
+        return original_cancel(futures)
+
+    monkeypatch.setattr(executor, "cancel_pending", record_cancel)
+
+    def mixed_compress(content, *, context="", bias=1.0):
+        if "number 0" in content:
+            raise RuntimeError("compressor failed")
+        release.wait(timeout=2.0)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", mixed_compress)
+    try:
+        with pytest.raises(RuntimeError, match="compressor failed"):
+            _apply(router, _messages(pending=6))
+    finally:
+        release.set()
+
+    assert cancelled_batch_sizes
+    assert cancelled_batch_sizes[0] >= 1

@@ -1099,6 +1099,10 @@ def _openai_responses_json_or_terminal_sse(response: Any) -> dict[str, Any]:
     passthrough response, a continuation cannot safely fall back to raw bytes:
     it may contain proxy-private CCR or memory tool calls.
     """
+    # `_retry_request` deliberately returns the final 429/5xx response after
+    # exhausting retries. Never convert a terminal SSE body from that response
+    # into a successful dict that the caller will rebuild as HTTP 200.
+    response.raise_for_status()
     if _is_event_stream_response(response):
         terminal = _openai_responses_sse_to_response(response.content)
         if terminal is None:

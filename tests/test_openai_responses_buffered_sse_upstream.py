@@ -21,7 +21,10 @@ pytest.importorskip("httpx")
 import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from headroom.proxy.handlers.openai import _openai_responses_sse_to_response  # noqa: E402
+from headroom.proxy.handlers.openai import (  # noqa: E402
+    _openai_responses_json_or_terminal_sse,
+    _openai_responses_sse_to_response,
+)
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
@@ -219,6 +222,19 @@ class TestSseToResponseHelper:
         assert out is not None
         assert out["id"] == "resp_rt"
         assert out["usage"] == {"input_tokens": 3, "output_tokens": 2}
+
+    def test_continuation_sse_preserves_http_failure(self) -> None:
+        response = httpx.Response(
+            429,
+            content=SSE_BODY.encode(),
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", "https://example.test/v1/responses"),
+        )
+
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            _openai_responses_json_or_terminal_sse(response)
+
+        assert exc_info.value.response.status_code == 429
 
 
 def test_buffered_stream_ccr_with_sse_upstream_passes_through() -> None:
