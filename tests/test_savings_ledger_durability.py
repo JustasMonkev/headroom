@@ -109,6 +109,67 @@ def test_compaction_not_rerun_until_regrowth(tmp_path: Path, monkeypatch) -> Non
     assert calls == []
 
 
+def test_should_compact_decision_logic(monkeypatch) -> None:
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 1000)
+    monkeypatch.setattr(sl, "_COMPACT_REGROWTH_BYTES", 100)
+    sl._last_compact_sizes.clear()
+
+    # Below threshold: never compact.
+    assert not sl._should_compact("p", 1000)
+    # Above threshold, no floor recorded: compact.
+    assert sl._should_compact("p", 1001)
+    # Floor recorded, within the regrowth window: skip.
+    sl._last_compact_sizes["p"] = 1500
+    assert not sl._should_compact("p", 1550)
+    # Regrown past the window: compact.
+    assert sl._should_compact("p", 1601)
+    # Shrank below the floor (external compaction/rotation): stale floor is
+    # dropped and compaction proceeds.
+    assert sl._should_compact("p", 1200)
+    assert "p" not in sl._last_compact_sizes
+
+
+def test_compaction_rechecks_under_lock(tmp_path: Path, monkeypatch) -> None:
+    """Writers queued behind a first compaction must not each rewrite the
+    file again: the size/floor decision is re-evaluated after LOCK_EX. Here a
+    'concurrent' compaction shrinks the file between the pre-lock check and
+    the open — the rewrite must be skipped."""
+    target = tmp_path / "events.jsonl"
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=sl.DEFAULT_RETENTION_DAYS + 5)
+    for _ in range(50):
+        _write_event_line(target, ts=old)
+
+    # Threshold sits between one event line (~156B) and the 50-event file, so
+    # the pre-lock check fires but the post-shrink recheck must not.
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 512)
+    sl._last_compact_sizes.clear()
+
+    real_open = open
+    truncations: list[str] = []
+
+    def racing_open(file, mode="r", *args, **kwargs):
+        if str(file) == str(target) and "r+" in mode:
+            # Simulate another writer compacting while we waited for the lock.
+            truncations.append(mode)
+            with real_open(target, "w", encoding="utf-8") as fh:
+                fh.write("")
+            _write_event_line(target, ts=now, saved=7)
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", racing_open)
+    sl._maybe_compact(target)
+    monkeypatch.setattr("builtins.open", real_open)
+
+    assert truncations  # the race actually happened
+    lines = [ln for ln in target.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    # The under-lock recheck saw a small file and skipped the rewrite: the
+    # concurrent writer's single event is intact and no floor was recorded.
+    assert len(lines) == 1
+    assert json.loads(lines[0])["saved"] == 7
+    assert str(target) not in sl._last_compact_sizes
+
+
 def test_stale_floor_is_reset_after_external_shrink(tmp_path: Path, monkeypatch) -> None:
     """A floor recorded by this process must not suppress retention after
     another process compacts (or rotates) the file to a much smaller size —

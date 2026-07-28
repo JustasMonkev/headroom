@@ -1570,13 +1570,11 @@ fn known_html_tag_names() -> Vec<&'static str> {
 // instead of degrading to character estimation. Token IDs are byte-identical
 // to Python `tiktoken` for the same encoding (same BPE merge tables).
 
-fn bundled_bpe(encoding_name: &str) -> PyResult<std::sync::Arc<headroom_core::tokenizer::CoreBPE>> {
-    headroom_core::tokenizer::bpe_for_encoding(encoding_name).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown tiktoken encoding: '{encoding_name}' (bundled: o200k_base, \
-             cl100k_base, p50k_base, r50k_base)"
-        ))
-    })
+fn unknown_encoding_error(encoding_name: &str) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "unknown tiktoken encoding: '{encoding_name}' (bundled: o200k_base, \
+         cl100k_base, p50k_base, r50k_base)"
+    ))
 }
 
 /// Encoding names whose BPE tables are bundled in the Rust core.
@@ -1591,20 +1589,32 @@ fn tiktoken_bundled_encodings() -> Vec<&'static str> {
 /// Special-token strings (e.g. a literal `<|endoftext|>`) are encoded as
 /// ordinary text — the tolerant behavior the Python counters already opt
 /// into via `disallowed_special=()`.
+///
+/// The BPE lookup (and its first-use LazyLock initialization, which parses a
+/// large merge table) runs inside the detached closure: resolving it before
+/// `py.detach` would hold the GIL for the whole init and freeze every other
+/// Python thread exactly on the first offline/firewalled request.
 #[pyfunction]
 fn tiktoken_count(py: Python<'_>, encoding_name: &str, text: &str) -> PyResult<usize> {
-    let bpe = bundled_bpe(encoding_name)?;
+    let name = encoding_name.to_string();
     let owned = text.to_string();
-    Ok(py.detach(move || bpe.encode_ordinary(&owned).len()))
+    py.detach(move || {
+        headroom_core::tokenizer::bpe_for_encoding(&name)
+            .map(|bpe| bpe.encode_ordinary(&owned).len())
+    })
+    .ok_or_else(|| unknown_encoding_error(encoding_name))
 }
 
 /// Encode `text` to token IDs under `encoding_name`. Special-token strings
-/// are treated as ordinary text (see `tiktoken_count`).
+/// are treated as ordinary text; BPE init runs off-GIL (see `tiktoken_count`).
 #[pyfunction]
 fn tiktoken_encode(py: Python<'_>, encoding_name: &str, text: &str) -> PyResult<Vec<u32>> {
-    let bpe = bundled_bpe(encoding_name)?;
+    let name = encoding_name.to_string();
     let owned = text.to_string();
-    Ok(py.detach(move || bpe.encode_ordinary(&owned)))
+    py.detach(move || {
+        headroom_core::tokenizer::bpe_for_encoding(&name).map(|bpe| bpe.encode_ordinary(&owned))
+    })
+    .ok_or_else(|| unknown_encoding_error(encoding_name))
 }
 
 /// Decode token IDs back to text under `encoding_name`.
@@ -1613,15 +1623,22 @@ fn tiktoken_encode(py: Python<'_>, encoding_name: &str, text: &str) -> PyResult<
 /// a token slice whose bytes split a multibyte character decodes with U+FFFD
 /// replacement instead of raising — callers routinely decode truncated token
 /// sequences. An unknown token ID still raises (KeyError, like tiktoken's
-/// `decode_bytes`).
+/// `decode_bytes`). BPE init runs off-GIL (see `tiktoken_count`).
 #[pyfunction]
 fn tiktoken_decode(py: Python<'_>, encoding_name: &str, tokens: Vec<u32>) -> PyResult<String> {
-    let bpe = bundled_bpe(encoding_name)?;
-    py.detach(move || {
-        bpe.decode_bytes(&tokens)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-    })
-    .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("decode failed: {e}")))
+    let name = encoding_name.to_string();
+    match py.detach(move || {
+        headroom_core::tokenizer::bpe_for_encoding(&name).map(|bpe| {
+            bpe.decode_bytes(&tokens)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+    }) {
+        None => Err(unknown_encoding_error(encoding_name)),
+        Some(Ok(text)) => Ok(text),
+        Some(Err(e)) => Err(pyo3::exceptions::PyKeyError::new_err(format!(
+            "decode failed: {e}"
+        ))),
+    }
 }
 
 // ─── Module init ───────────────────────────────────────────────────────────

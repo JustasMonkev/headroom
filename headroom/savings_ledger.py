@@ -371,6 +371,31 @@ def aggregate_savings(
     )
 
 
+def _should_compact(path_key: str, size: int) -> bool:
+    """Whether a ledger of ``size`` bytes needs a compaction rewrite.
+
+    Central so the decision can be re-evaluated both before AND after taking
+    the exclusive lock: concurrent writers all race past a single pre-lock
+    check, then each rewrites the whole retained file in turn.
+    """
+    if size <= _COMPACT_SIZE_BYTES:
+        return False
+    # If a previous compaction couldn't get below the threshold (the 30-day
+    # working set is simply that big), don't rewrite the whole file again on
+    # every append — wait until it has regrown meaningfully.
+    floor = _last_compact_sizes.get(path_key, 0)
+    if floor and size < floor:
+        # The file shrank below our recorded floor: another process compacted
+        # it, or it was rotated/recreated. The cached floor is stale — keeping
+        # it would suppress retention enforcement until the new file regrew
+        # past the OLD working-set size. Forget it and re-evaluate fresh.
+        _last_compact_sizes.pop(path_key, None)
+        return True
+    if floor and size <= floor + _COMPACT_REGROWTH_BYTES:
+        return False
+    return True
+
+
 def _maybe_compact(target: Path) -> None:
     """Rewrite the ledger dropping out-of-retention events once it grows large."""
 
@@ -378,20 +403,7 @@ def _maybe_compact(target: Path) -> None:
         size = target.stat().st_size
     except OSError:
         return
-    if size <= _COMPACT_SIZE_BYTES:
-        return
-    # If a previous compaction couldn't get below the threshold (the 30-day
-    # working set is simply that big), don't rewrite the whole file again on
-    # every append — wait until it has regrown meaningfully.
-    floor = _last_compact_sizes.get(str(target), 0)
-    if floor and size < floor:
-        # The file shrank below our recorded floor: another process compacted
-        # it, or it was rotated/recreated. The cached floor is stale — keeping
-        # it would suppress retention enforcement until the new file regrew
-        # past the OLD working-set size. Forget it and re-evaluate fresh.
-        _last_compact_sizes.pop(str(target), None)
-        floor = 0
-    if floor and size <= floor + _COMPACT_REGROWTH_BYTES:
+    if not _should_compact(str(target), size):
         return
 
     now = _utc_now()
@@ -401,6 +413,16 @@ def _maybe_compact(target: Path) -> None:
             if _HAS_FCNTL and fcntl is not None:
                 fcntl.flock(handle, fcntl.LOCK_EX)
             try:
+                # Re-check under the lock: writers that queued behind the
+                # first compaction would otherwise each rewrite the whole
+                # retained file again. fstat the locked handle (not the path)
+                # so a concurrent rotation can't redirect the check.
+                try:
+                    locked_size = os.fstat(handle.fileno()).st_size
+                except OSError:
+                    return
+                if not _should_compact(str(target), locked_size):
+                    return
                 kept: list[str] = []
                 handle.seek(0)
                 for raw in handle:
