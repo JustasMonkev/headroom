@@ -375,13 +375,62 @@ def test_a_match_row_extending_an_anchored_path_is_left_unparsed():
     assert search_tree_unheading(folded) == rg
 
 
-@pytest.mark.parametrize("body", ["t = 12:34:56", "d = {'k': 12}", "raise ValueError('x: 1')"])
+@pytest.mark.parametrize("body", ["d = {'k': 12}", "raise ValueError('x: 1')", "url = http://a/b"])
 def test_context_bodies_holding_colons_still_fold(body):
-    # The common case, and it must keep folding: a space precedes the colon
-    # marker, so the colon tier never claims these and nothing is ambiguous.
+    # The common case, and it must keep folding: nothing in these bodies reads
+    # as a `path:<digits>:` marker, so there is no rival interpretation.
     rg = f"s/a.py-9-{body}\ns/a.py:10:MATCH\ns/a.py-11-{body}\n"
     folded = search_tree_heading(rg)
     assert len(folded) < len(rg)
+    assert search_tree_unheading(folded) == rg
+
+
+def test_a_bare_timestamp_body_declines_and_that_is_affordable():
+    # `s/a.py-9-t = 12:34:56` reads as context in `s/a.py` or as a match in a
+    # file called `s/a.py-9-t = 12`. Contrived as the second sounds, it is the
+    # same shape as `report.log-2026-backup name:2:MATCH`, where it is the right
+    # answer — so this declines rather than pick.
+    #
+    # Affordable because it is rare in practice, not because it is cheap per
+    # row: on `rg -C 2` over headroom/ and crates/ the folded corpus is 63.6% of
+    # raw whether these rows fold or decline, for both the `context` and `error`
+    # queries. The surrounding rows still fold either way.
+    rg = "s/a.py-9-t = 12:34:56\ns/a.py:10:MATCH\ns/a.py-11-u = 01:02:03\n"
+    folded = search_tree_heading(rg)
+    assert "s/a.py-9-t = 12:34:56" in folded  # verbatim, not re-filed
+    assert search_tree_unheading(folded) == rg
+    # Whatever candidate compact_lossless ends up picking here (the dir fold
+    # wins on this shape) stays byte-recoverable.
+    out = compact_lossless(rg, "search")
+    assert out == rg or search_fold_recovers(out, rg)
+
+    # In a block with something left to factor, the surrounding rows still fold
+    # and only the timestamp row stays verbatim.
+    bigger = rg + "".join(f"s/a.py:{n}:MATCH {n}\n" for n in range(12, 20))
+    folded = search_tree_heading(bigger)
+    assert "s/a.py-9-t = 12:34:56" in folded
+    assert len(folded) < len(bigger)
+    assert search_tree_unheading(folded) == bigger
+
+
+def test_the_marker_colon_must_be_the_lines_first_colon():
+    # A path cannot contain a colon — the claim the whole fold rests on. Walking
+    # on to a later colon when the first isn't followed by digits drops that
+    # colon into the path: `rg --heading -n -o` emits `1:see/foo:12:value`,
+    # which parsed as a file named `1:see/foo` under a `1:see/` directory.
+    assert _tree_colon_row("1:see/foo:12:value") is None
+    headed = "src/main.rs\n1:see/foo:12:value\n2:see/foo:12:other\n"
+    assert search_tree_heading(headed) == headed
+
+
+def test_a_spaced_path_holding_a_dash_marker_is_not_filed_under_its_prefix():
+    # The space guard suppresses the colon reading here, so without asking what
+    # it would have said the dash tier files this under `report.log` at line
+    # 2026 with no disagreement to notice.
+    rg = "report.log:1:hit\nreport.log-2026-backup name:2:MATCH\n"
+    folded = search_tree_heading(rg)
+    assert "report.log-2026-backup name:2:MATCH" in folded  # verbatim
+    assert "\n2026-backup name" not in folded  # not re-filed under report.log
     assert search_tree_unheading(folded) == rg
 
 

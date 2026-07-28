@@ -438,34 +438,39 @@ def _tree_structure_stop(line: str) -> int:
     return stop
 
 
-def _tree_colon_row(line: str) -> tuple[str, str, str, str] | None:
+def _tree_colon_row(line: str, *, allow_space: bool = False) -> tuple[str, str, str, str] | None:
     """Parse a ``path:line:content`` match row.
 
-    ``:`` is grep's *match* separator and a path essentially never contains one
-    (the Windows drive colon is skipped explicitly), so the leftmost marker is
-    the right one.
+    The marker has to be the line's **first** colon, because a path cannot
+    contain one — the claim the rest of this fold rests on. Walking on to a
+    later colon when the first one isn't followed by digits silently drops that
+    colon into the path, which is how ``rg --heading -n -o`` output like
+    ``1:see/foo:12:value`` came to parse as a file named ``1:see/foo`` and fold
+    under a fabricated ``1:see/`` directory. The Windows drive colon is the one
+    exception, and it is skipped explicitly.
+
+    ``allow_space`` lifts the space guard. Callers use it to ask "would this
+    have been a match row but for the guard?" — see :func:`_tree_split_row`.
     """
-    limit = min(len(line), _TREE_MAX_PATH)
     # Skip a Windows drive colon (``C:\Users\...``) so it is never mistaken for
     # the line-number marker.
     start = 2 if len(line) >= 3 and line[0].isalpha() and line[1] == ":" and line[2] in "\\/" else 0
-    first_space = line.find(" ")
-    structure = _tree_structure_stop(line)
     pos = line.find(":", start)
-    seen = 0
-    while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
-        seen += 1
-        end = _tree_digit_run_end(line, pos)
-        if end > pos + 1 and end < len(line) and line[end] == ":" and 0 < pos <= structure:
-            # A space before the marker usually means this is the *body* of a
-            # ``-`` context row quoting a ``foo.py:12:`` reference, not a path.
-            # But a line with no dash marker anywhere cannot be a context row,
-            # so there the space is simply part of a path that has one —
-            # ``very/long/directory name/file.py:2:MATCH`` is a real result row.
-            if first_space == -1 or first_space >= pos or not _tree_has_dash_marker(line):
-                return line[:pos], ":", line[pos + 1 : end], line[end + 1 :]
-        pos = line.find(":", pos + 1)
-    return None
+    if pos <= 0 or pos >= min(len(line), _TREE_MAX_PATH) or pos > _tree_structure_stop(line):
+        return None
+    end = _tree_digit_run_end(line, pos)
+    if end == pos + 1 or end >= len(line) or line[end] != ":":
+        return None
+    if not allow_space:
+        # A space before the marker usually means this is the *body* of a ``-``
+        # context row quoting a ``foo.py:12:`` reference, not a path. But a line
+        # with no dash marker anywhere cannot be a context row, so there the
+        # space is simply part of a path that has one —
+        # ``very/long/directory name/file.py:2:MATCH`` is a real result row.
+        first_space = line.find(" ")
+        if 0 <= first_space < pos and _tree_has_dash_marker(line):
+            return None
+    return line[:pos], ":", line[pos + 1 : end], line[end + 1 :]
 
 
 def _tree_dash_row(
@@ -551,11 +556,18 @@ def _tree_split_row(
     """
     colon = _tree_colon_row(line)
     dash = _tree_dash_row(line, known_paths, known_lengths)
-    if colon is None:
-        return dash
-    if dash is None or dash[0] == colon[0]:
-        return colon
-    return None
+    if colon is not None:
+        return colon if dash is None or dash[0] == colon[0] else None
+    if dash is None:
+        return None
+    # The space guard can suppress a colon reading that was the right one: a
+    # path holding both a space and a ``-<digits>-`` (``report.log-2026-backup
+    # name:2:MATCH``) is rejected as a match row, and the dash tier then files
+    # it under ``report.log`` at line 2026 with no disagreement to notice. Ask
+    # what the colon tier would have said without the guard; if that is a
+    # different file, the row is ambiguous after all.
+    lenient = _tree_colon_row(line, allow_space=True)
+    return None if lenient is not None and lenient[0] != dash[0] else dash
 
 
 def _tree_anchor_paths(lines: list[str]) -> tuple[frozenset[str], frozenset[int]]:

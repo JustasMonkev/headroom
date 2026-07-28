@@ -110,37 +110,49 @@ def _row_file(row: str) -> str | None:
     return m.group("path") if m else None
 
 
+def _belongs(row: str, file: str) -> bool:
+    """Whether ``row`` is part of ``file``'s block — its match row or context."""
+    return _row_file(row) == file or row.startswith(f"{file}-")
+
+
 def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
     """Back ``cut`` up so it lands between files, never inside one.
 
     Two passes, because a file's rows straddle the cut in two different ways.
 
-    Backwards first, over the partial file the cut landed in. Its context rows
-    are attributed by path prefix rather than by "the nearest match row" —
-    treating every context row as part of the file being dropped would also
-    swallow the *previous* file's trailing context.
+    Backwards first, over the partial file the cut landed in — but only when it
+    landed *inside* one. Trimming unconditionally deleted a complete file when
+    the cut already sat on a boundary, and on a query concentrated in one large
+    file it walked the whole way back and left a single row.
 
-    Then again, over what is now at the end. `-B`/`-C` context precedes its
-    match row, so when the cut falls inside a *new* file's leading context the
+    Then again over what is now at the end. `-B`/`-C` context precedes its match
+    row, so when the cut falls inside a *new* file's leading context the
     backward search finds the previous file and the first pass has nothing to
     do: the orphan context rows, and the `--` separator above them, stay. That
     leaves a file represented by context alone, which is not a shape ripgrep
     emits — precisely what this helper exists to keep out of the corpus.
+
+    A file larger than the whole budget has no earlier boundary to find. There
+    the requested cut is returned unchanged: a partial file measures the fold
+    imperfectly, an empty one measures nothing.
     """
+    requested = cut
     target = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
     if target is None:
         return cut
-    prefix = target + "-"
-    while cut > 1 and (_row_file(rows[cut - 1]) == target or rows[cut - 1].startswith(prefix)):
-        cut -= 1
+
+    first_dropped = rows[cut] if cut < len(rows) else None
+    if first_dropped is not None and _belongs(first_dropped, target):
+        while cut > 0 and _belongs(rows[cut - 1], target):
+            cut -= 1
 
     kept = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
     kept_prefix = f"{kept}-" if kept is not None else None
-    while cut > 1 and _row_file(rows[cut - 1]) is None:
+    while cut > 0 and _row_file(rows[cut - 1]) is None:
         if kept_prefix is not None and rows[cut - 1].startswith(kept_prefix):
             break
         cut -= 1
-    return cut or MAX_ROWS
+    return cut if cut > 1 else requested
 
 
 def previous_best(content: str) -> str:

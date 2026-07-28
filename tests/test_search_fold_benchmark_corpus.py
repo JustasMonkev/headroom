@@ -97,6 +97,21 @@ def test_trim_keeps_trailing_context_of_the_last_surviving_file():
     assert rows[:cut] == rows[:2]
 
 
+def test_trim_keeps_a_cut_that_already_sits_on_a_boundary():
+    # Trimming unconditionally deleted a complete file: the backward walk ran
+    # over the last kept file whether or not the cut was inside it.
+    rows = [f"a/f1.py:{n}:b" for n in range(1, 4)] + [f"a/f2.py:{n}:b" for n in range(1, 4)]
+    assert _trim_to_file_boundary(rows, 3) == 3
+
+
+def test_trim_keeps_a_partial_file_when_one_file_fills_the_budget():
+    # A query concentrated in one large file has no earlier boundary to find.
+    # The walk reached the start and left a single row — a corpus that measures
+    # nothing. A partial file measures the fold imperfectly, which is better.
+    rows = [f"only/big.py:{n}:body" for n in range(1, 20)]
+    assert _trim_to_file_boundary(rows, 10) == 10
+
+
 def test_trim_never_returns_an_empty_corpus():
     rows = [f"only/one.py:{n}:body" for n in range(1, 6)]
     assert _trim_to_file_boundary(rows, 3) > 0
