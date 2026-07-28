@@ -15,7 +15,7 @@ The full `MEMORY_TOOLS` JSON is ~9,640 chars ≈ **2,605 tokens** (`memory_save`
 
 The OpenAI variant in `memory_tool_adapter.py:236-241` already proves the examples collapse to one line with no behavior change. Additional cuts:
 - `extracted_entities` / `extracted_relationships` (~180 tok of nested schema) → separate tool registered only when graph storage is on, or free-form `object`.
-- `reason` params on `memory_update`/`memory_delete` ("Explanation for the update.") → drop; nobody reads them and the model pays output tokens to fill them.
+- `reason` params on `memory_update`/`memory_delete`: **keep the fields** — they are consumed in production (`MemoryHandler._execute_update` records `reason` in edit history and forwards it into audit metadata, `proxy/memory_handler.py:1359-1393`). The saving here is limited to tightening the description strings, not removing the parameters.
 
 **Target: ~120 tok/tool → saves ~2,000 tokens/request.** One-time cache-busting edit, permanent payback.
 
@@ -24,7 +24,7 @@ The OpenAI variant in `memory_tool_adapter.py:236-241` already proves the exampl
 
 The "don't double up" guard compares verbatim names, but `headroom wrap` registers the MCP server whose tools surface as `mcp__headroom__headroom_retrieve` — never equal to `headroom_retrieve`. The proxy then appends a second near-identical tool (~129 tok duplicated, plus model ambiguity). Same bug applies to sticky memory tools vs `mcp__headroom-memory__memory_save` — potentially the entire ~2,600-token block **twice**. `config.py:269-282` already has `_tool_name_aliases` for exactly this; it just isn't used here.
 
-**Fix:** normalize `existing_names` through the alias logic (or strip `mcp__*__` prefixes) before the dedup check.
+**Fix:** normalize only the known Headroom server labels (`mcp__headroom__*`, `mcp__headroom-memory__*`) before the dedup check. Do **not** strip arbitrary `mcp__<server>__` prefixes or reuse `_tool_name_aliases` directly — that would conflate tools from unrelated MCP servers whose final component happens to match (e.g. an existing `mcp__other-memory__memory_save` would wrongly suppress Headroom's own `memory_save`, which targets a different store). `_tool_name_aliases` is built for broad exclusion matching, not ownership-sensitive dedup.
 
 ### A3. CCR retrieval tool description: 3 verbatim copies, ~129 tok each
 `headroom/ccr/tool_injection.py:42-110`
@@ -54,7 +54,9 @@ A ~150-token `## Memory` instruction block duplicates guidance already in the to
 ### A7. CCR system-instructions block (opt-in, but broken-by-design when on)
 `headroom/ccr/tool_injection.py:113-144`
 
-~158 tok, of which the `**Available hashes:**` list (~60 tok) is redundant with inline markers **and** mutates turn-to-turn — a cache-busting change in the system prompt, the exact hazard `output_steering.py` warns about. The string-only idempotency check (`:397-399`) also silently re-appends on structured content. Cut to one byte-stable line: `"Compressed tool output carries a hash; call headroom_retrieve(hash) for the original."` (~20 tok).
+~158 tok, of which the `**Available hashes:**` list (~60 tok) is redundant with inline markers **and** mutates turn-to-turn — a cache-busting change in the system prompt, the exact hazard `output_steering.py` warns about. Cut to one byte-stable line: `"Compressed tool output carries a hash; call headroom_retrieve(hash) for the original."` (~20 tok).
+
+Separate gap on the same path: when the system message has **structured** (list) content, `inject_into_system_message` hits the `else` branch at `:397-399` and appends the message unchanged — no instructions are injected at all. So shortening the string alone doesn't cover that case; structured-content insertion (appending a text block to the list) needs to be implemented alongside it.
 
 ---
 
@@ -70,14 +72,16 @@ Emitters: `kompress_compressor.py:1526-1531`, `:1914-1919`; `kompress_remote.py:
 
 Typical marker: `[1200 items compressed to 40 (from 3100 source lines). Retrieve more: hash=<24hex>]` ≈ 27 tok. SmartCrusher's Rust path already ships `<<ccr:{12hex} {n}_rows_offloaded>>` ≈ 10 tok — same information, 2.7× cheaper. With 15–50 markers live in context, prose markers cost 400–900 tokens per turn.
 
-- Converge bracket markers on the `<<ccr:...>>` shape (e.g. `<<ccr:3f9a2b1c4d5e 1200→40>>`). The retrieval-tool description explains semantics once; restating "Retrieve more: hash=" per marker is redundant.
+- Converge bracket markers on the `<<ccr:...>>` shape (e.g. `<<ccr:<hash> 1200→40>>`, keeping the store's 24-hex keys — see B3). The retrieval-tool description explains semantics once; restating "Retrieve more: hash=" per marker is redundant.
 - `tool_injection.py:182-217` already parses 5 formats — consolidation also simplifies the scanner.
 - **Caution:** `"Retrieve original: hash="` is load-bearing for `content_router.py:4976/6009/6064`, `compression_units.py:110`, `parser.py:30`, `read_maturation.py:282` — change all matchers in lockstep.
 
-### B3. 24-hex hashes where 12 suffice
+### B3. Hash keys cost ~12 tokens each; shrink the *encoding*, not the entropy
 `headroom/cache/compression_store.py:325` and all Python emitters (`hexdigest()[:24]`)
 
-Hex tokenizes ~2 chars/token: 24 hex ≈ 12 tok, 12 hex ≈ 6. The Rust path already uses 12 (`crusher.rs:1154-1163`), `parse_tool_call` accepts both (`tool_injection.py:526`), and 48 bits is ample for a store capped at 1,000 entries (`config.py:555`). **~6 tok × every marker in the prompt.**
+Hex tokenizes ~2 chars/token, so a 24-hex key ≈ 12 tok per marker. **Do not truncate to 12 hex:** 96 bits was a deliberate collision-resistance choice (documented at `compression_store.py:303-305`) — at 48 bits an adversary crafting content needs only ~2^24 candidates to find a colliding pair, after which storing the second value overwrites the first and an older marker retrieves the wrong original. The Rust path's 12-hex keys (`crusher.rs:1154-1163`) are an existing compatibility exception, not a precedent to generalize.
+
+The token saving is still available without losing entropy: re-encode the same 96 bits in base32/base64url (96 bits = 16 base64url chars ≈ 6–8 tok vs 12) — `parse_tool_call`/marker regexes would need to accept the wider alphabet in lockstep. Alternatively, keep hex and accept the cost; this is the lowest-priority marker item.
 
 ### B4. `Expires in {N}m.` is dead weight and factually wrong
 `headroom/transforms/code_compressor.py:1266-1273`
@@ -156,7 +160,9 @@ Verified output carries `\r\n` per row (excel dialect; ~1 wasted token/row plus 
 ### C10. HTML extractor defaults maximize output
 `headroom/transforms/html_extractor.py:60-71`
 
-`include_links=True` renders every anchor as `[text](long-tracked-url)` — URLs are the most token-dense text there is — and `favor_recall=True` is documented in-line as "more content, may include some noise". Default both off (anchor text is retained); expect 25–50% on link-heavy pages.
+`include_links=True` renders every anchor as `[text](long-tracked-url)` — URLs are the most token-dense text there is — and `favor_recall=True` is documented in-line as "more content, may include some noise". Expect 25–50% savings on link-heavy pages with both off.
+
+**But don't change the defaults silently:** the router forwards only `HTMLExtractionResult.extracted` (`content_router.py:413-419`, `:3276-3295`) and the original HTML is *not* stored in CCR, so whatever extraction drops is unrecoverable. On docs/search/index pages the destination URL often *is* the payload, and anchor text alone is ambiguous. Safe versions of this win: (a) keep defaults, expose the lean settings as an opt-in profile; (b) store the pre-extraction HTML (or at least the link map) in CCR first, then flip the defaults; (c) lossless middle ground — keep links but strip query strings/tracking params and collapse same-origin hrefs to paths.
 
 ### C11. Lossless-fold gates skip the highest-frequency payloads
 `headroom/transforms/content_router.py:1659`, `:4506`, `:5521`, `:5568`; `smart_crusher.py:174`
@@ -226,7 +232,7 @@ The learned block lands in `CLAUDE.local.md`/`AGENTS.md` — loaded into **every
 
 1. **A1 + A3 + A4** — tool-schema shrink behind shared constants (~2,200 tok/request, one cache-busting edit).
 2. **A2** — alias-aware dedup (bug fix; prevents paying A1 twice).
-3. **B5 → B2/B3/B4/B6** — single marker template, then terse format + 12-hex hashes in one lockstep change with all matchers.
+3. **B5 → B2/B4/B6** — single marker template, then terse format in one lockstep change with all matchers (B3's hash re-encoding is optional and last).
 4. **D1, C9, C4-pass, B1** — free lossless one-liners.
 5. **C1, C2, C3** — search/log/diff format changes (highest-frequency tool outputs).
 6. **A5, E** — memory framing to system prompt; learn-block cap + dedup.
