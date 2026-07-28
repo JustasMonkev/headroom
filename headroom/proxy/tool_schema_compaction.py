@@ -262,7 +262,13 @@ def compact_tools(
         if after >= before:
             return payload, False, before, after
         updated = copy.deepcopy(payload)
-        updated["tools"] = compacted_tools
+        # Hand out a copy, never the cache entry itself: _compaction_cache is a
+        # process-global keyed only on the tools digest, so it is shared across
+        # sessions and concurrent requests. Downstream stages mutate the tools
+        # they are given (inject_tool_search_deferral moving a cache_control
+        # breakpoint, for one), and an aliased entry would let one request's
+        # edit leak into every later request with the same tools.
+        updated["tools"] = copy.deepcopy(compacted_tools)
         return updated, True, before, after
 
     compacted_tools = compact_tool_schema_value(tools)
@@ -400,7 +406,13 @@ def compact_tool_descriptions(
         if after >= before:
             return payload, False, before, after
         updated = copy.deepcopy(payload)
-        updated["tools"] = compacted_tools
+        # Hand out a copy, never the cache entry itself: _compaction_cache is a
+        # process-global keyed only on the tools digest, so it is shared across
+        # sessions and concurrent requests. Downstream stages mutate the tools
+        # they are given (inject_tool_search_deferral moving a cache_control
+        # breakpoint, for one), and an aliased entry would let one request's
+        # edit leak into every later request with the same tools.
+        updated["tools"] = copy.deepcopy(compacted_tools)
         return updated, True, before, after
 
     compacted_tools = _truncate_descriptions_in_schema(tools, max_chars, strip_sem)

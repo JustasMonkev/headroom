@@ -2440,6 +2440,28 @@ class AnthropicHandlerMixin:
                         f"{_ts_saved_tokens}tok"
                     )
 
+            # Tool-reference integrity (#7). Every stage above is individually
+            # correct and the request can still name a tool it does not declare:
+            # overlay_cached_prefix replays the previously-forwarded prefix
+            # byte-identical with no coupling to the current tools array, and
+            # Claude Code's tool surface is not stable across turns
+            # (WaitForMcpServers is exposed only while MCP servers connect).
+            # A replayed tool_reference to a now-undeclared tool is a hard
+            # 400 "not found in available tools", so prune the unresolvable
+            # references rather than forward a request we know will be rejected.
+            from headroom.proxy.tool_reference_integrity import (
+                prune_dangling_tool_references,
+            )
+
+            _tri_messages, _tri_pruned = prune_dangling_tool_references(
+                optimized_messages, body.get("tools")
+            )
+            if _tri_pruned:
+                optimized_messages = _tri_messages
+                body["messages"] = optimized_messages
+                tags["dangling_tool_references_pruned"] = len(_tri_pruned)
+                transforms_applied.append(f"router:tool_reference_repair:{len(_tri_pruned)}")
+
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
             # extensible counterpart to the built-in deferral above. A single
