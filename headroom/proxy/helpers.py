@@ -2059,7 +2059,12 @@ def apply_session_sticky_memory_tools(
     for t in tools_out:
         n = _extract_tool_name(t)
         if n:
-            existing_names.add(n)
+            # `headroom wrap` surfaces these same tools as
+            # `mcp__headroom-memory__memory_save` etc., which would never
+            # compare equal to the bare names below — injecting the whole
+            # ~1k-token memory block a second time. Normalize only the
+            # labels Headroom itself registers (A2).
+            existing_names.add(normalize_headroom_tool_name(n))
 
     # Diagnostic / rollback path.
     if get_tool_injection_sticky_mode() == "disabled":
