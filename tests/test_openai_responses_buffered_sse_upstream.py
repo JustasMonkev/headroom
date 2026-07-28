@@ -283,8 +283,9 @@ def test_delayed_buffered_sse_is_appended_after_keepalive() -> None:
     assert "proxy_error" not in resp.text
 
 
-def test_buffered_sse_terminal_response_is_used_for_ccr_interception() -> None:
-    """A retrieval call inside upstream SSE must be handled before replay."""
+@pytest.mark.parametrize("client_stream", [True, False])
+def test_sse_terminal_response_is_used_for_ccr_interception(client_stream: bool) -> None:
+    """A retrieval call inside upstream SSE must be handled for either client mode."""
     from headroom.ccr import CCR_TOOL_NAME
 
     terminal = {
@@ -337,7 +338,7 @@ def test_buffered_sse_terminal_response_is_used_for_ccr_interception() -> None:
             headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
             json={
                 "model": "gpt-5.4",
-                "stream": True,
+                "stream": client_stream,
                 "input": "hello",
                 "tools": [{"type": "function", "name": CCR_TOOL_NAME, "parameters": {}}],
             },
@@ -349,8 +350,8 @@ def test_buffered_sse_terminal_response_is_used_for_ccr_interception() -> None:
     assert "call_retrieve" not in resp.text
 
 
-def test_sse_body_is_not_reparsed_as_json_by_ccr(monkeypatch) -> None:
-    """An SSE upstream must not be fed into the CCR/memory JSON rewrite paths."""
+def test_sse_body_is_not_reparsed_as_json_by_ccr() -> None:
+    """CCR may inspect the terminal response without treating raw SSE as JSON."""
     app = _make_app()
     server = app.state.proxy
     calls: list = []
@@ -372,6 +373,6 @@ def test_sse_body_is_not_reparsed_as_json_by_ccr(monkeypatch) -> None:
         )
 
     assert resp.status_code == 200
-    # resp_json stays None for an SSE upstream, so the CCR probe never runs.
-    assert calls == []
-    assert json.loads(SSE_BODY.split("data: ", 1)[1].strip())["type"] == "response.completed"
+    event = json.loads(SSE_BODY.split("data: ", 1)[1].strip())
+    assert calls == [event["response"]]
+    assert resp.text == SSE_BODY

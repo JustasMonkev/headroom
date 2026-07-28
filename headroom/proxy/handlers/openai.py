@@ -5273,10 +5273,10 @@ class OpenAIHandlerMixin:
                     # retrieve call never gets treated as an unresolved tool_call
                     # by the memory-tool branch.
                     ccr_response_source = resp_json
-                    if buffered_stream_ccr and upstream_is_sse and usage_source is not None:
-                        # A few OpenAI-compatible upstreams ignore the forced
-                        # ``stream:false`` and still return SSE.  The terminal
-                        # response extracted above is authoritative enough for
+                    if upstream_is_sse and usage_source is not None:
+                        # An OpenAI-compatible upstream can return SSE even for
+                        # a client ``stream:false`` request.  In every SSE path
+                        # the extracted terminal response is authoritative for
                         # CCR interception, while ``resp_json`` intentionally
                         # remains unset so a response with no retrieval call can
                         # still pass through with its original event sequence.
