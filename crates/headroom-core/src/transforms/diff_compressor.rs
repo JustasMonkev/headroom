@@ -1082,35 +1082,6 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
 
 // ─── Output formatter ──────────────────────────────────────────────────────
 
-/// `Some(path)` when this file section can be rendered as one heading instead
-/// of the four-copy git triple.
-///
-/// The conditions are deliberately narrow. The heading is only unambiguous
-/// when the file is an in-place modification of a single path: not renamed or
-/// copied, not created or deleted (where `--- /dev/null` is the signal), not
-/// binary, and with `--- a/p` / `+++ b/p` present and naming the same path the
-/// `diff --git` header does. Anything else keeps git's full framing.
-fn plain_modification_path(f: &DiffFile) -> Option<String> {
-    if f.is_renamed || f.is_new_file || f.is_deleted_file || f.is_binary {
-        return None;
-    }
-    if !f.rename_lines.is_empty() {
-        return None;
-    }
-    let old = f.old_file.strip_prefix("--- a/")?;
-    let new = f.new_file.strip_prefix("+++ b/")?;
-    if old != new {
-        return None;
-    }
-    // The `diff --git a/p b/p` header must agree, or we would be dropping a
-    // path the reader has not seen.
-    let expected = format!("diff --git a/{old} b/{new}");
-    if f.header != expected {
-        return None;
-    }
-    Some(format!("--- {old}"))
-}
-
 fn format_output(
     pre_diff_lines: &[String],
     files: &[DiffFile],
@@ -1128,19 +1099,7 @@ fn format_output(
     }
 
     for f in files {
-        // An ordinary in-place modification prints its path FOUR times:
-        // `diff --git a/p b/p`, `--- a/p`, `+++ b/p`. None of that framing
-        // is needed to *read* the diff — the hunks carry the change and the
-        // path only has to be stated once. The full git triple is kept
-        // wherever the two sides can differ (rename/copy) or where the
-        // presence of `---`/`+++` is itself the signal (create/delete),
-        // and for anything the parser did not fully understand.
-        let single_path = plain_modification_path(f);
-
-        match &single_path {
-            Some(path) => out_lines.push(path.clone()),
-            None => out_lines.push(f.header.clone()),
-        }
+        out_lines.push(f.header.clone());
 
         // Bug-fix: emit rename / similarity / dissimilarity / copy marker
         // lines immediately after `diff --git`, matching git's canonical
@@ -1162,13 +1121,11 @@ fn format_output(
             continue;
         }
 
-        if single_path.is_none() {
-            if !f.old_file.is_empty() {
-                out_lines.push(f.old_file.clone());
-            }
-            if !f.new_file.is_empty() {
-                out_lines.push(f.new_file.clone());
-            }
+        if !f.old_file.is_empty() {
+            out_lines.push(f.old_file.clone());
+        }
+        if !f.new_file.is_empty() {
+            out_lines.push(f.new_file.clone());
         }
 
         for h in &f.hunks {
@@ -1350,10 +1307,8 @@ mod tests {
         assert_eq!(r.deletions, 24);
         assert_eq!(r.hunks_kept, 8);
         assert_eq!(r.hunks_removed, 0);
-        // 113, not the pre-C3 129: each of the 8 in-place modifications now
-        // prints one `--- path` heading instead of `diff --git a/p b/p` +
-        // `--- a/p` + `+++ b/p` (2 lines saved per file).
-        assert_eq!(r.compressed_line_count, 113);
+        // Compressed line count should be 129 (matches the parity fixture).
+        assert_eq!(r.compressed_line_count, 129);
         assert!(r.cache_key.is_some());
     }
 
@@ -1812,82 +1767,9 @@ mod tests {
             "pre-diff commit message dropped:\n{}",
             r.compressed
         );
-        // And the diff itself is still there. An in-place modification is
-        // rendered as ONE path heading instead of git's four-copy triple —
-        // see `plain_modification_path`.
-        assert!(r.compressed.contains("--- x.py"));
-        assert!(!r.compressed.contains("diff --git"));
-        assert!(!r.compressed.contains("+++ b/x.py"));
+        // And the diff itself is still there.
+        assert!(r.compressed.contains("diff --git a/x.py b/x.py"));
         assert!(r.compressed.contains("-a"));
         assert!(r.compressed.contains("+b"));
-    }
-
-    // ─── C3: single path heading for plain modifications ────────────────────
-
-    fn compress_small(input: &str) -> String {
-        let cfg = DiffCompressorConfig {
-            min_lines_for_ccr: 5,
-            ..Default::default()
-        };
-        DiffCompressor::new(cfg).compress(input, "").compressed
-    }
-
-    #[test]
-    fn renames_keep_the_full_git_triple() {
-        // The two sides differ, so collapsing to one path would lose the
-        // information that this is a rename at all.
-        let input = "diff --git a/old.py b/new.py\n\
-                     similarity index 95%\n\
-                     rename from old.py\n\
-                     rename to new.py\n\
-                     --- a/old.py\n\
-                     +++ b/new.py\n\
-                     @@ -1 +1 @@\n\
-                     -a\n\
-                     +b\n";
-        let out = compress_small(input);
-        assert!(out.contains("diff --git a/old.py b/new.py"), "{out}");
-        assert!(out.contains("--- a/old.py"), "{out}");
-        assert!(out.contains("+++ b/new.py"), "{out}");
-    }
-
-    #[test]
-    fn created_files_keep_the_full_git_triple() {
-        // `--- /dev/null` is itself the signal that the file is new.
-        let input = "diff --git a/new.py b/new.py\n\
-                     new file mode 100644\n\
-                     --- /dev/null\n\
-                     +++ b/new.py\n\
-                     @@ -0,0 +1 @@\n\
-                     +a\n";
-        let out = compress_small(input);
-        assert!(out.contains("diff --git a/new.py b/new.py"), "{out}");
-        assert!(out.contains("new file mode"), "{out}");
-    }
-
-    #[test]
-    fn deleted_files_keep_the_full_git_triple() {
-        let input = "diff --git a/gone.py b/gone.py\n\
-                     deleted file mode 100644\n\
-                     --- a/gone.py\n\
-                     +++ /dev/null\n\
-                     @@ -1 +0,0 @@\n\
-                     -a\n";
-        let out = compress_small(input);
-        assert!(out.contains("diff --git a/gone.py b/gone.py"), "{out}");
-        assert!(out.contains("deleted file mode"), "{out}");
-    }
-
-    #[test]
-    fn plain_modification_prints_its_path_exactly_once() {
-        let input = "diff --git a/src/mod.py b/src/mod.py\n\
-                     --- a/src/mod.py\n\
-                     +++ b/src/mod.py\n\
-                     @@ -1 +1 @@\n\
-                     -a\n\
-                     +b\n";
-        let out = compress_small(input);
-        assert_eq!(out.matches("src/mod.py").count(), 1, "{out}");
-        assert!(out.contains("--- src/mod.py"), "{out}");
     }
 }
