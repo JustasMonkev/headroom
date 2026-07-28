@@ -1569,3 +1569,60 @@ async def test_memory_list_dispatched_via_execute_memory_tool(handler: MemoryHan
     payload = json.loads(out)
     assert payload["status"] == "ok"
     assert payload["memories"][0]["id"] == "m1"
+
+
+# ---------------------------------------------------------------------------
+# F4 payload hygiene (docs/token-efficiency-review.md).
+#
+# The Codex review on PR #15 flagged that only ONE of the two content previews
+# is round-trip waste. These tests pin the distinction so a future "drop the
+# previews" sweep can't take out the wrong one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_memory_save_does_not_echo_saved_content(handler: MemoryHandler) -> None:
+    """The model just wrote this content; echoing a preview back re-bills the
+    same bytes for zero information (F4)."""
+
+    class SaveBackend:
+        async def save_memory(self, **kwargs):  # noqa: ANN003
+            return SimpleNamespace(id="mem-1", content=kwargs["content"], metadata={})
+
+        async def search_memories(self, **kwargs):  # noqa: ANN003
+            return []
+
+    handler._backend = SaveBackend()  # type: ignore[assignment]
+    handler._initialized = True
+
+    payload = json.loads(
+        await handler._execute_save(
+            {"content": "a distinctive fact worth remembering", "importance": 0.8}, "u1"
+        )
+    )
+    assert payload["status"] == "saved"
+    assert payload["memory_id"] == "mem-1"
+    assert "content" not in payload
+    assert "distinctive fact" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_list_all_memories_keeps_content_preview(handler: MemoryHandler) -> None:
+    """`view /memories/all` renders ONLY previews — they are the identifying
+    payload of the listing, not an echo. Dropping them (as the round-2 report
+    suggested for :1267) would leave the listing unusable: the model would see
+    numbered blank rows."""
+
+    class ListBackend:
+        async def search_memories(self, **kwargs):  # noqa: ANN003
+            return [
+                make_result("mem-1", "user prefers dark mode"),
+                make_result("mem-2", "deploys run on Tuesdays"),
+            ]
+
+    handler._backend = ListBackend()  # type: ignore[assignment]
+    handler._initialized = True
+
+    out = await handler._list_all_memories("u1", limit=20)
+    assert "user prefers dark mode" in out
+    assert "deploys run on Tuesdays" in out

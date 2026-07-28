@@ -7,6 +7,8 @@ Tests cover:
 4. Edge cases
 """
 
+import re
+
 from headroom.transforms.search_compressor import (
     FileMatches,
     SearchCompressionResult,
@@ -279,8 +281,12 @@ class TestMatchSelection:
         )
         result = compressor.compress(content)
 
-        assert "src/file.py:1:line 1" in result.compressed
-        assert "src/file.py:100:line 100" in result.compressed
+        # Auto-grouped (5 kept matches in one file): path once as a heading,
+        # then `line:content` rows.
+        lines = result.compressed.splitlines()
+        assert "src/file.py" in lines
+        assert "1:line 1" in lines
+        assert "100:line 100" in lines
 
     def test_respects_max_matches_per_file(self):
         """max_matches_per_file limits matches per file."""
@@ -318,9 +324,10 @@ class TestMatchSelection:
         )
         result = compressor.compress(content)
 
-        # Count actual match lines (not summaries)
+        # Count actual match lines — not summaries, blank separators, or the
+        # `rg --heading` path lines the auto-grouping emits.
         match_lines = [
-            line for line in result.compressed.split("\n") if line and not line.startswith("[")
+            line for line in result.compressed.split("\n") if re.match(r"^\d+:", line or "")
         ]
         assert len(match_lines) <= 15
 
@@ -391,14 +398,29 @@ src/file.py:90:last line
 class TestCompressionBehavior:
     """Tests for overall compression behavior."""
 
-    def test_small_results_unchanged(self):
-        """Small results pass through unchanged."""
+    def test_small_results_keep_every_match(self):
+        """Small results drop no match — but the repeated path is still folded.
+
+        Two matches in one file auto-group to a single heading, so the output
+        is smaller than the input while carrying exactly the same matches and
+        no CCR marker.
+        """
         content = "src/file.py:1:def foo():\nsrc/file.py:2:    pass"
 
         compressor = SearchCompressor()
         result = compressor.compress(content)
 
-        assert result.compression_ratio == 1.0
+        assert result.compressed == "src/file.py\n1:def foo():\n2:    pass"
+        assert result.compressed_match_count == result.original_match_count == 2
+        assert result.compression_ratio < 1.0
+        assert result.cache_key is None
+
+    def test_single_match_file_stays_flat(self):
+        """One match and nothing omitted: grouping would cost more than it saves."""
+        content = "src/file.py:1:def foo():"
+
+        result = SearchCompressor().compress(content)
+
         assert result.compressed == content
 
     def test_empty_input_handled(self):
@@ -628,12 +650,22 @@ class TestOutputFormatting:
     """Tests for output format and structure."""
 
     def test_output_maintains_grep_format(self):
-        """Output maintains file:line:content format."""
+        """Output stays grep-shaped: a path heading, then line:content rows."""
         content = """src/file.py:10:def foo():
 src/file.py:20:def bar():
 """
         compressor = SearchCompressor()
         result = compressor.compress(content)
+
+        body = [line for line in result.compressed.split("\n") if line and not line.startswith("[")]
+        assert body[0] == "src/file.py"
+        for line in body[1:]:
+            assert re.match(r"^\d+:", line), line
+
+    def test_ungrouped_output_maintains_grep_format(self):
+        """Files that stay flat keep the classic file:line:content shape."""
+        content = "src/a.py:10:def foo():\nsrc/b.py:20:def bar():\n"
+        result = SearchCompressor().compress(content)
 
         for line in result.compressed.split("\n"):
             if line and not line.startswith("["):
@@ -714,8 +746,8 @@ class TestConfigOptions:
         result = compressor.compress(content)
 
         # First line not guaranteed to be present
-        # But last should be
-        assert "src/file.py:50:line 50" in result.compressed
+        # But last should be (auto-grouped: `line:content` under a heading)
+        assert "50:line 50" in result.compressed.splitlines()
 
     def test_disable_keep_last(self):
         """always_keep_last=False doesn't force last match."""
@@ -731,8 +763,8 @@ class TestConfigOptions:
         )
         result = compressor.compress(content)
 
-        # First line should be present
-        assert "src/file.py:1:line 1" in result.compressed
+        # First line should be present (auto-grouped: `line:content`)
+        assert "1:line 1" in result.compressed.splitlines()
 
     def test_disable_error_boost(self):
         """boost_errors=False doesn't prioritize error patterns."""

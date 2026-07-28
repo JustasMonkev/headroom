@@ -1,0 +1,340 @@
+"""Durable memory aliases (PR #15 Codex review, P1).
+
+Passive recall renders a short handle instead of the full backend UUID so
+``memory_update`` / ``memory_delete`` can address a row without spending
+~16 prompt tokens per ID (docs/token-efficiency-review.md F4).
+
+The first implementation minted *session-local* counters (``m1``, ``m2``, …)
+held in per-handler dicts. That is a data-integrity bug:
+
+* After a proxy restart — or when consecutive requests land on different
+  workers — the map is empty while ``[m1]`` references are still live in the
+  client's transcript, so the operation fails.
+* Worse, first-seen ordering could assign ``m1`` to a *different* memory in
+  the new process, so ``memory_update`` / ``memory_delete`` would silently
+  mutate the wrong persistent record.
+
+The fix makes the alias a pure function of the memory's own ID (``m:`` plus
+its first 8 characters) and resolves it server-side by prefix lookup against
+the backend. These tests pin the properties that make that safe:
+
+1. A *fresh* handler (empty process state) resolves an alias minted by
+   another handler instance.
+2. Ambiguity fails loudly instead of mutating a guessed record.
+3. A stale alias (memory deleted) fails loudly.
+4. Full IDs pass through untouched.
+5. Two rows in the same block that would share an alias both fall back to
+   their full IDs, so what we render is never ambiguous.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+import pytest
+
+from headroom.proxy.memory_handler import (
+    MEMORY_ALIAS_PREFIX,
+    MemoryAliasError,
+    MemoryConfig,
+    MemoryHandler,
+    MemoryMode,
+)
+
+# ---------------------------------------------------------------------------
+# Stub backend
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Memory:
+    id: str
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _Result:
+    memory: _Memory
+    score: float = 0.9
+    related_entities: list[str] = field(default_factory=list)
+
+
+class _Backend:
+    """Minimal backend exposing the listing API alias resolution uses."""
+
+    def __init__(self, memories: list[_Memory]) -> None:
+        self.memories = list(memories)
+        self.updated: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+
+    async def get_user_memories(self, user_id: str, limit: int = 100) -> list[_Memory]:
+        return list(self.memories[:limit])
+
+    async def search_memories(self, query: str = "", **kwargs: Any) -> list[_Result]:
+        top_k = kwargs.get("top_k", 10)
+        return [_Result(memory=m) for m in self.memories[:top_k]]
+
+    async def update_memory(self, memory_id: str, new_content: str, **kwargs: Any) -> _Memory:
+        for m in self.memories:
+            if m.id == memory_id:
+                m.content = new_content
+                self.updated.append((memory_id, new_content))
+                return m
+        raise KeyError(memory_id)
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        for i, m in enumerate(self.memories):
+            if m.id == memory_id:
+                del self.memories[i]
+                self.deleted.append(memory_id)
+                return True
+        return False
+
+
+def _handler(backend: _Backend) -> MemoryHandler:
+    handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            backend="local",
+            inject_context=True,
+            inject_tools=True,
+            top_k=5,
+            min_similarity=0.3,
+            mode=MemoryMode.AUTO_TAIL,
+        )
+    )
+    handler._backend = backend  # type: ignore[assignment]
+    handler._initialized = True
+    return handler
+
+
+UUID_A = "a1b2c3d4-1111-4aaa-8bbb-000000000001"
+UUID_B = "f9e8d7c6-2222-4ccc-8ddd-000000000002"
+
+
+def _fresh_backend() -> _Backend:
+    return _Backend(
+        [
+            _Memory(id=UUID_A, content="User prefers Python."),
+            _Memory(id=UUID_B, content="User is in America/Los_Angeles."),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# The alias itself
+# ---------------------------------------------------------------------------
+
+
+def test_alias_is_a_pure_function_of_the_memory_id() -> None:
+    """No handler state is involved — two unrelated instances agree.
+
+    This is what makes the alias survive a restart: it is derived, not
+    assigned, so there is no map to lose.
+    """
+    a = _handler(_fresh_backend())
+    b = _handler(_fresh_backend())
+    assert a._alias_for_memory(UUID_A) == f"{MEMORY_ALIAS_PREFIX}a1b2c3d4"
+    assert a._alias_for_memory(UUID_A) == b._alias_for_memory(UUID_A)
+    assert a._alias_for_memory(UUID_A) != a._alias_for_memory(UUID_B)
+
+
+def test_short_ids_are_not_aliased() -> None:
+    """An alias longer than the ID saves nothing, so render the ID."""
+    handler = _handler(_fresh_backend())
+    assert handler._alias_for_memory("abc123") == "abc123"
+
+
+def test_handler_keeps_no_alias_map() -> None:
+    """Regression guard: any alias→id map on the handler would be an
+    unshared source of truth across workers and restarts."""
+    handler = _handler(_fresh_backend())
+    assert not hasattr(handler, "_memory_id_by_alias")
+    assert not hasattr(handler, "_alias_by_memory_id")
+
+
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_process_resolves_alias_minted_elsewhere() -> None:
+    """THE regression test for the review finding.
+
+    A handler that never rendered the recall block (a restarted proxy, or a
+    different worker) must still resolve ``m:a1b2c3d4`` to the memory it was
+    minted for.
+    """
+    minting = _handler(_fresh_backend())
+    alias = minting._alias_for_memory(UUID_A)
+
+    # Brand new handler, brand new backend object: no shared state at all.
+    fresh_backend = _fresh_backend()
+    fresh = _handler(fresh_backend)
+    resolved = asyncio.run(fresh._resolve_memory_alias(fresh_backend, "u", alias))
+    assert resolved == UUID_A
+
+
+def test_alias_resolution_survives_reordered_results() -> None:
+    """First-seen ordering must not matter: the old counter scheme assigned
+    ``m1`` to whichever memory came back first, so a re-ordered result set
+    silently re-pointed the alias."""
+    backend = _Backend(
+        [
+            _Memory(id=UUID_B, content="second first now"),
+            _Memory(id=UUID_A, content="first second now"),
+        ]
+    )
+    handler = _handler(backend)
+    alias = handler._alias_for_memory(UUID_A)
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", alias)) == UUID_A
+
+
+def test_full_ids_pass_through_unchanged() -> None:
+    """IDs from memory_search / memory_list keep working verbatim."""
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", UUID_A)) == UUID_A
+    # A value that is neither an alias nor a stored ID is still passed
+    # through — the backend decides whether it exists.
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", "nope")) == "nope"
+
+
+def test_ambiguous_alias_raises_instead_of_guessing() -> None:
+    """Two memories sharing the alias prefix must abort the operation."""
+    backend = _Backend(
+        [
+            _Memory(id="dupprefix-1111-4aaa-8bbb-000000000001", content="one"),
+            _Memory(id="dupprefix-2222-4ccc-8ddd-000000000002", content="two"),
+        ]
+    )
+    handler = _handler(backend)
+    alias = handler._alias_for_memory("dupprefix-1111-4aaa-8bbb-000000000001")
+    with pytest.raises(MemoryAliasError, match="ambiguous"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", alias))
+
+
+def test_unknown_alias_raises() -> None:
+    """A stale alias (memory since deleted) fails loudly."""
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    with pytest.raises(MemoryAliasError, match="No memory matches"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", f"{MEMORY_ALIAS_PREFIX}deadbeef"))
+
+
+def test_empty_alias_raises() -> None:
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    with pytest.raises(MemoryAliasError, match="Malformed"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", MEMORY_ALIAS_PREFIX))
+
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
+
+def test_update_via_alias_hits_the_right_record() -> None:
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    alias = handler._alias_for_memory(UUID_B)
+
+    raw = asyncio.run(
+        handler._execute_update({"memory_id": alias, "new_content": "moved to UTC"}, "u")
+    )
+    assert json.loads(raw)["status"] == "updated"
+    assert backend.updated == [(UUID_B, "moved to UTC")]
+
+
+def test_delete_via_alias_hits_the_right_record() -> None:
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    alias = handler._alias_for_memory(UUID_A)
+
+    raw = asyncio.run(handler._execute_delete({"memory_id": alias}, "u"))
+    payload = json.loads(raw)
+    assert payload["status"] == "deleted"
+    assert payload["memory_id"] == UUID_A
+    assert backend.deleted == [UUID_A]
+
+
+def test_update_with_ambiguous_alias_errors_and_mutates_nothing() -> None:
+    """The load-bearing safety property: on ambiguity the record is left
+    alone and the model gets an actionable error."""
+    backend = _Backend(
+        [
+            _Memory(id="dupprefix-1111-4aaa-8bbb-000000000001", content="one"),
+            _Memory(id="dupprefix-2222-4ccc-8ddd-000000000002", content="two"),
+        ]
+    )
+    handler = _handler(backend)
+    alias = handler._alias_for_memory("dupprefix-1111-4aaa-8bbb-000000000001")
+
+    raw = asyncio.run(
+        handler._execute_update({"memory_id": alias, "new_content": "clobbered"}, "u")
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "error"
+    assert "ambiguous" in payload["error"]
+    assert backend.updated == []
+    assert [m.content for m in backend.memories] == ["one", "two"]
+
+
+def test_delete_with_unknown_alias_errors_and_deletes_nothing() -> None:
+    backend = _fresh_backend()
+    handler = _handler(backend)
+
+    raw = asyncio.run(handler._execute_delete({"memory_id": f"{MEMORY_ALIAS_PREFIX}deadbeef"}, "u"))
+    payload = json.loads(raw)
+    assert payload["status"] == "error"
+    assert backend.deleted == []
+    assert len(backend.memories) == 2
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def test_recall_block_renders_durable_aliases() -> None:
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    context = asyncio.run(
+        handler.search_and_format_context("u", [{"role": "user", "content": "hi"}])
+    )
+    assert context is not None
+    assert f"[{MEMORY_ALIAS_PREFIX}a1b2c3d4]" in context
+    assert f"[{MEMORY_ALIAS_PREFIX}f9e8d7c6]" in context
+    assert UUID_A not in context
+
+
+def test_colliding_rows_render_full_ids() -> None:
+    """If two rendered rows would share an alias, both fall back to the full
+    ID — what we render is never ambiguous by construction."""
+    ids = [
+        "dupprefix-1111-4aaa-8bbb-000000000001",
+        "dupprefix-2222-4ccc-8ddd-000000000002",
+        UUID_A,
+    ]
+    backend = _Backend([_Memory(id=i, content=f"row {i}") for i in ids])
+    handler = _handler(backend)
+    context = asyncio.run(
+        handler.search_and_format_context("u", [{"role": "user", "content": "hi"}])
+    )
+    assert context is not None
+    assert f"[{ids[0]}]" in context
+    assert f"[{ids[1]}]" in context
+    # The non-colliding row still gets the cheap alias.
+    assert f"[{MEMORY_ALIAS_PREFIX}a1b2c3d4]" in context
+
+
+def test_alias_row_ids_handles_missing_ids() -> None:
+    assert MemoryHandler._alias_row_ids([UUID_A, "", UUID_B]) == [
+        f"{MEMORY_ALIAS_PREFIX}a1b2c3d4",
+        "?",
+        f"{MEMORY_ALIAS_PREFIX}f9e8d7c6",
+    ]

@@ -600,14 +600,9 @@ class CCRConfig:
     inject_tool: bool = True  # Inject headroom_retrieve tool into tools array
     inject_system_instructions: bool = False  # Add retrieval instructions to system message
 
-    # Retrieval marker format
-    # Inserted at end of compressed content to tell LLM how to get more
-    marker_template: str = (
-        "\n[{original_count} items compressed to {compressed_count}."
-        "{summary}"
-        " Retrieve more: hash={hash}."
-        " Expires in {ttl_minutes}m.]"
-    )
+    # NOTE: a `marker_template` field used to live here. It had zero consumers
+    # (every compressor hardcodes its own f-string) and was removed as dead
+    # config — see "B5" in docs/token-efficiency-review.md.
 
 
 @dataclass

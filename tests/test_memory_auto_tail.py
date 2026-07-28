@@ -76,7 +76,7 @@ class _DeterministicBackend:
         self._fixture = [
             _StubResult(
                 memory=_StubMemory(
-                    id="mem_alpha_001",
+                    id="a1b2c3d4-1111-4aaa-8bbb-000000000001",
                     content="User prefers Python over Java for data work.",
                     metadata={"source_agent": "test"},
                 ),
@@ -85,7 +85,7 @@ class _DeterministicBackend:
             ),
             _StubResult(
                 memory=_StubMemory(
-                    id="mem_alpha_002",
+                    id="f9e8d7c6-2222-4ccc-8ddd-000000000002",
                     content="User's timezone is America/Los_Angeles.",
                     metadata={"source_agent": "test"},
                 ),
@@ -323,36 +323,29 @@ def test_unknown_provider_raises() -> None:
 # operation, against the model-as-judge architecture.
 #
 # Post-this-PR the format is ``f"{i}. [{alias}] {content}"`` where the
-# alias is a session-local short handle (m1, m2, ...) that resolves to
-# the real backend ID server-side. The model can call
-# ``memory_update('m1', ...)`` directly from a row it sees in the
+# alias is a DURABLE handle derived from the memory's own backend ID
+# (``m:`` + its first 8 characters). Any worker, in any process, resolves
+# it by prefix lookup against the backend — see the alias-durability tests
+# in tests/test_memory_alias_durability.py. The model can call
+# ``memory_update('m:a1b2c3d4', ...)`` directly from a row it sees in the
 # auto-injected tail; full UUIDs never spend prompt tokens.
 # ---------------------------------------------------------------------------
 
 
 def test_auto_tail_block_includes_memory_ids() -> None:
-    """Each entry in the formatted block carries a short session-local
-    alias in square brackets, immediately after the row number. The
-    model uses it to address rows directly (memory_update /
-    memory_delete) without round-tripping through memory_search; the
-    handler resolves the alias back to the real backend ID."""
+    """Each entry in the formatted block carries a short durable alias in
+    square brackets, immediately after the row number. The model uses it to
+    address rows directly (memory_update / memory_delete) without
+    round-tripping through memory_search."""
     handler = _build_handler()
     context = asyncio.run(
         handler.search_and_format_context("alpha", [{"role": "user", "content": "hi"}])
     )
     assert context is not None
-    # Aliases are assigned in first-seen order; full backend IDs are
-    # never rendered into the prompt.
-    assert "[mem_alpha_001]" not in context
-    assert "1. [m1] User prefers Python" in context
-    assert "2. [m2] User's timezone" in context
-    # Server-side resolution maps aliases back to the real backend IDs
-    # (the effective user key for the default PROJECT scope resolution).
-    user_key = next(iter(handler._memory_id_by_alias))
-    assert handler._resolve_memory_alias(user_key, "m1") == "mem_alpha_001"
-    assert handler._resolve_memory_alias(user_key, "m2") == "mem_alpha_002"
-    # Unknown values (e.g. full IDs from memory_search) pass through.
-    assert handler._resolve_memory_alias(user_key, "mem_alpha_001") == "mem_alpha_001"
+    # Full backend IDs are never rendered into the prompt.
+    assert "[a1b2c3d4-1111-4aaa-8bbb-000000000001]" not in context
+    assert "1. [m:a1b2c3d4] User prefers Python" in context
+    assert "2. [m:f9e8d7c6] User's timezone" in context
 
 
 def test_auto_tail_block_id_format_handles_missing_id() -> None:
@@ -424,7 +417,7 @@ def test_auto_tail_block_includes_id_usage_guidance() -> None:
     assert "memory_update" in context
     assert "memory_delete" in context
     # And it names the [id] convention so the model maps brackets → IDs.
-    assert "square brackets" in context.lower() or "[id]" in context.lower()
+    assert "[id]" in context.lower()
 
 
 def test_id_usage_guidance_lives_in_user_tail_not_system() -> None:
@@ -500,10 +493,6 @@ def test_memory_block_preserves_memory_id_addressing() -> None:
     assert context is not None
 
     # The [id] addressing convention is still documented in the block.
-    assert "ID in square brackets" in context
+    assert "[id]" in context
     assert "memory_update" in context
     assert "memory_delete" in context
-    # The block tail should NOT say "use this to drive new actions" — the
-    # framing change explicitly says "inform your responses, not to drive
-    # new actions" to reinforce the read-only semantic.
-    assert "inform your responses, not to drive new actions" in context

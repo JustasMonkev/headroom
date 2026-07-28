@@ -740,3 +740,128 @@ class TestOutputFormatting:
 
         # Should have omission summary
         assert "lines omitted" in result.compressed
+
+
+class TestC2EmissionWaste:
+    """Footer merge, honest omission counts, byte-identical dedup, tight context.
+
+    All four are properties of the Rust implementation `compress()` delegates
+    to; the Python shim helpers mirror them for the legacy direct-call surface.
+    """
+
+    @staticmethod
+    def _compress(content, **cfg):
+        base = {"min_lines_for_ccr": 5, "enable_ccr": False}
+        base.update(cfg)
+        return LogCompressor(config=LogCompressorConfig(**base)).compress(content)
+
+    def test_single_fused_footer_instead_of_two_lines(self):
+        """CCR mode emits ONE trailing line carrying both facts, not two."""
+        lines = [f"INFO: step {i}" for i in range(200)]
+        lines.append("ERROR: boom")
+        result = LogCompressor(
+            config=LogCompressorConfig(min_lines_for_ccr=50, enable_ccr=True)
+        ).compress("\n".join(lines))
+
+        assert result.cache_key is not None
+        trailing = [ln for ln in result.compressed.splitlines() if ln.startswith("[")]
+        assert len(trailing) == 1, trailing
+        # Both facts on the one line, and the scanner token is intact.
+        assert "lines omitted" in trailing[0]
+        assert "Retrieve more: hash=" in trailing[0]
+        assert "lines compressed to" not in result.compressed
+
+    def test_footer_does_not_advertise_errors_that_are_still_present(self):
+        """The old footer counted ALL lines, so it named errors printed above."""
+        lines = [f"INFO: step {i}" for i in range(200)]
+        lines.insert(10, "ERROR: the only error")
+        result = self._compress("\n".join(lines))
+
+        assert "ERROR: the only error" in result.compressed
+        footer = next(ln for ln in result.compressed.splitlines() if "lines omitted" in ln)
+        assert "ERROR" not in footer, footer
+
+    def test_footer_never_mentions_info(self):
+        lines = [f"INFO: step {i}" for i in range(300)]
+        result = self._compress("\n".join(lines))
+        footer = next(ln for ln in result.compressed.splitlines() if "lines omitted" in ln)
+        assert "INFO" not in footer, footer
+
+    def test_byte_identical_errors_fold_with_a_count(self):
+        content = "\n".join(["ERROR: connection refused"] * 40 + [f"INFO: x{i}" for i in range(40)])
+        result = self._compress(content)
+
+        assert result.compressed.count("ERROR: connection refused") == 1
+        assert "ERROR: connection refused ×40" in result.compressed
+
+    def test_errors_differing_in_an_id_are_all_kept(self):
+        """`_dedupe_similar` would collapse these; byte-identical dedup must not."""
+        errors = [f"FAILED test_apply[case-{i}]: assert 0 == 1" for i in range(8)]
+        content = "\n".join(errors + [f"INFO: x{i}" for i in range(60)])
+        result = self._compress(content, max_errors=20)
+
+        for i in range(8):
+            assert f"case-{i}]" in result.compressed, f"case-{i} was hidden"
+
+    def test_identical_traces_collapse_to_one_with_a_count(self):
+        trace = [
+            "Traceback (most recent call last):",
+            '  File "app.py", line 12, in run',
+            "ValueError: bad input",
+        ]
+        # A non-trace line separates the groups (blank lines stay *inside* a
+        # Python traceback, so they would not end one).
+        lines = []
+        for i in range(6):
+            lines.append(f"running case {i}")
+            lines.extend(trace)
+        content = "\n".join(lines + [f"INFO: x{i}" for i in range(40)])
+        result = self._compress(content)
+
+        # The exact group boundary depends on the trace state machine, so the
+        # assertion is on the property: repeats collapse into a counted marker
+        # and the frame list is not printed six times.
+        assert "[same trace ×" in result.compressed
+        assert result.compressed.count('File "app.py", line 12, in run') <= 2
+
+    def test_traces_differing_by_a_line_number_are_both_kept(self):
+        def trace(n):
+            return [
+                "running a case",
+                "Traceback (most recent call last):",
+                f'  File "app.py", line {n}, in run',
+                "ValueError: bad input",
+            ]
+
+        content = "\n".join(trace(12) + trace(99) + [f"INFO: x{i}" for i in range(40)])
+        result = self._compress(content)
+
+        assert "[same trace" not in result.compressed
+        assert "line 12" in result.compressed
+        assert "line 99" in result.compressed
+
+    def test_pytest_banners_do_not_drag_in_their_neighbours(self):
+        """`====` banners match the summary patterns; they must not expand."""
+        lines = []
+        for i in range(12):
+            lines.append(f"=========================== block {i} ============================")
+            lines.extend(f"noise line {i}.{j}" for j in range(8))
+        content = "\n".join(lines)
+        result = self._compress(content, max_total_lines=100)
+
+        # No ERROR/FAIL anywhere, so no context expansion should have happened:
+        # only the banner lines themselves survive.
+        body = [ln for ln in result.compressed.splitlines() if not ln.startswith("[")]
+        assert all(ln.startswith("====") for ln in body), body
+
+    def test_context_window_is_asymmetric_around_errors(self):
+        lines = [f"line {i}" for i in range(60)]
+        lines[30] = "ERROR: boom"
+        result = self._compress("\n".join(lines), max_total_lines=100)
+        kept = set(result.compressed.splitlines())
+
+        assert "ERROR: boom" in kept
+        assert "line 29" in kept  # 1 before
+        assert "line 31" in kept and "line 32" in kept  # 2 after
+        assert "line 28" not in kept
+        assert "line 33" not in kept

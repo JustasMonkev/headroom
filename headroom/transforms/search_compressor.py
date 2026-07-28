@@ -49,6 +49,12 @@ from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
+# A file section switches to `rg --heading` rendering once it holds at least
+# this many kept matches, even with `group_by_file` off — from the second
+# match on, the flat shape only re-emits the same path. Mirrors the Rust
+# `AUTO_GROUP_MIN_MATCHES`.
+AUTO_GROUP_MIN_MATCHES = 2
+
 
 def _is_cjk_char(c: str) -> bool:
     """True for CJK ideographs, kana, and Hangul. Code-point ranges kept
@@ -122,10 +128,11 @@ class SearchCompressorConfig:
     boost_errors: bool = True
     enable_ccr: bool = True
     min_matches_for_ccr: int = 10
-    # Group output by file (`rg --heading` style): path emitted once per
-    # file, then `line:content` rows. Removes per-match path repetition.
-    # Default False (classic `file:line:content`); the proxy enables it
-    # in token mode.
+    # Force `rg --heading` output for EVERY file: path emitted once per
+    # file, then `line:content` rows. Default False; the proxy enables it
+    # in token mode. Note that even when False, any individual file whose
+    # flat rendering would repeat its path (≥2 kept matches, or a trailing
+    # "N more matches" line) is grouped anyway — see AUTO_GROUP_MIN_MATCHES.
     group_by_file: bool = False
 
 
@@ -363,14 +370,35 @@ class SearchCompressor:
     ) -> tuple[str, dict[str, str]]:
         lines: list[str] = []
         summaries: dict[str, str] = {}
+        force_grouped = getattr(self.config, "group_by_file", False)
+        prev_grouped = False
 
         for file_path, fm in sorted(selected.items()):
-            for match in fm.matches:
-                lines.append(f"{match.file}:{match.line_number}:{match.content}")
             original_fm = original.get(file_path)
-            if original_fm and len(original_fm.matches) > len(fm.matches):
-                omitted = len(original_fm.matches) - len(fm.matches)
-                summary = f"[... and {omitted} more matches in {file_path}]"
+            omitted = (
+                max(0, len(original_fm.matches) - len(fm.matches)) if original_fm is not None else 0
+            )
+            # Mirror of the Rust `format_output` auto-grouping: group any
+            # file whose flat rendering would print the path more than once.
+            grouped = force_grouped or len(fm.matches) >= AUTO_GROUP_MIN_MATCHES or omitted > 0
+
+            if lines and (grouped or prev_grouped):
+                lines.append("")
+            if grouped:
+                lines.append(file_path)
+                for match in fm.matches:
+                    lines.append(f"{match.line_number}:{match.content}")
+            else:
+                for match in fm.matches:
+                    lines.append(f"{match.file}:{match.line_number}:{match.content}")
+            prev_grouped = grouped
+
+            if omitted > 0:
+                summary = (
+                    f"[... and {omitted} more matches]"
+                    if grouped
+                    else f"[... and {omitted} more matches in {file_path}]"
+                )
                 lines.append(summary)
                 summaries[file_path] = summary
 

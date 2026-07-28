@@ -2377,6 +2377,29 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         reason: str | None = None
 
+        # F11: the tool-schema savings are measured STAGE BY STAGE. Both layers
+        # below shrink `working["tools"]`, so diffing each one against the
+        # untouched `payload["tools"]` counted layer 1's reduction twice (once
+        # in its own delta, once inside layer 2's). `_tools_savings_baseline`
+        # always holds the tools as they looked BEFORE the stage being measured.
+        _tools_savings_baseline: Any = payload.get("tools")
+
+        def _add_tool_schema_savings() -> int:
+            """Tokens saved by the most recent tools rewrite, vs the prior stage."""
+            nonlocal _tools_savings_baseline
+            before = _tools_savings_baseline
+            after = working.get("tools")
+            _tools_savings_baseline = after
+            try:
+                tok = self.openai_provider.get_token_counter(model)
+                return max(
+                    0,
+                    tok.count_text(_json_debug_dumps(before))
+                    - tok.count_text(_json_debug_dumps(after)),
+                )
+            except Exception:
+                return 0
+
         tool_compaction_started = time.perf_counter()
         compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
             _compact_openai_responses_tools(working)
@@ -2389,12 +2412,7 @@ class OpenAIHandlerMixin:
             transforms.append("openai:responses:tool_schema_compaction")
             try:
                 tool_token_started = time.perf_counter()
-                tokenizer = self.openai_provider.get_token_counter(model)
-                tokens_saved += max(
-                    0,
-                    tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                    - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
-                )
+                tokens_saved += _add_tool_schema_savings()
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
                 pass
@@ -2430,12 +2448,10 @@ class OpenAIHandlerMixin:
                     modified = True
                     transforms.append("openai:responses:tool_desc_compaction")
                     try:
-                        tokenizer = self.openai_provider.get_token_counter(model)
-                        tokens_saved += max(
-                            0,
-                            tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                            - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
-                        )
+                        # Measured against the post-layer-1 tools, not the
+                        # original payload (F11) — else layer 1's reduction is
+                        # counted a second time here.
+                        tokens_saved += _add_tool_schema_savings()
                     except Exception:
                         pass
                     if debug_enabled:
@@ -3173,6 +3189,7 @@ class OpenAIHandlerMixin:
                 openai_frozen_count = 0
 
         _compression_failed = False
+        pipeline_ccr_hashes: list[str] = []
         original_messages = messages  # Preserve for 400-retry fallback
         _decision = CompressionDecision.decide(
             headers=request.headers,
@@ -3282,6 +3299,17 @@ class OpenAIHandlerMixin:
                         pipeline_timing = result.timing
                         original_tokens = result.tokens_before
                         optimized_tokens = result.tokens_after
+
+                # CCR hashes minted by the pipeline's pre-processing passes
+                # (read-lifecycle, tool-input compaction). Tool-input markers
+                # live inside `tool_calls[].function.arguments`, which
+                # `CCRToolInjector.scan_for_markers` never reads — see the CCR
+                # injection block below for why that matters.
+                pipeline_ccr_hashes = [
+                    h
+                    for h in (getattr(result, "markers_inserted", None) or [])
+                    if isinstance(h, str) and h
+                ]
 
                 if result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()
@@ -3404,6 +3432,18 @@ class OpenAIHandlerMixin:
                 inject_system_instructions=self.config.ccr_inject_system_instructions,
             )
             injector.scan_for_markers(optimized_messages)
+            # `scan_for_markers` reads message TEXT and tool-result content
+            # only. The tool-input compaction pass (F3) writes its marker into
+            # `tool_calls[].function.arguments`, which the scanner never
+            # visits — so on the first compaction of a session
+            # `detected_hashes` is empty, the sticky injection is skipped, and
+            # the stored original is unreachable. Merge in the hashes the
+            # pipeline reported minting (order-stable, de-duplicated).
+            from headroom.transforms.tool_input_compactor import merge_pipeline_ccr_hashes
+
+            _detected_hashes = merge_pipeline_ccr_hashes(
+                injector.detected_hashes, pipeline_ccr_hashes
+            )
             if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
 
@@ -3419,7 +3459,7 @@ class OpenAIHandlerMixin:
                 # *tools* cache segment (undoing the overlay's messages-prefix
                 # cache-safety).
                 has_new_compressed_content = has_new_ccr_markers(
-                    current_detected_hashes=injector.detected_hashes,
+                    current_detected_hashes=_detected_hashes,
                     previous_forwarded_messages=openai_prefix_tracker.get_last_forwarded_messages(),
                     provider="openai",
                 )
@@ -3434,7 +3474,7 @@ class OpenAIHandlerMixin:
                     logger.debug(
                         f"[{request_id}] CCR: tool registered (session={openai_session_id}, "
                         f"compressed_this_turn={injector.has_compressed_content}, "
-                        f"hashes_seen={len(injector.detected_hashes)})"
+                        f"hashes_seen={len(_detected_hashes)})"
                     )
 
         if is_cache_mode(self.config.mode):
@@ -6740,28 +6780,15 @@ class OpenAIHandlerMixin:
                     if mem_injected:
                         ws_response_body["tools"] = ws_tools
 
-                        # Add memory instruction so the model uses
-                        # memory tools as persistent cross-session knowledge.
-                        mem_instruction = (
-                            "\n\n## Memory\n"
-                            "You have persistent memory via memory_search and "
-                            "memory_save tools. Memory stores knowledge across "
-                            "sessions — user info, project details, org context, "
-                            "decisions, architecture, conventions, anything worth "
-                            "remembering.\n\n"
-                            "- ALWAYS call memory_search BEFORE searching files "
-                            "when the user asks a question that could be answered "
-                            "from prior knowledge.\n"
-                            "- Call memory_save to store important facts, decisions, "
-                            "or context that would be useful in future sessions.\n"
-                            "- Memory is your first source of truth for anything "
-                            "not visible in the current conversation."
-                        )
-                        existing_instr = ws_response_body.get("instructions") or ""
-                        ws_response_body["instructions"] = existing_instr + mem_instruction
-                        logger.info(
-                            f"[{request_id}] WS Memory: Injected memory tools + instruction"
-                        )
+                        # NOTE: no `## Memory` instruction block is appended here.
+                        # It duplicated guidance the injected tool descriptions
+                        # already carry (~150 tokens per request, and it mutated
+                        # `instructions`, which is otherwise byte-stable). Its one
+                        # novel clause — "search memory before searching files" —
+                        # now lives in MEMORY_SEARCH_DESCRIPTION
+                        # (headroom/memory/tools.py). See
+                        # docs/token-efficiency-review.md A6.
+                        logger.info(f"[{request_id}] WS Memory: Injected memory tools")
 
                     # Write back into envelope if it was wrapped
                     if "response" in frame_body and isinstance(frame_body["response"], dict):

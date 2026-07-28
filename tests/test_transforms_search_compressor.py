@@ -64,8 +64,12 @@ def test_parse_score_select_and_format_search_results(monkeypatch: pytest.Monkey
             ),
         },
     )
-    assert "src/auth.py:10:ERROR auth failed" in formatted
-    assert summaries["src/db.py"] == "[... and 1 more matches in src/db.py]"
+    # Both files auto-group (auth.py has 3 kept matches; db.py has an omission),
+    # so paths appear once as headings and rows carry only `line:content`.
+    lines = formatted.splitlines()
+    assert "src/auth.py" in lines
+    assert "10:ERROR auth failed" in lines
+    assert summaries["src/db.py"] == "[... and 1 more matches]"
 
 
 def test_search_compressor_compress_paths_and_ccr() -> None:

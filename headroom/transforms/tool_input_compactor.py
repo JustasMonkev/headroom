@@ -16,6 +16,20 @@ under the marker's hash, so ``headroom_retrieve`` / ``/v1/retrieve/{hash}``
 recovers the exact bytes on demand.
 
 Safety rules (each prevents a concrete failure mode):
+- **Reproducible/read-only inputs only.** A call is compacted only when
+  neither its tool name nor its serialized arguments look *mutating*
+  (``Write``/``apply_patch``-family tools, SQL DML/DDL, shell heredocs,
+  shell write-redirection / in-place edits). For a mutating call the tool
+  result is usually a bare acknowledgement ("File written"), so the
+  arguments are the ONLY exact record of what changed — and the CCR entry
+  expires (``CCRConfig.ttl_seconds``, default 1,800s), after which that
+  record would be gone for good. Read-only inputs (a Grep pattern, a
+  Read path, a SELECT) are always re-derivable from the tool result or by
+  re-running the call, so a lapsed CCR entry costs nothing irreversible.
+- **Successful CCR persistence is a precondition.** If the store is
+  missing or ``store()`` raises, the call is left completely untouched.
+  There is no catch-up mechanism, so emitting a marker whose entry was
+  never written would silently make the historical input unrecoverable.
 - Only calls whose matching tool result appears in a LATER message are
   compacted — a pending call's arguments are live working context.
 - The trailing ``protect_recent_turns`` assistant messages are never
@@ -34,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +58,137 @@ logger = logging.getLogger(__name__)
 
 # Replacement key carrying the marker inside the compacted arguments.
 CCR_INPUT_KEY = "_ccr"
+
+# ---------------------------------------------------------------------------
+# THE RULE: only reproducible / read-only tool inputs are compacted.
+#
+# A mutating call's result is typically a bare acknowledgement ("File
+# written", "1 row updated"), so its ARGUMENTS are the sole exact record of
+# what changed. CCR entries expire (``CCRConfig.ttl_seconds``, default
+# 1,800s), so replacing those arguments with a marker would make the record
+# unrecoverable once the entry lapses. Read-only inputs are always
+# re-derivable (re-run the search, re-read the file), so a lapsed entry is
+# merely inconvenient. Hence: name-based denylist + a content check for the
+# mutation shapes that ride inside otherwise-innocuous tools (bash, sql).
+# ---------------------------------------------------------------------------
+
+#: Tool names (normalized: casefolded, ``_``/``-`` stripped) whose inputs
+#: describe a mutation. Never compacted, at any size or age.
+MUTATING_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "write",
+        "writefile",
+        "createfile",
+        "edit",
+        "editfile",
+        "multiedit",
+        "applypatch",
+        "patch",
+        "notebookedit",
+        "strreplaceeditor",
+        "strreplacebasededittool",
+        "texteditor",
+        "filewrite",
+        "fswrite",
+        "update",
+        "delete",
+        "deletefile",
+        "removefile",
+        "movefile",
+        "renamefile",
+        "insert",
+        "createpullrequest",
+        "createorupdatefile",
+        "pushfiles",
+    }
+)
+
+#: SQL statements that change data or schema. Matched anywhere in the
+#: serialized arguments (a query string may be nested arbitrarily).
+_SQL_MUTATION_RE = re.compile(
+    r"\b(?:"
+    r"insert\s+into|update\s+[\"'`\w]|delete\s+from|merge\s+into|replace\s+into|"
+    r"drop\s+(?:table|database|schema|index|view|column)|"
+    r"alter\s+(?:table|database|schema|view)|truncate(?:\s+table)?\s+[\"'`\w]|"
+    r"create\s+(?:table|database|schema|index|view|or\s+replace)|"
+    r"grant\s+\w|revoke\s+\w"
+    r")",
+    re.IGNORECASE,
+)
+
+#: Shell heredoc (``cat <<'EOF' > file``) — the body IS the written content.
+#: The arguments are JSON-serialized, so a real newline appears as the two
+#: characters ``\`` ``n``; accept both forms.
+_HEREDOC_RE = re.compile(r"<<-?\s*[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?\s*(?:\\n|\n|\\\\n)")
+
+#: Shell write-redirection / in-place edit / destructive file ops.
+_SHELL_MUTATION_RE = re.compile(
+    r"(?:>>?\s*[\w./~$-]*[\w/])"  # `> path` / `>> path` redirection
+    r"|(?:\btee\b)"
+    r"|(?:\bsed\b[^|;&]*\s-i\b)"
+    r"|(?:\bperl\b[^|;&]*\s-i\b)"
+    r"|(?:\b(?:rm|mv|cp|mkdir|rmdir|chmod|chown|ln|truncate|dd)\s)"
+    r"|(?:\bgit\s+(?:commit|apply|checkout|reset|push|rebase|merge|am|revert|clean)\b)"
+    r"|(?:\b(?:npm|pnpm|yarn|pip|uv|cargo|apt|apt-get|brew)\s+(?:install|add|remove|"
+    r"uninstall|publish)\b)",
+)
+
+
+def _normalize_tool_name(name: Any) -> str:
+    """Fold a tool name for denylist membership (case/separator-insensitive)."""
+    if not isinstance(name, str):
+        return ""
+    return name.casefold().replace("_", "").replace("-", "")
+
+
+def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
+    """True when this call's arguments are the sole record of a mutation.
+
+    See THE RULE above. Deliberately conservative — a false positive costs
+    only missed savings, a false negative costs an unrecoverable record.
+    """
+    normalized = _normalize_tool_name(tool_name)
+    if normalized in MUTATING_TOOL_NAMES:
+        return True
+    # `mcp__server__write_file` and friends: check the trailing component too.
+    if "__" in tool_name and _normalize_tool_name(tool_name.rsplit("__", 1)[-1]) in (
+        MUTATING_TOOL_NAMES
+    ):
+        return True
+    if _SQL_MUTATION_RE.search(serialized_args):
+        return True
+    if _HEREDOC_RE.search(serialized_args):
+        return True
+    return bool(_SHELL_MUTATION_RE.search(serialized_args))
+
+
+def merge_pipeline_ccr_hashes(
+    detected_hashes: Any,
+    pipeline_ccr_hashes: Any,
+) -> list[str]:
+    """Union of scanner-detected CCR hashes and hashes the pipeline minted.
+
+    ``CCRToolInjector.scan_for_markers`` reads message TEXT and tool-RESULT
+    content. This pass writes its marker into ``tool_use.input`` /
+    ``tool_calls[].function.arguments``, which the scanner never visits — so on
+    the first compaction of a session the scanner reports zero hashes, the
+    provider handlers skip the sticky ``headroom_retrieve`` injection, and the
+    stored original becomes unreachable. Handlers therefore merge the hashes
+    the pipeline reported minting (``TransformResult.markers_inserted``) into
+    the injection decision.
+
+    Order-stable and de-duplicated: the merged list feeds
+    ``has_new_ccr_markers``, whose result drives cache-affecting tool
+    injection, so a stable order keeps that decision reproducible.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for source in (detected_hashes or (), pipeline_ccr_hashes or ()):
+        for h in source:
+            if isinstance(h, str) and h and h not in seen:
+                seen.add(h)
+                merged.append(h)
+    return merged
 
 
 @dataclass
@@ -218,12 +364,16 @@ class ToolInputCompactor:
             return None  # Pending or same-message result: arguments are live.
         if CCR_INPUT_KEY in args[:16]:
             return None  # Already compacted (idempotence).
+        tool_name = str(func.get("name", ""))
+        if is_mutating_tool_input(tool_name, args):
+            return None  # THE RULE: mutating arguments are the only record.
 
-        marker, ccr_hash = self._store_original(
-            args, tool_name=str(func.get("name", "")), tool_call_id=tc_id
-        )
+        stored = self._store_original(args, tool_name=tool_name, tool_call_id=tc_id)
+        if stored is None:
+            return None  # Persistence failed — leave the arguments intact.
+        marker, ccr_hash = stored
         replacement_args = json.dumps({CCR_INPUT_KEY: marker}, separators=(",", ":"))
-        self._record(result, str(func.get("name", "")), len(args), len(replacement_args), ccr_hash)
+        self._record(result, tool_name, len(args), len(replacement_args), ccr_hash)
         return {**tc, "function": {**func, "arguments": replacement_args}}
 
     def _compact_anthropic_block(
@@ -249,37 +399,49 @@ class ToolInputCompactor:
             return None
         if completed_at.get(tc_id, -1) <= msg_index:
             return None  # Pending or same-message result: arguments are live.
+        tool_name = str(block.get("name", ""))
+        if is_mutating_tool_input(tool_name, serialized):
+            return None  # THE RULE: mutating arguments are the only record.
 
-        marker, ccr_hash = self._store_original(
-            serialized, tool_name=str(block.get("name", "")), tool_call_id=tc_id
-        )
-        self._record(result, str(block.get("name", "")), len(serialized), len(marker), ccr_hash)
+        stored = self._store_original(serialized, tool_name=tool_name, tool_call_id=tc_id)
+        if stored is None:
+            return None  # Persistence failed — leave the arguments intact.
+        marker, ccr_hash = stored
+        self._record(result, tool_name, len(serialized), len(marker), ccr_hash)
         return {**block, "input": {CCR_INPUT_KEY: marker}}
 
     def _store_original(
         self, serialized: str, *, tool_name: str, tool_call_id: str
-    ) -> tuple[str, str]:
-        """Persist the original arguments; return (marker, ccr_hash).
+    ) -> tuple[str, str] | None:
+        """Persist the original arguments; return (marker, ccr_hash) or None.
 
-        Best-effort CCR persistence (mirrors read_lifecycle): a store failure
-        must not break compress() — the marker still carries a valid hash for
-        deployments where the store catches up later.
+        Successful persistence is a PRECONDITION for compaction, not a
+        best-effort side effect. There is no catch-up mechanism: if the store
+        is absent or ``store()`` raises, a marker would point at an entry that
+        never existed and the historical arguments would be gone for good. So
+        a failure returns ``None`` and the caller leaves the call untouched —
+        the request still succeeds, it just saves no tokens this turn.
         """
+        if self.store is None:
+            return None
         ccr_hash = hashlib.sha256(serialized.encode()).hexdigest()[:24]
-        if self.store is not None:
-            try:
-                ccr_hash = self.store.store(
-                    original=serialized,
-                    compressed="",
-                    tool_name=tool_name or "tool",
-                    tool_call_id=tool_call_id,
-                    compression_strategy="tool_input_compaction",
-                    explicit_hash=ccr_hash,
-                )
-            except Exception as e:  # noqa: BLE001 - storage failure must not break the request
-                logger.warning(
-                    "tool_input_compaction: CCR store failed for %s: %s", tool_call_id, e
-                )
+        try:
+            ccr_hash = self.store.store(
+                original=serialized,
+                compressed="",
+                tool_name=tool_name or "tool",
+                tool_call_id=tool_call_id,
+                compression_strategy="tool_input_compaction",
+                explicit_hash=ccr_hash,
+            )
+        except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+            logger.warning("tool_input_compaction: CCR store failed for %s: %s", tool_call_id, e)
+            return None
+        if not isinstance(ccr_hash, str) or not ccr_hash:
+            logger.warning(
+                "tool_input_compaction: CCR store returned no hash for %s", tool_call_id
+            )
+            return None
         # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
         # the hash collectors in ccr/tool_injection.py match it, which keeps the
         # headroom_retrieve tool injected while compacted inputs are in context.

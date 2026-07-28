@@ -109,7 +109,7 @@ from headroom.proxy.tool_injection_logging import (
     log_tool_injection_decision as _log_tool_injection_decision,
 )
 from headroom.proxy.tool_injection_tracker import SessionToolTracker as _SessionToolTracker
-from headroom.proxy.tool_name_policy import extract_tool_name
+from headroom.proxy.tool_name_policy import extract_tool_name, normalize_headroom_tool_name
 
 if TYPE_CHECKING:
     import httpx
@@ -2341,7 +2341,13 @@ def apply_session_sticky_ccr_tool(
     for t in tools_out:
         n = _extract_tool_name(t)
         if n:
-            existing_names.add(n)
+            # A2: `headroom wrap` registers our own MCP server, so the client
+            # surfaces the tool as `mcp__headroom__headroom_retrieve` — never
+            # equal to `headroom_retrieve`, so this guard used to miss and we
+            # appended a second, near-identical definition every request.
+            # Only Headroom-owned server labels are normalized: an unrelated
+            # server's `mcp__other__headroom_retrieve` is a different tool.
+            existing_names.add(normalize_headroom_tool_name(n))
 
     # Client (or MCP) already provided a tool by this name — don't double up.
     if CCR_TOOL_NAME in existing_names:
@@ -2882,6 +2888,89 @@ _TOOL_SEARCH_CORE_TOOLS_NORMALIZED = frozenset(
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
+
+# --- F1: tool-search deferral is default-ON (`auto`) for first-party Anthropic.
+#
+# The deferral is deterministic (same input tools -> same output bytes), so the
+# tools prefix still prompt-caches, and it already no-ops for small tool sets
+# and for clients that ship their own tool_search tool. The remaining risk is
+# purely model support: pre-4.5 Claude models 400 on `defer_loading` /
+# `tool_search_tool_*`. Hence a version gate plus two escape hatches.
+_ANTHROPIC_TOOL_SEARCH_MIN_VERSION = (4, 5)
+_TOOL_SEARCH_ON_VALUES = frozenset({"1", "true", "yes", "on"})
+_TOOL_SEARCH_OFF_VALUES = frozenset({"0", "false", "no", "off", "none", "disabled"})
+
+
+def tool_search_mode() -> str:
+    """Resolve ``HEADROOM_TOOL_SEARCH`` to ``"on"`` / ``"off"`` / ``"auto"``.
+
+    Unset (or ``auto``) means auto: inject for first-party Anthropic models
+    that support the GA tool-search shape. ``0``/``off``/``false``/``no`` is the
+    explicit opt-out. ``1``/``on``/``true``/``yes`` forces injection even when
+    the version gate does not recognise the model name (escape hatch for model
+    IDs newer than this code).
+    """
+    raw = os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
+    if not raw or raw == "auto":
+        return "auto"
+    if raw in _TOOL_SEARCH_OFF_VALUES:
+        return "off"
+    if raw in _TOOL_SEARCH_ON_VALUES:
+        return "on"
+    # Unrecognized value: treat as auto rather than silently disabling a
+    # default-on feature (or force-enabling it on an unsupported model).
+    return "auto"
+
+
+def _model_supports_anthropic_tool_search(model: str | None) -> bool:
+    """True when a Claude model supports the server-side Tool Search Tool.
+
+    Default gate: Claude generation >= 4.5 (``claude-sonnet-4-5``,
+    ``claude-opus-4-6``, ``claude-*-5*``, …). A regex in
+    ``HEADROOM_TOOL_SEARCH_MODELS`` (matched against the model name) wins when
+    set; a malformed pattern falls back to the version gate rather than
+    crashing. Conservative: an unparseable model name returns False, which
+    costs only missed savings (the explicit ``HEADROOM_TOOL_SEARCH=1`` escape
+    hatch overrides it).
+    """
+    if not model:
+        return False
+    override = os.environ.get("HEADROOM_TOOL_SEARCH_MODELS", "").strip()
+    if override:
+        try:
+            return re.search(override, model) is not None
+        except re.error:
+            pass  # malformed override -> fall back to the version gate
+    # Version digits are contiguous and follow the family name:
+    # claude-sonnet-4-5-20250929 -> (4, 5); claude-opus-4-6 -> (4, 6).
+    nums: list[int] = []
+    for part in model.strip().lower().split("-"):
+        if part.isdigit():
+            nums.append(int(part))
+        elif nums:
+            break  # stop at the family/date boundary
+    if not nums:
+        return False
+    major = nums[0]
+    minor = nums[1] if len(nums) > 1 else 0
+    return (major, minor) >= _ANTHROPIC_TOOL_SEARCH_MIN_VERSION
+
+
+def anthropic_tool_search_enabled(model: str | None) -> bool:
+    """Whether to inject Anthropic's tool-search deferral for ``model``.
+
+    Combines :func:`tool_search_mode` with :func:`_model_supports_anthropic_tool_search`.
+    Provider/backend scoping (first-party Anthropic only, never Bedrock/Vertex)
+    stays at the call site, which is where that context lives.
+    """
+    mode = tool_search_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return _model_supports_anthropic_tool_search(model)
+
+
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
 # guidance: standard calling is better under ~10 tools).
 _TOOL_SEARCH_MIN_TOOLS = 12

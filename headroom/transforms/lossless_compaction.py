@@ -38,14 +38,31 @@ __all__ = [
 # non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# syslog-style run-collapse marker. The count is captured for exact inversion.
-_RUN_MARKER_RE = re.compile(r"^\.\.\. \(repeated (\d+) times\)$")
+# syslog-style run-collapse marker: `…x5` means the preceding line appears 5
+# times in total. The count is captured for exact inversion.
+#
+# The marker is deliberately terse. Its English predecessor
+# (``... (repeated 5 times)``) cost ~7 tokens, which is more than the run it
+# replaces on any short line — the whole reason `collapse_runs` needed the
+# per-fold net-win guard below. Digits are bounded so the pattern can never
+# blow up on a pathological line, and every emitter/parser pair here lives
+# beside its regex so the two can only change together.
+_RUN_MARKER_RE = re.compile(r"^…x([0-9]{1,9})$")
 
-# multi-line block back-reference marker. Length and distance (both in lines,
-# in ORIGINAL coordinates) are captured for exact inversion: everything before
-# a marker expands to the exact original prefix, so `distance` lines back in
-# the expanded output is the block's first occurrence.
-_BLOCK_MARKER_RE = re.compile(r"^\.\.\. \(repeats (\d+) lines from (\d+) lines back\)$")
+# multi-line block back-reference marker: `…12@-40` means "the 12 lines
+# starting 40 lines back". Length and distance (both in lines, in ORIGINAL
+# coordinates) are captured for exact inversion: everything before a marker
+# expands to the exact original prefix, so `distance` lines back in the
+# expanded output is the block's first occurrence.
+_BLOCK_MARKER_RE = re.compile(r"^…([0-9]{1,9})@-([0-9]{1,9})$")
+
+
+def _run_marker(count: int) -> str:
+    return f"…x{count}"
+
+
+def _block_marker(length: int, distance: int) -> str:
+    return f"…{length}@-{distance}"
 
 # fold_repeated_blocks search bounds: minimum/maximum block length worth a
 # marker, candidate anchors per line, and an input size cap so the scan stays
@@ -96,7 +113,15 @@ def collapse_runs(text: str) -> str:
     """Collapse runs of >=2 identical consecutive lines (syslog convention).
 
     A run of N (N>=2) identical lines becomes the line once followed by
-    ``... (repeated N times)``. Exact inverse: :func:`expand_runs`.
+    ``…xN``. Exact inverse: :func:`expand_runs`.
+
+    Each fold carries its own net-win guard, exactly like
+    :func:`fold_repeated_blocks`. A marker is not free: replacing a run of two
+    8-char lines with a line plus a marker *grows* the payload. Only
+    :func:`compact_lossless`'s global size check stood between that and the
+    wire, so on an input where one long run wins, every short run rode along
+    as pure loss. A run is now collapsed only when the marker costs strictly
+    fewer characters than the duplicate lines it replaces.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
@@ -109,11 +134,15 @@ def collapse_runs(text: str) -> str:
         while j + 1 < n and lines[j + 1] == lines[i]:
             j += 1
         run_len = j - i + 1
+        out.append(lines[i])
         if run_len >= 2:
-            out.append(lines[i])
-            out.append(f"... (repeated {run_len} times)")
-        else:
-            out.append(lines[i])
+            marker = _run_marker(run_len)
+            # Dropped: (run_len - 1) copies of the line, each with its newline.
+            # Added: the marker plus its newline.
+            if (run_len - 1) * (len(lines[i]) + 1) > len(marker) + 1:
+                out.append(marker)
+            else:
+                out.extend(lines[i] for _ in range(run_len - 1))
         i = j + 1
     return _join(out, had_trailing)
 
@@ -153,7 +182,7 @@ def fold_repeated_blocks(text: str) -> str:
 
     The block-level generalization of :func:`collapse_runs`: a run of K
     consecutive lines (K >= 3) that exactly reproduces K lines seen D lines
-    earlier becomes ``... (repeats K lines from D lines back)``. The repeats
+    earlier becomes ``…K@-D`` ("K lines, from D lines back"). The repeats
     need not be adjacent, which is what config payloads actually look like —
     k8s container stanzas repeat with only the ``name:`` line differing, so
     their identical tails fold even though no two whole stanzas are
@@ -181,7 +210,7 @@ def fold_repeated_blocks(text: str) -> str:
                 best_len = length
                 best_dist = i - q
         if best_len >= _FOLD_MIN_BLOCK:
-            marker = f"... (repeats {best_len} lines from {best_dist} lines back)"
+            marker = _block_marker(best_len, best_dist)
             block_chars = sum(len(lines[i + k]) + 1 for k in range(best_len))
             if block_chars > len(marker) + 1:
                 out.append(marker)

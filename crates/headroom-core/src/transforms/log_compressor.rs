@@ -232,6 +232,10 @@ pub struct LogCompressorStats {
     pub stack_traces_seen: usize,
     pub stack_traces_kept: usize,
     pub warnings_dropped_by_dedupe: usize,
+    /// Error/fail lines folded into a `×N` survivor (byte-identical only).
+    pub duplicate_errors_folded: usize,
+    /// Stack traces that had at least one byte-identical repeat.
+    pub duplicate_traces_folded: usize,
     pub lines_dropped_by_global_cap: usize,
     pub runtime_frames_collapsed: usize,
     pub ccr_emitted: bool,
@@ -955,9 +959,19 @@ impl LogCompressor {
 
         let selected = self.select_lines(&log_lines, bias, &mut stats);
 
-        let (compressed_body, output_stats) = self.format_output(&selected, &log_lines);
-        let mut compressed = compressed_body;
-        let ratio = compressed.len() as f64 / content.len().max(1) as f64;
+        let (compressed_body, footer, output_stats) =
+            self.format_output_parts(&selected, &log_lines);
+        // The footer and the CCR marker used to be two adjacent lines saying
+        // the same thing twice. They are now one line: the omission counts
+        // followed by the retrieval hash. `Retrieve more: hash=` is kept
+        // verbatim — it is the token the marker scanners match on.
+        let ratio_body = match &footer {
+            Some(f) if compressed_body.is_empty() => format!("[{}]", f),
+            Some(f) => format!("{}\n[{}]", compressed_body, f),
+            None => compressed_body.clone(),
+        };
+        let ratio = ratio_body.len() as f64 / content.len().max(1) as f64;
+        let mut compressed = ratio_body;
 
         let mut cache_key = None;
         if self.config.enable_ccr {
@@ -966,13 +980,19 @@ impl LogCompressor {
             } else if let Some(store) = store {
                 let key = md5_hex_24(content);
                 store.put(&key, content);
-                let marker = format!(
-                    "\n[{} lines compressed to {}. Retrieve more: hash={}]",
-                    original_line_count,
-                    selected.len(),
-                    key
-                );
-                compressed.push_str(&marker);
+                compressed = match &footer {
+                    Some(f) if compressed_body.is_empty() => {
+                        format!("[{}. Retrieve more: hash={}]", f, key)
+                    }
+                    Some(f) => format!("{}\n[{}. Retrieve more: hash={}]", compressed_body, f, key),
+                    None => format!(
+                        "{}\n[{} lines compressed to {}. Retrieve more: hash={}]",
+                        compressed_body,
+                        original_line_count,
+                        selected.len(),
+                        key
+                    ),
+                };
                 cache_key = Some(key);
                 stats.ccr_emitted = true;
             } else {
@@ -1106,6 +1126,17 @@ impl LogCompressor {
         // line-number-ordered output without an extra sort pass.
         let _ = (); // appease style; the BTreeSet ordering relies on Ord impl below.
 
+        // Byte-identical dedup for errors/fails. Deliberately NOT
+        // `dedupe_similar`: its normaliser blanks digits, hex and paths in the
+        // trailing region, which would collapse `test_apply[case-3] FAILED` and
+        // `test_apply[case-9] FAILED` into one entry and hide *which* inputs
+        // failed. Only lines that are equal byte for byte are folded, and the
+        // survivor states the count.
+        let (errors, mut suppressed) = dedupe_identical(errors);
+        let (fails, fail_suppressed) = dedupe_identical(fails);
+        suppressed.extend(fail_suppressed);
+        stats.duplicate_errors_folded += suppressed.len();
+
         for line in self.select_with_first_last(&errors, self.config.max_errors) {
             selected.insert(line);
         }
@@ -1123,6 +1154,26 @@ impl LogCompressor {
         for line in warnings.into_iter().take(self.config.max_warnings) {
             selected.insert(line);
         }
+
+        // Byte-identical stack traces (the same failure raised by N
+        // parametrized cases) collapse to one copy plus a count. The key is the
+        // exact frame list, so two traces that differ anywhere — a line number,
+        // a value in the message — are still both kept.
+        let (stack_traces, traces_suppressed) = dedupe_identical_traces(stack_traces);
+        suppressed.extend(traces_suppressed);
+        stats.duplicate_traces_folded +=
+            stack_traces.iter().filter(|(_, count)| *count > 1).count();
+        let stack_traces: Vec<Vec<LogLine>> = stack_traces
+            .into_iter()
+            .map(|(mut stack, count)| {
+                if count > 1 {
+                    if let Some(head) = stack.first_mut() {
+                        head.content = format!("{} [same trace ×{}]", head.content, count);
+                    }
+                }
+                stack
+            })
+            .collect();
 
         let mut collapsed_frame_indices: BTreeSet<usize> = BTreeSet::new();
         for stack in stack_traces.iter().take(self.config.max_stack_traces) {
@@ -1157,12 +1208,31 @@ impl LogCompressor {
             }
         }
 
-        // Add context lines around every selected entry.
+        // Add context lines around selected ERROR/FAIL entries only.
+        //
+        // This used to expand around *every* selected line — warnings,
+        // summaries and stack-trace frames included. pytest's `====` banners
+        // all match the summary patterns, so a single run dragged in up to
+        // ~120 neighbours of pure framing against a 100-line budget, evicting
+        // the errors the context was meant to explain. Warnings and summaries
+        // are self-contained; only an error benefits from its surroundings.
+        //
+        // The window is asymmetric: what follows an error explains it (the
+        // traceback, the retry, the exit code); the line before it is usually
+        // just the last thing that went right. At the default
+        // `error_context_lines = 3` that is 1 before / 2 after, and it still
+        // scales for callers that deliberately widen the setting.
+        let ctx_before = self.config.error_context_lines.div_ceil(3);
+        let ctx_after = (2 * self.config.error_context_lines).div_ceil(3);
         let selected_indices: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
         let mut context_indices: BTreeSet<usize> = BTreeSet::new();
-        for &idx in &selected_indices {
-            let lo = idx.saturating_sub(self.config.error_context_lines);
-            let hi = (idx + self.config.error_context_lines + 1).min(log_lines.len());
+        for line in selected.iter() {
+            if !matches!(line.level, LogLevel::Error | LogLevel::Fail) {
+                continue;
+            }
+            let idx = line.line_number;
+            let lo = idx.saturating_sub(ctx_before);
+            let hi = (idx + ctx_after + 1).min(log_lines.len());
             for i in lo..hi {
                 if i != idx {
                     context_indices.insert(i);
@@ -1172,9 +1242,11 @@ impl LogCompressor {
         for idx in context_indices {
             // Deliberately-collapsed runtime frames must not ride back in as
             // "context" around the kept frames — that would undo the collapse.
+            // Same for byte-identical duplicates already folded into a `×N`.
             if !selected_indices.contains(&idx)
                 && idx < log_lines.len()
                 && !collapsed_frame_indices.contains(&idx)
+                && !suppressed.contains(&idx)
             {
                 selected.insert(log_lines[idx].clone());
             }
@@ -1254,11 +1326,19 @@ impl LogCompressor {
         out
     }
 
-    pub fn format_output(
+    /// Body text plus the *inner* text of the omission footer (no brackets),
+    /// so the caller can fuse it with the CCR marker into a single line.
+    ///
+    /// The footer used to be emitted here and the CCR marker appended right
+    /// after it, giving two adjacent lines that restate the same arithmetic
+    /// (`[137 lines omitted: …]` + `[200 lines compressed to 63. Retrieve
+    /// more: hash=…]`, ~48 tokens). Splitting the render from the wrapping
+    /// lets `compress_with_store` emit one line instead.
+    pub fn format_output_parts(
         &self,
         selected: &[LogLine],
         all_lines: &[LogLine],
-    ) -> (String, BTreeMap<String, u64>) {
+    ) -> (String, Option<String>, BTreeMap<String, u64>) {
         let mut stats: BTreeMap<String, u64> = BTreeMap::new();
         stats.insert("errors".into(), count_level(all_lines, LogLevel::Error));
         stats.insert("fails".into(), count_level(all_lines, LogLevel::Fail));
@@ -1267,36 +1347,130 @@ impl LogCompressor {
         stats.insert("total".into(), all_lines.len() as u64);
         stats.insert("selected".into(), selected.len() as u64);
 
-        let mut output: Vec<String> = selected.iter().map(|l| l.content.clone()).collect();
+        let output: Vec<String> = selected.iter().map(|l| l.content.clone()).collect();
+        let footer = omission_summary(selected, all_lines);
+        (output.join("\n"), footer, stats)
+    }
 
-        let omitted = all_lines.len().saturating_sub(selected.len());
-        if omitted > 0 {
-            let mut summary_parts: Vec<String> = Vec::new();
-            for (label, key) in [
-                ("ERROR", "errors"),
-                ("FAIL", "fails"),
-                ("WARN", "warnings"),
-                ("INFO", "info"),
-            ] {
-                let n = stats.get(key).copied().unwrap_or(0);
-                if n > 0 {
-                    summary_parts.push(format!("{} {}", n, label));
-                }
-            }
-            if !summary_parts.is_empty() {
-                output.push(format!(
-                    "[{} lines omitted: {}]",
-                    omitted,
-                    summary_parts.join(", ")
-                ));
-            }
+    pub fn format_output(
+        &self,
+        selected: &[LogLine],
+        all_lines: &[LogLine],
+    ) -> (String, BTreeMap<String, u64>) {
+        let (body, footer, stats) = self.format_output_parts(selected, all_lines);
+        match footer {
+            Some(f) if body.is_empty() => (format!("[{}]", f), stats),
+            Some(f) => (format!("{}\n[{}]", body, f), stats),
+            None => (body, stats),
         }
-        (output.join("\n"), stats)
+    }
+}
+
+/// The inner text of the omission footer, or `None` when there is nothing
+/// worth saying.
+///
+/// Two defects the old version had:
+///
+/// * **The counts were of ALL lines, not omitted ones.** A log with 12 errors
+///   of which 10 were kept still advertised `12 ERROR` in a line whose subject
+///   is what got dropped — telling the model to retrieve for errors that are
+///   sitting right above it. Counts are now `all − selected` per level, and a
+///   level with nothing left over is not mentioned.
+/// * **INFO was listed.** Nobody retrieves a log to read the INFO lines, and
+///   it is by far the largest term (`122 INFO`), so it cost the most tokens
+///   for the least actionable information. Dropped.
+fn omission_summary(selected: &[LogLine], all_lines: &[LogLine]) -> Option<String> {
+    let omitted = all_lines.len().saturating_sub(selected.len());
+    if omitted == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for (label, level) in [
+        ("ERROR", LogLevel::Error),
+        ("FAIL", LogLevel::Fail),
+        ("WARN", LogLevel::Warn),
+    ] {
+        let dropped = count_level(all_lines, level).saturating_sub(count_level(selected, level));
+        if dropped > 0 {
+            parts.push(format!("{} {}", dropped, label));
+        }
+    }
+    if parts.is_empty() {
+        Some(format!("{} lines omitted", omitted))
+    } else {
+        Some(format!("{} lines omitted: {}", omitted, parts.join(", ")))
     }
 }
 
 fn count_level(lines: &[LogLine], level: LogLevel) -> u64 {
     lines.iter().filter(|l| l.level == level).count() as u64
+}
+
+/// Fold BYTE-IDENTICAL lines: keep the first, append ` ×N` to it, and report
+/// the line numbers that were suppressed.
+///
+/// Byte-identity is the whole point. Normalised similarity (see
+/// `dedupe_similar`) is fine for warnings, where the variable part is noise,
+/// but on errors the variable part is the *answer* — which id, which path,
+/// which value failed. A fold that erases it turns "here are the 9 inputs that
+/// broke" into "something broke 9 times".
+fn dedupe_identical(lines: Vec<LogLine>) -> (Vec<LogLine>, BTreeSet<usize>) {
+    let mut first_at: BTreeMap<String, usize> = BTreeMap::new();
+    let mut counts: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut kept: Vec<LogLine> = Vec::with_capacity(lines.len());
+    let mut suppressed: BTreeSet<usize> = BTreeSet::new();
+
+    for line in lines {
+        match first_at.get(&line.content) {
+            Some(&pos) => {
+                counts[pos] += 1;
+                suppressed.insert(line.line_number);
+            }
+            None => {
+                first_at.insert(line.content.clone(), kept.len());
+                counts.push(1);
+                kept.push(line);
+            }
+        }
+    }
+    for (line, count) in kept.iter_mut().zip(counts) {
+        if count > 1 {
+            line.content = format!("{} ×{}", line.content, count);
+        }
+    }
+    (kept, suppressed)
+}
+
+/// Fold stack traces whose frame lists are byte-identical.
+///
+/// Returns `(traces_with_occurrence_count, suppressed_line_numbers)` in
+/// first-seen order. A trace that differs in *any* frame — one different line
+/// number is enough — keeps its own entry.
+fn dedupe_identical_traces(
+    traces: Vec<Vec<LogLine>>,
+) -> (Vec<(Vec<LogLine>, usize)>, BTreeSet<usize>) {
+    let mut first_at: BTreeMap<String, usize> = BTreeMap::new();
+    let mut kept: Vec<(Vec<LogLine>, usize)> = Vec::with_capacity(traces.len());
+    let mut suppressed: BTreeSet<usize> = BTreeSet::new();
+
+    for trace in traces {
+        let key = trace
+            .iter()
+            .map(|l| l.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match first_at.get(&key) {
+            Some(&pos) => {
+                kept[pos].1 += 1;
+                suppressed.extend(trace.iter().map(|l| l.line_number));
+            }
+            None => {
+                first_at.insert(key, kept.len());
+                kept.push((trace, 1));
+            }
+        }
+    }
+    (kept, suppressed)
 }
 
 fn warnings_dropped(all: &[LogLine], deduped: &[LogLine]) -> usize {
@@ -1602,9 +1776,76 @@ mod tests {
         .collect::<Vec<_>>();
         let selected = vec![all_lines[0].clone()];
         let (output, stats) = c.format_output(&selected, &all_lines);
-        assert!(output.contains("[3 lines omitted: 1 ERROR, 1 WARN, 2 INFO]"));
+        // The footer counts what was OMITTED, not what the log contained: the
+        // one ERROR is right above, so advertising it would send the model
+        // retrieving for something it already has. INFO is never listed.
+        assert!(
+            output.contains("[3 lines omitted: 1 WARN]"),
+            "unexpected footer: {output}"
+        );
+        // The `stats` map still reports whole-log level totals.
         assert_eq!(stats["errors"], 1);
         assert_eq!(stats["info"], 2);
+    }
+
+    #[test]
+    fn omission_footer_drops_a_level_that_is_fully_present() {
+        let c = cmp();
+        let mut a = LogLine::new(0, "ERROR boom");
+        a.level = LogLevel::Error;
+        let mut b = LogLine::new(1, "INFO noise");
+        b.level = LogLevel::Info;
+        let all_lines = vec![a.clone(), b];
+        let (output, _) = c.format_output(&[a], &all_lines);
+        assert_eq!(output, "ERROR boom\n[1 lines omitted]");
+    }
+
+    #[test]
+    fn identical_errors_fold_to_one_with_a_count() {
+        let lines: Vec<LogLine> = (0..4)
+            .map(|i| {
+                let mut l = LogLine::new(i, "ERROR connection refused");
+                l.level = LogLevel::Error;
+                l
+            })
+            .collect();
+        let (kept, suppressed) = dedupe_identical(lines);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].content, "ERROR connection refused ×4");
+        assert_eq!(suppressed.len(), 3);
+    }
+
+    #[test]
+    fn errors_differing_only_in_an_id_are_all_kept() {
+        // The regression `dedupe_similar` would cause: these normalise to the
+        // same string, but each names a different failing input.
+        let lines: Vec<LogLine> = (0..3)
+            .map(|i| {
+                let mut l = LogLine::new(i, format!("FAILED test_apply[case-{i}]: assert 0 == 1"));
+                l.level = LogLevel::Fail;
+                l
+            })
+            .collect();
+        let (kept, suppressed) = dedupe_identical(lines);
+        assert_eq!(kept.len(), 3);
+        assert!(suppressed.is_empty());
+        assert!(kept[2].content.contains("case-2"));
+    }
+
+    #[test]
+    fn identical_traces_fold_but_differing_ones_do_not() {
+        let trace = |n: usize, line_no: usize| {
+            vec![
+                LogLine::new(line_no, "Traceback (most recent call last):"),
+                LogLine::new(line_no + 1, format!("  File \"a.py\", line {n}, in f")),
+            ]
+        };
+        let (kept, suppressed) =
+            dedupe_identical_traces(vec![trace(7, 0), trace(7, 10), trace(9, 20)]);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].1, 2);
+        assert_eq!(kept[1].1, 1);
+        assert_eq!(suppressed, [10, 11].into_iter().collect());
     }
 
     #[test]

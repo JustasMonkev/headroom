@@ -89,10 +89,15 @@ class TestSearchGroupedOutput:
         ]
     )
 
-    def test_standard_format_default(self):
+    def test_standard_format_auto_groups_multi_match_files(self):
         result = SearchCompressor(SearchCompressorConfig()).compress(self.INPUT)
-        # Classic file:line:content — path on every match line.
-        assert "src/very/long/path/to/module.py:10:" in result.compressed
+        lines = result.compressed.splitlines()
+        # With group_by_file off, a file with >=2 matches still groups — the
+        # flat shape would only re-emit the same path.
+        assert "src/very/long/path/to/module.py" in lines
+        assert "10:def alpha():" in lines
+        # ...while the single-match file keeps the classic flat shape.
+        assert "src/other.py:5:class Other:" in lines
 
     def test_grouped_format(self):
         result = SearchCompressor(SearchCompressorConfig(group_by_file=True)).compress(self.INPUT)
@@ -104,10 +109,13 @@ class TestSearchGroupedOutput:
         # No classic-format line remains.
         assert not any(line.startswith("src/very/long/path/to/module.py:10:") for line in lines)
 
-    def test_grouped_is_smaller(self):
+    def test_grouped_is_smaller_than_the_raw_input(self):
+        """Both modes beat the raw input; forcing grouping only adds the
+        single-match file, where it is a wash (one path either way)."""
         std = SearchCompressor(SearchCompressorConfig()).compress(self.INPUT)
         grp = SearchCompressor(SearchCompressorConfig(group_by_file=True)).compress(self.INPUT)
-        assert len(grp.compressed) < len(std.compressed)
+        assert len(std.compressed) < len(self.INPUT)
+        assert len(grp.compressed) <= len(std.compressed)
 
     def test_grouped_deterministic(self):
         c = SearchCompressor(SearchCompressorConfig(group_by_file=True))

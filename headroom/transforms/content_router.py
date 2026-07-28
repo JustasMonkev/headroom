@@ -48,6 +48,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -1773,6 +1774,117 @@ class ContentRouterConfig:
     search_group_by_file: bool = False
 
 
+# ---------------------------------------------------------------------------
+# F6: per-request routing context.
+#
+# Routers are long-lived and SHARED: the proxy builds one per pipeline and
+# reuses it for every request, and `apply()` itself runs on a compression
+# executor thread while the parallel block pass fans out to more threads. The
+# request-specific routing knobs below (target ratio, kompress model override,
+# the tool_call_id -> args/command maps, the read-protection sets) used to be
+# plain instance attributes assigned at the top of `apply()`, so two concurrent
+# requests overwrote each other's routing context — request B's target ratio
+# and tool-args map silently applied to request A's blocks mid-flight.
+#
+# The fix scopes them to a `contextvars` request scope: `apply()` installs a
+# fresh dict, every read/write goes through it, and the parallel pass copies the
+# calling context into its workers so they observe THEIR request's values. Reads
+# outside any scope (direct `compress()` callers, tests inspecting the router
+# after `apply()` returned) fall back to a per-instance dict, which preserves
+# the pre-existing behaviour for those paths.
+# ---------------------------------------------------------------------------
+
+# C11: floor below which the LOSSLESS folds are not even attempted.
+#
+# Formerly 200, which skipped the single most common payload in an agent
+# transcript. `compact_lossless` is pure-stdlib, microsecond-fast and
+# self-verifying (it returns its input untouched when it cannot shrink), so the
+# only cost of attempting it is a few microseconds — there is no accuracy risk
+# to trade off. 80 chars is roughly the point below which no fold can win: the
+# cheapest fold markers (`…x5`) plus a fold's structural overhead need a couple
+# of repeated lines to pay for themselves.
+#
+# NOTE this is the LOSSLESS floor only. The lossy floor
+# (`ContentRouterConfig.min_chars_for_block_compression`, default 500) is
+# unchanged: lowering that would push 200-499-char blocks into the *lossy*
+# compressors, which is a different and much riskier bet. Small blocks already
+# bypass the lossy floor when a lossless fold wins (`_has_lossless_fold`).
+LOSSLESS_FOLD_MIN_CHARS = 80
+
+# Outer dict is keyed by ``id(router)`` so two routers active on the same
+# context (a pipeline holding more than one, a nested standalone router) keep
+# separate state. Inner dict is attribute name -> value.
+_REQUEST_SCOPE: ContextVar[dict[int, dict[str, Any]]] = ContextVar(
+    "headroom_router_request_scope"
+)
+
+#: Ceiling on distinct routers tracked in one context before the scope is
+#: recycled. Requests normally involve a single router; the cap only bounds the
+#: pathological case of many short-lived routers on one long-lived thread.
+_REQUEST_SCOPE_MAX_ROUTERS = 16
+
+#: Attribute holding the no-scope fallback store on each router instance.
+_SCOPE_FALLBACK_ATTR = "_request_scope_fallback"
+
+
+class _RequestScoped:
+    """Descriptor storing an attribute in the active per-request scope.
+
+    Behaves exactly like a normal instance attribute when this router has no
+    scope open on the current context (direct ``compress()`` use, a different
+    router instance, post-``apply()`` inspection from another thread), but
+    isolates concurrent ``apply()`` calls from one another when one is.
+    """
+
+    __slots__ = ("_default_factory", "_name")
+
+    def __init__(self, default_factory: Callable[[], Any]) -> None:
+        self._default_factory = default_factory
+        self._name = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._name = name
+
+    @staticmethod
+    def _store(obj: Any) -> dict[str, Any]:
+        scope = _REQUEST_SCOPE.get(None)
+        if scope is not None:
+            per_router = scope.get(id(obj))
+            if per_router is not None:
+                return per_router
+        fallback = obj.__dict__.get(_SCOPE_FALLBACK_ATTR)
+        if fallback is None:
+            fallback = {}
+            obj.__dict__[_SCOPE_FALLBACK_ATTR] = fallback
+        return fallback
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        store = self._store(obj)
+        if self._name not in store:
+            store[self._name] = self._default_factory()
+        return store[self._name]
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        self._store(obj)[self._name] = value
+
+
+def _open_router_request_scope(router: Any) -> None:
+    """Install a fresh routing scope for ``router`` on the current context.
+
+    Deliberately NOT reset on exit: the scope lives in the current thread's /
+    task's context, every ``apply()`` replaces this router's slot wholesale, and
+    leaving it in place keeps the routing decisions inspectable after
+    ``apply()`` returns (tests and the savings reporter rely on that).
+    """
+    scope = _REQUEST_SCOPE.get(None)
+    if scope is None or len(scope) > _REQUEST_SCOPE_MAX_ROUTERS:
+        scope = {}
+        _REQUEST_SCOPE.set(scope)
+    scope[id(router)] = {}
+
+
 class ContentRouter(Transform):
     """Intelligent router that selects optimal compression strategy.
 
@@ -1831,6 +1943,20 @@ class ContentRouter(Transform):
     # (fewer lossy chains, safer); 0 = keep the lossy pass on any improvement.
     _DEFAULT_LOSSY_MIN_EXTRA_SAVINGS = 0.05
 
+    # --- F6: per-request routing context (see `_RequestScoped` above). These
+    # are assigned per request from `apply()`'s kwargs and read from the
+    # (possibly parallel) compression pass; keeping them on the shared instance
+    # let concurrent requests clobber each other's routing decisions.
+    _runtime_target_ratio = _RequestScoped(lambda: None)
+    _runtime_force_kompress = _RequestScoped(lambda: False)
+    _runtime_skip_kompress = _RequestScoped(lambda: False)
+    _runtime_kompress_model = _RequestScoped(lambda: None)
+    _runtime_compression_policy = _RequestScoped(lambda: None)
+    _tool_call_args = _RequestScoped(dict)
+    _tool_call_commands = _RequestScoped(dict)
+    _protect_read_tool_ids = _RequestScoped(set)
+    _protect_read_msg_indices = _RequestScoped(set)
+
     def __init__(
         self,
         config: ContentRouterConfig | None = None,
@@ -1857,6 +1983,13 @@ class ContentRouter(Transform):
         if self.config.lossless:
             self.config.ccr_inject_marker = False
             self.config.smart_crusher_lossless_only = True
+            # Tool-input compaction is CCR-backed by construction: it replaces
+            # arguments with a `hash=` marker redeemable only through
+            # `headroom_retrieve`, which lossless mode suppresses. Leaving it on
+            # would strand the arguments — a lossy outcome in the mode whose
+            # whole contract is losslessness.
+            if self.config.tool_input_compaction.enabled:
+                self.config.tool_input_compaction = ToolInputCompactionConfig(enabled=False)
         self._observer = observer
         # Reused by deadline-bound pass-2 compression.  A single bounded pool
         # prevents timed-out compressor threads from growing without limit
@@ -1904,9 +2037,9 @@ class ContentRouter(Transform):
         self._relevance_scorer_tried: bool = False
         self._relevance_prewarm_started: bool = False
         # tool_call_id → compact args text, populated by _build_tool_name_map.
-        self._tool_call_args: dict[str, str] = {}
+        self._tool_call_args = {}
         # tool_call_id → raw shell command (bash-search fold), same population.
-        self._tool_call_commands: dict[str, str] = {}
+        self._tool_call_commands = {}
 
         # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
         # ONNX). Its inference scales O(tokens) and runs synchronously on the
@@ -1975,7 +2108,7 @@ class ContentRouter(Transform):
         # proxy) keep pre-F2.2 behaviour: TOIN writes are not gated.
         # Same pattern the existing ``_runtime_target_ratio`` /
         # ``_runtime_kompress_model`` fields below use.
-        self._runtime_compression_policy: Any = None
+        self._runtime_compression_policy = None
 
         self._cache = CompressionCache()
 
@@ -2237,9 +2370,16 @@ class ContentRouter(Transform):
         Timed-out futures deliberately remain in the executor's bounded queue;
         running and retained request contents can never exceed two worker
         waves, even while every worker is wedged.
+
+        F6: the worker runs inside a COPY of the submitting context, so it sees
+        this request's routing scope (target ratio, tool-args map, read
+        protection) rather than whatever the shared, long-lived executor thread
+        happened to be left holding by an earlier request.
         """
         executor = self._get_stage_compression_executor(max_workers)
+        ctx = copy_context()
         return executor.submit(
+            ctx.run,
             self._timed_compress,
             content,
             context,
@@ -4470,6 +4610,11 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        # F6: isolate this request's routing context from every other request
+        # sharing this router. Must be the first statement — everything below
+        # assigns into the scope. See `_RequestScoped` / `_open_router_request_scope`.
+        _open_router_request_scope(self)
+
         # Shared CCR store for the pre-processing passes below. is None (not
         # truthiness) so falsy test doubles are honored; guarded import keeps
         # the passes running in stripped builds.
@@ -4540,16 +4685,16 @@ class ContentRouter(Transform):
             self.config.min_chars_for_block_compression,
         )
         # Store runtime options on self for access by _route_and_compress_block
-        self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
-        self._runtime_force_kompress: bool = bool(
+        self._runtime_target_ratio = kwargs.get("target_ratio")
+        self._runtime_force_kompress = bool(
             kwargs.get("force_kompress", self.config.force_kompress_all)
         )
         # skip_kompress: run everything EXCEPT the Kompress ML stage this
         # call. Used by the cold-start fast pass so the request-path pass
         # stays sub-second; units routed to Kompress take the same fallback
         # they take when the model isn't ready. Wins over force_kompress.
-        self._runtime_skip_kompress: bool = bool(kwargs.get("skip_kompress", False))
-        self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
+        self._runtime_skip_kompress = bool(kwargs.get("skip_kompress", False))
+        self._runtime_kompress_model = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
         # ``policy.toin_read_only``. ``None`` when the caller didn't
@@ -4610,7 +4755,7 @@ class ContentRouter(Transform):
         # mark the observation's message index so it is passed verbatim — so
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
-        self._protect_read_msg_indices: set[int] = set()
+        self._protect_read_msg_indices = set()
         if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
             "0",
             "",
@@ -5544,7 +5689,7 @@ class ContentRouter(Transform):
                     "lossless provider failed; using built-in compaction",
                     exc_info=True,
                 )
-        if len(content) < 200:
+        if len(content) < LOSSLESS_FOLD_MIN_CHARS:
             return None
         try:
             from .lossless_compaction import compact_lossless
@@ -5591,7 +5736,7 @@ class ContentRouter(Transform):
 
         Returns the folded text (smaller, recoverable) or ``None`` to fall through.
         """
-        if not isinstance(content, str) or len(content) < 200:
+        if not isinstance(content, str) or len(content) < LOSSLESS_FOLD_MIN_CHARS:
             return None
         if tool_name.lower() not in self.config.bash_tool_names:
             return None

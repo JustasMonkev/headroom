@@ -37,8 +37,15 @@ __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
 # pointer. Small dups are left alone (fragmenting context is not worth it) —
 # and a larger floor keeps the pointer comfortably shorter than the span it
 # replaces, so a fold is always a net byte win.
+#
+# The char floor is a *heuristic* prefilter, not the guarantee: a 45-char span
+# used to become a 49-char pointer, and `chars_removed` went negative while
+# still being reported as savings. The guarantee is the explicit
+# `len(ptr) < len(span_text)` check in :func:`dedup_blocks`; this floor exists
+# so the common case never reaches it, and so a fold is worth the context
+# fragmentation, not just worth one byte.
 DEFAULT_MIN_LINES = 3
-DEFAULT_MIN_CHARS = 40
+DEFAULT_MIN_CHARS = 120
 # Cap anchor candidates examined per line so a hot line (e.g. ``    return``)
 # can't blow up matching. Deterministic: candidates are kept in first-seen order.
 MAX_ANCHOR_CANDIDATES = 16
@@ -135,12 +142,19 @@ def _pointer(span: list[str], ref_turn: int, delta: int = 0) -> str:
     # left uncompressed. Trimming the pointer + MIN_LINES=3 lets those pay off
     # (~4.3% -> ~6% lossless on Opus). Still no hash= token (in-context recovery)
     # and keeps a short first-line anchor so the model can locate the original.
+    #
+    # Two characters that used to be here are gone. ``↑`` is a non-ASCII glyph
+    # that tokenizes to 2-3 tokens on its own and carried no information the
+    # words "same as msg" don't; ``!r`` quoting wrapped the anchor in quotes
+    # that fragment its tokenization (and doubled up whenever the anchor itself
+    # contained a quote). The leading ``[`` plus ``L same as msg`` already make
+    # the line unmistakably a marker.
     anchor = next((_num_and_key(ln)[2].strip() for ln in span if ln.strip()), "")
     if len(anchor) > 20:
         anchor = anchor[:17] + "..."
     if delta:
-        return f"[↑{len(span)}L same as msg {ref_turn} {delta:+d}L: {anchor!r}]"
-    return f"[↑{len(span)}L same as msg {ref_turn}: {anchor!r}]"
+        return f"[{len(span)}L same as msg {ref_turn} {delta:+d}L: {anchor}]"
+    return f"[{len(span)}L same as msg {ref_turn}: {anchor}]"
 
 
 def _index_lines(
@@ -259,9 +273,14 @@ def dedup_blocks(
                 if m is not None and m[0] >= min_lines:
                     span = lines[i : i + m[0]]
                     span_text = "\n".join(span)
-                    if len(span_text) >= min_chars:
-                        ref_turn = blocks[m[1]].turn
-                        ptr = _pointer(span, ref_turn, m[3])
+                    ref_turn = blocks[m[1]].turn
+                    ptr = _pointer(span, ref_turn, m[3]) if len(span_text) >= min_chars else ""
+                    # The floors are heuristics; THIS is the guarantee. The
+                    # pointer's length is data-dependent (turn ordinal, delta,
+                    # anchor), so no static floor can promise it is shorter than
+                    # what it replaces. Without this check a fold could add
+                    # bytes and still be counted as savings.
+                    if ptr and len(ptr) < len(span_text):
                         out.append(ptr)
                         # Folded span is NOT verbatim in this block's output:
                         # mark None so it can't seed a later contiguous match,

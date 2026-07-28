@@ -9,10 +9,13 @@ from headroom.transforms.cross_turn_dedup import (
     is_prefix_monotonic,
 )
 
-# Compact fold pointer: ``[↑<N>L same as msg <ref>[ <±delta>L]: '<anchor>']`` —
+# Compact fold pointer: ``[<N>L same as msg <ref>[ <±delta>L]: <anchor>]`` —
 # span length + referenced msg + optional line-number offset + a truncated
 # first-line anchor (no explicit line range; recovery locates the span by anchor).
-_FOLD_RE = re.compile(r"\[↑(\d+)L same as msg (\d+)(?: ([+-]\d+)L)?: '([^']*)'\]")
+# No ``↑`` glyph and no quoting around the anchor: both cost tokens and neither
+# carried information (see `_pointer`).
+_FOLD_RE = re.compile(r"\[(\d+)L same as msg (\d+)(?: ([+-]\d+)L)?: ([^\]]*)\]")
+_FOLD_MARK = "L same as msg "
 
 
 def _blk(text, turn, protected=False):
@@ -47,7 +50,7 @@ def _reconstruct(orig_blocks, out_blocks):
         rebuilt = []
         for line in out.text.split("\n"):
             m = _FOLD_RE.search(line)
-            if m and line.lstrip().startswith("[↑"):
+            if m and line.lstrip().startswith("["):
                 assert m.group(3) is None, "unexpected delta for an unnumbered span"
                 n, ref, anchor = int(m.group(1)), int(m.group(2)), m.group(4)
                 assert ref < orig.turn, "reference must point to an EARLIER msg"
@@ -65,7 +68,7 @@ def test_verbatim_reread_is_folded_keep_earliest():
     blocks = [_blk(f"cat merge.py\n{span}\ntail", 1), _blk(f"sed run\n{span}\nmore", 5)]
     out, stats = dedup_blocks(blocks)
     assert out[0].text == blocks[0].text  # earliest untouched
-    assert "[↑" in out[1].text  # later occurrence folded
+    assert _FOLD_MARK in out[1].text  # later occurrence folded
     assert stats["spans_folded"] == 1
     _reconstruct(blocks, out)
 
@@ -87,6 +90,55 @@ def test_below_min_lines_not_folded():
     out, stats = dedup_blocks(blocks)
     assert stats["spans_folded"] == 0
     assert out[1].text == blocks[1].text
+
+
+def test_below_min_chars_not_folded():
+    # 3 short lines: over min_lines, under the 120-char floor.
+    span = "\n".join(["ab_cd_ef", "gh_ij_kl", "mn_op_qr"])
+    blocks = [_blk(span, 1), _blk(span, 2)]
+    out, stats = dedup_blocks(blocks)
+    assert stats["spans_folded"] == 0
+    assert out[1].text == blocks[1].text
+
+
+def test_pointer_never_longer_than_the_span_it_replaces():
+    """The net-win guard: a fold that would ADD bytes must not happen.
+
+    With the floors lowered to their old values the pointer for this span is
+    longer than the span itself — the exact shape that used to ship a bigger
+    payload and report the growth as savings.
+    """
+    span = "\n".join(["alpha_one", "beta_two_", "gamma_thr"])  # 29 chars
+    blocks = [_blk(span, 1), _blk(span, 987654)]
+    out, stats = dedup_blocks(blocks, min_lines=3, min_chars=1)
+    assert stats["spans_folded"] == 0
+    assert stats["chars_removed"] == 0
+    assert out[1].text == blocks[1].text
+
+
+def test_reported_savings_are_never_negative():
+    """`chars_removed` is savings, so it must be positive whenever a fold fires."""
+    cases = [
+        ([_blk(_code("", 8), 1), _blk(_code("", 8), 999999)], 3, 1),
+        ([_blk("x\n" + _code("q", 4), 1), _blk("y\n" + _code("q", 4), 2)], 2, 1),
+        ([_blk(_code("", 3), 1), _blk(_code("", 3), 2)], 3, 1),
+    ]
+    for blocks, min_lines, min_chars in cases:
+        out, stats = dedup_blocks(blocks, min_lines=min_lines, min_chars=min_chars)
+        assert stats["chars_removed"] >= 0
+        if stats["spans_folded"]:
+            assert stats["chars_removed"] > 0
+            assert len(out[1].text) < len(blocks[1].text)
+
+
+def test_pointer_has_no_glyph_or_quoting():
+    span = _code("", 8)
+    blocks = [_blk(span, 1), _blk("later:\n" + span, 2)]
+    out, _ = dedup_blocks(blocks)
+    ptr = next(ln for ln in out[1].text.split("\n") if _FOLD_MARK in ln)
+    assert "↑" not in ptr
+    assert "'" not in ptr and '"' not in ptr
+    assert _FOLD_RE.fullmatch(ptr)
 
 
 def test_trivial_repeated_lines_not_folded():
@@ -112,7 +164,7 @@ def test_protected_block_not_rewritten_but_is_reference_target():
     ]
     out, stats = dedup_blocks(blocks)
     assert out[0].text == blocks[0].text
-    assert "[↑" in out[1].text
+    assert _FOLD_MARK in out[1].text
     _reconstruct(blocks, out)
 
 
@@ -154,7 +206,7 @@ def _reconstruct_numbered(orig_blocks, out_blocks):
         rebuilt = []
         for line in out.text.split("\n"):
             m = _FOLD_RE.search(line)
-            if m and line.lstrip().startswith("[↑"):
+            if m and line.lstrip().startswith("["):
                 n, ref = int(m.group(1)), int(m.group(2))
                 delta = int(m.group(3)) if m.group(3) else 0
                 anchor = m.group(4)
@@ -185,7 +237,7 @@ def test_zero_padded_prefix_not_folded_lossily():
     ]
     out, stats = dedup_blocks(blocks)
     assert stats["spans_folded"] == 0
-    assert out[1].text == blocks[1].text and "[↑" not in out[1].text
+    assert out[1].text == blocks[1].text and _FOLD_MARK not in out[1].text
     _reconstruct_numbered(blocks, out)  # trivially exact: nothing folded
 
 
@@ -270,8 +322,8 @@ def test_apply_dedups_reread_and_keeps_prefix_stable():
     # Dedup fired on the later re-read (turn t2), earliest (t1) untouched.
     later = out2[-1]["content"][0]["content"]
     earlier = out2[2]["content"][0]["content"]
-    assert "[↑" in later
-    assert "[↑" not in earlier and span in earlier
+    assert _FOLD_MARK in later
+    assert _FOLD_MARK not in earlier and span in earlier
 
     # CACHE-SAFETY at the router level: appending turn t2 did NOT change any
     # earlier message's emitted bytes → the prompt-cache prefix is stable.
@@ -300,7 +352,7 @@ def test_apply_no_dedup_when_flag_off():
     r = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=False))
     out = r.apply(copy.deepcopy(msgs), _mk_tok()).messages
     joined = "".join(b["content"] for m in out for b in m["content"] if isinstance(b, dict))
-    assert "[↑" not in joined
+    assert _FOLD_MARK not in joined
 
 
 def test_apply_dedup_runs_in_ccr_mode_too():
@@ -325,7 +377,7 @@ def test_apply_dedup_runs_in_ccr_mode_too():
         for b in m["content"]
         if isinstance(b, dict)
     )
-    assert "[↑" in joined  # dedup fired despite lossless=False
+    assert _FOLD_MARK in joined  # dedup fired despite lossless=False
 
 
 # --------------------------------------------------------------------------
@@ -339,7 +391,7 @@ def test_no_fold_when_original_absent_fallback():
     blocks = [_blk("unrelated log\n" + _code("z", 8), 1), _blk(f"sed\n{span}\nmore", 5)]
     out, stats = dedup_blocks(blocks)
     assert stats["spans_folded"] == 0
-    assert out[1].text == blocks[1].text and "[↑" not in out[1].text
+    assert out[1].text == blocks[1].text and _FOLD_MARK not in out[1].text
 
 
 # --------------------------------------------------------------------------
@@ -372,7 +424,7 @@ def test_dedup_folds_user_string_read_observation():
         {"role": "user", "content": span},  # read #2 (duplicate) -> folds
     ]
     out = _dedup_only(msgs)
-    assert "[↑" in out[3]["content"]
+    assert _FOLD_MARK in out[3]["content"]
     assert out[1]["content"] == span
 
 
@@ -386,7 +438,7 @@ def test_dedup_does_not_fold_plain_user_prose():
         {"role": "user", "content": prose},  # duplicate prose -> must NOT fold
     ]
     out = _dedup_only(msgs)
-    assert "[↑" not in out[2]["content"] and out[2]["content"] == prose
+    assert _FOLD_MARK not in out[2]["content"] and out[2]["content"] == prose
 
 
 def test_dedup_folds_role_function_output():
@@ -398,4 +450,4 @@ def test_dedup_folds_role_function_output():
         {"role": "function", "name": "read_file", "content": span},  # dup -> folds
     ]
     out = _dedup_only(msgs)
-    assert "[↑" in out[2]["content"]
+    assert _FOLD_MARK in out[2]["content"]

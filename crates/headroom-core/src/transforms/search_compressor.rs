@@ -102,6 +102,12 @@ fn cjk_bigrams(text: &str) -> BTreeSet<String> {
 }
 use crate::transforms::adaptive_sizer::compute_optimal_k;
 
+/// A file section is rendered `rg --heading` style once it holds at least
+/// this many kept matches, even when `group_by_file` is off: from the
+/// second match on, the flat shape is re-emitting the same path, which on
+/// a large result set is the single largest source of redundant tokens.
+const AUTO_GROUP_MIN_MATCHES: usize = 2;
+
 // ─── Types ──────────────────────────────────────────────────────────────
 
 /// Single search match — a single grep-style hit.
@@ -177,6 +183,12 @@ pub struct SearchCompressorConfig {
     /// sets (a 70-char path repeated 15× is ~250 wasted tokens).
     /// Default `false` (classic `file:line:content`) for parity; the
     /// proxy enables it in token mode.
+    ///
+    /// Note: even when `false`, [`SearchCompressor::format_output`]
+    /// groups any *individual* file whose section would otherwise repeat
+    /// the path (≥2 kept matches, or a trailing "N more matches" line) —
+    /// see `AUTO_GROUP_MIN_MATCHES`. This flag forces grouping for every
+    /// file, including single-match ones.
     pub group_by_file: bool,
 }
 
@@ -571,14 +583,29 @@ impl SearchCompressor {
     ) -> (String, BTreeMap<String, String>) {
         let mut lines: Vec<String> = Vec::new();
         let mut summaries: BTreeMap<String, String> = BTreeMap::new();
-        let grouped = self.config.group_by_file;
+        let force_grouped = self.config.group_by_file;
+        let mut prev_grouped = false;
 
         for (file, fm) in selected {
+            let omitted = original
+                .get(file)
+                .map(|orig| orig.matches.len().saturating_sub(fm.matches.len()))
+                .unwrap_or(0);
+            // Auto-group whenever the flat shape would print the path more
+            // than once: ≥2 kept matches, or 1 kept match plus an
+            // "N more matches in <path>" line. A lone match with no
+            // omissions stays flat — grouping it would cost a heading and
+            // a blank line to save nothing.
+            let grouped =
+                force_grouped || fm.matches.len() >= AUTO_GROUP_MIN_MATCHES || omitted > 0;
+
+            // Blank line around every grouped block so a bare heading is
+            // never mistaken for a content row of the block above it.
+            if !lines.is_empty() && (grouped || prev_grouped) {
+                lines.push(String::new());
+            }
             if grouped {
                 // `rg --heading` style: path once, then line:content rows.
-                if !lines.is_empty() {
-                    lines.push(String::new());
-                }
                 lines.push(file.clone());
                 for m in &fm.matches {
                     lines.push(format!("{}:{}", m.line_number, m.content));
@@ -588,17 +615,15 @@ impl SearchCompressor {
                     lines.push(format!("{}:{}:{}", m.file, m.line_number, m.content));
                 }
             }
-            if let Some(orig_fm) = original.get(file) {
-                if orig_fm.matches.len() > fm.matches.len() {
-                    let omitted = orig_fm.matches.len() - fm.matches.len();
-                    let summary = if grouped {
-                        format!("[... and {} more matches]", omitted)
-                    } else {
-                        format!("[... and {} more matches in {}]", omitted, file)
-                    };
-                    lines.push(summary.clone());
-                    summaries.insert(file.clone(), summary);
-                }
+            prev_grouped = grouped;
+            if omitted > 0 {
+                let summary = if grouped {
+                    format!("[... and {} more matches]", omitted)
+                } else {
+                    format!("[... and {} more matches in {}]", omitted, file)
+                };
+                lines.push(summary.clone());
+                summaries.insert(file.clone(), summary);
             }
         }
 

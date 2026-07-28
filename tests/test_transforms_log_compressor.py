@@ -113,7 +113,18 @@ def test_select_dedupe_add_context_and_format_output(monkeypatch: pytest.MonkeyP
         "total": 9,
         "selected": 6,
     }
-    assert output.endswith("[3 lines omitted: 1 ERROR, 1 FAIL, 2 WARN, 1 INFO]")
+    # The footer counts what was OMITTED, not the whole log. Every ERROR,
+    # FAIL and WARN here is present in the output above, so no level is named
+    # (and INFO is never named — nobody retrieves a log for its INFO lines).
+    assert output.endswith("[3 lines omitted]")
+
+    # A level with lines left over IS named, and only by the leftover count.
+    dropped_errors = [
+        LogLine(0, f"ERROR e{i}", level=LogLevel.ERROR, score=1.0) for i in range(5)
+    ]
+    assert compressor._omission_summary(dropped_errors[:2], dropped_errors) == (
+        "3 lines omitted: 3 ERROR"
+    )
 
 
 def test_log_compressor_compress_and_ccr_paths() -> None:

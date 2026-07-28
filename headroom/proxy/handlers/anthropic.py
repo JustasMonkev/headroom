@@ -1245,6 +1245,14 @@ class AnthropicHandlerMixin:
                         compressor.close()
 
             _compression_failed = False
+            # CCR hashes minted by the pipeline's pre-processing passes
+            # (read-lifecycle, tool-input compaction). These markers live INSIDE
+            # tool_use inputs / tool_calls arguments, which `scan_for_markers`
+            # does not read — so without threading them into the injection
+            # decision below the very first compaction in a session would strand
+            # its own marker (no `headroom_retrieve` tool injected). See the
+            # CCR-injection block further down.
+            pipeline_ccr_hashes: list[str] = []
             original_messages = messages  # Preserve for 400-retry fallback
             _decision = CompressionDecision.decide(
                 headers=request.headers,
@@ -1587,6 +1595,12 @@ class AnthropicHandlerMixin:
                             optimized_messages = messages
                             optimized_tokens = original_tokens
 
+                    if result is not None:
+                        pipeline_ccr_hashes = [
+                            h
+                            for h in (getattr(result, "markers_inserted", None) or [])
+                            if isinstance(h, str) and h
+                        ]
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
                 except Exception as e:
@@ -1858,6 +1872,21 @@ class AnthropicHandlerMixin:
                     inject_system_instructions=inject_system_instructions,
                 )
                 injector.scan_for_markers(optimized_messages)
+                # `scan_for_markers` reads message TEXT and tool-result content
+                # only. The tool-input compaction pass (F3) writes its marker
+                # into `tool_use.input` / `tool_calls[].function.arguments`,
+                # which the scanner never visits — so on the first compaction of
+                # a session `detected_hashes` is empty, the sticky injection is
+                # skipped, and the stored original is unreachable. Merge the
+                # hashes the pipeline reported minting so the decision below
+                # sees them.
+                from headroom.transforms.tool_input_compactor import (
+                    merge_pipeline_ccr_hashes,
+                )
+
+                _detected_hashes = merge_pipeline_ccr_hashes(
+                    injector.detected_hashes, pipeline_ccr_hashes
+                )
                 if inject_system_instructions and injector.has_compressed_content:
                     optimized_messages = injector.inject_into_system_message(optimized_messages)
 
@@ -1886,7 +1915,7 @@ class AnthropicHandlerMixin:
                 # frozen turn and bust the *tools* cache segment, undoing the
                 # overlay's messages-prefix cache-safety.
                 has_new_compressed_content = has_new_ccr_markers(
-                    current_detected_hashes=injector.detected_hashes,
+                    current_detected_hashes=_detected_hashes,
                     previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
                     provider="anthropic",
                 )
@@ -1917,7 +1946,7 @@ class AnthropicHandlerMixin:
                         logger.debug(
                             f"[{request_id}] CCR: tool registered (session={session_id}, "
                             f"compressed_this_turn={injector.has_compressed_content}, "
-                            f"hashes_seen={len(injector.detected_hashes)})"
+                            f"hashes_seen={len(_detected_hashes)})"
                         )
 
                 # CCR workspace scoping: resolve a stable project identity
@@ -2366,6 +2395,73 @@ class AnthropicHandlerMixin:
                     "[%s] system prompt compaction FAILED: %s", request_id, _sys_compaction_exc
                 )
 
+            # F2: prior-turn thinking compaction (HEADROOM_THINKING_COMPACT,
+            # off by default). On Claude 4.6+ / 5.x prior-turn `thinking` blocks
+            # are re-sent AND re-billed as input (~688 tok/block on sonnet-4-6,
+            # ~995 on opus-4-6). Editing a thinking block in place is futile —
+            # Anthropic re-expands it from the signature — so the only way to
+            # shrink it is to convert it to a signature-free `text` block
+            # carrying a Kompressed summary. Deterministic per content, so the
+            # forwarded prefix stays cache-stable; `keep_last_turns=1` preserves
+            # the active reasoning the model is still using.
+            #
+            # DOUBLE-GATED, deliberately:
+            #   * `bills_prior_thinking(model)` — on pre-4.6 models the provider
+            #     strips thinking server-side, so compaction would turn FREE
+            #     tokens into billed text. This gate establishes that compaction
+            #     *could* pay.
+            #   * `HEADROOM_THINKING_COMPACT` — the transform is LOSSY (signed
+            #     reasoning becomes a generated summary). The billing predicate
+            #     is not user consent to that, so the module's documented opt-in
+            #     stays required. Never silently on.
+            if os.environ.get("HEADROOM_THINKING_COMPACT", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                try:
+                    from headroom.transforms.compression_units import find_content_router
+                    from headroom.transforms.thinking_compactor import (
+                        bills_prior_thinking,
+                        compact_thinking_to_text,
+                    )
+
+                    if bills_prior_thinking(str(model)):
+                        _tc_router = find_content_router(self.anthropic_pipeline)
+                        _tc_kompress = (
+                            (_tc_router._get_remote_kompress() or _tc_router._get_kompress())
+                            if _tc_router is not None
+                            else None
+                        )
+                        if _tc_kompress is not None:
+                            _tc_keep = int(
+                                os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1")
+                            )
+                            optimized_messages, _tc_stats = compact_thinking_to_text(
+                                optimized_messages,
+                                kompress=_tc_kompress,
+                                keep_last_turns=_tc_keep,
+                            )
+                            body["messages"] = optimized_messages
+                            if _tc_stats["turns_compacted"]:
+                                transforms_applied.append(
+                                    f"anthropic:thinking_compact:{_tc_stats['turns_compacted']}"
+                                )
+                                optimized_tokens = tokenizer.count_messages(body["messages"])
+                                tokens_saved = max(0, original_tokens - optimized_tokens)
+                                logger.info(
+                                    "[%s] thinking compaction: %d turns, %d blocks, "
+                                    "%d->%d words",
+                                    request_id,
+                                    _tc_stats["turns_compacted"],
+                                    _tc_stats["blocks"],
+                                    _tc_stats["words_before"],
+                                    _tc_stats["words_after"],
+                                )
+                except Exception as _tc_exc:  # never break the request on compaction
+                    logger.warning("[%s] thinking compaction skipped: %s", request_id, _tc_exc)
+
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
                 operation="proxy.request",
@@ -2395,7 +2491,8 @@ class AnthropicHandlerMixin:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
-            # Server-side Tool Search (opt-in HEADROOM_TOOL_SEARCH): defer the
+            # Server-side Tool Search (F1: DEFAULT-ON / `auto`, opt out with
+            # HEADROOM_TOOL_SEARCH=0): defer the
             # non-core tool schemas behind a tool_search tool so Anthropic excludes
             # them from the context window — they stop counting as input tokens until
             # the model searches for one — while every tool stays callable.
@@ -2411,11 +2508,18 @@ class AnthropicHandlerMixin:
             # (``anthropic_backend``) and Vertex/gateway providers gate tool search
             # differently, so scope the injection to provider "anthropic" over the
             # direct API and leave those paths untouched.
+            #
+            # F1: this is now default-on. `anthropic_tool_search_enabled` resolves
+            # HEADROOM_TOOL_SEARCH (unset/`auto` = on for models >= Claude 4.5,
+            # `0`/`off` = explicit opt-out, `1`/`on` = force on regardless of the
+            # version gate) and `inject_tool_search_deferral` still no-ops for
+            # <12 tools and for clients that already ship a tool_search tool.
+            from headroom.proxy.helpers import anthropic_tool_search_enabled
+
             if (
                 provider_name == "anthropic"
                 and getattr(self, "anthropic_backend", None) is None
-                and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
-                in ("1", "true", "yes", "on", "auto")
+                and anthropic_tool_search_enabled(model)
             ):
                 from headroom.proxy.helpers import inject_tool_search_deferral
 

@@ -16,8 +16,11 @@ from headroom.transforms.tool_input_compactor import (
     ToolInputCompactor,
 )
 
-LARGE_ARGS = json.dumps({"file_path": "/tmp/x.py", "content": "x" * 2000})
-SMALL_ARGS = json.dumps({"file_path": "/tmp/x.py"})
+# Read-only (reproducible) arguments — the only kind that may be compacted.
+LARGE_ARGS = json.dumps({"pattern": "def handler", "path": "/repo", "glob": "y" * 2000})
+SMALL_ARGS = json.dumps({"pattern": "def handler"})
+# A mutating call: its arguments are the sole exact record of the change.
+MUTATING_ARGS = json.dumps({"file_path": "/tmp/x.py", "content": "x" * 2000})
 
 
 class _FakeStore:
@@ -45,7 +48,7 @@ def _openai_conversation() -> list[dict[str, Any]]:
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "Write", "arguments": LARGE_ARGS},
+                    "function": {"name": "Grep", "arguments": LARGE_ARGS},
                 }
             ],
         },
@@ -63,8 +66,8 @@ def _anthropic_conversation() -> list[dict[str, Any]]:
                 {
                     "type": "tool_use",
                     "id": "toolu_1",
-                    "name": "Write",
-                    "input": {"file_path": "/tmp/x.py", "content": "y" * 2000},
+                    "name": "Grep",
+                    "input": {"pattern": "def handler", "path": "/repo", "glob": "y" * 2000},
                 }
             ],
         },
@@ -83,12 +86,12 @@ def test_openai_completed_call_is_compacted():
 
     compacted = result.messages[1]["tool_calls"][0]
     assert compacted["id"] == "call_1"
-    assert compacted["function"]["name"] == "Write"
+    assert compacted["function"]["name"] == "Grep"
     args = json.loads(compacted["function"]["arguments"])
     assert set(args) == {CCR_INPUT_KEY}
     assert "Retrieve original: hash=" in args[CCR_INPUT_KEY]
     assert result.compacted_count == 1
-    assert result.transforms_applied == ["tool_input_compaction:Write"]
+    assert result.transforms_applied == ["tool_input_compaction:Grep"]
     assert len(result.ccr_hashes) == 1
     # Original bytes are retrievable from the store.
     assert store.stored[0]["original"] == LARGE_ARGS
@@ -106,12 +109,12 @@ def test_anthropic_completed_call_is_compacted():
     block = result.messages[1]["content"][0]
     assert block["type"] == "tool_use"
     assert block["id"] == "toolu_1"
-    assert block["name"] == "Write"
+    assert block["name"] == "Grep"
     assert set(block["input"]) == {CCR_INPUT_KEY}
     assert "Retrieve original: hash=" in block["input"][CCR_INPUT_KEY]
     assert result.compacted_count == 1
     # Original serialized input is retrievable.
-    assert json.loads(store.stored[0]["original"])["file_path"] == "/tmp/x.py"
+    assert json.loads(store.stored[0]["original"])["pattern"] == "def handler"
 
 
 def test_pending_call_is_never_compacted():
@@ -167,18 +170,37 @@ def test_idempotent_on_already_compacted_input():
     assert anthropic_second.compacted_count == 0
 
 
-def test_store_failure_does_not_break_compaction():
+def test_store_failure_leaves_arguments_intact():
+    """Codex P1: a failed store must NOT be replaced by an unredeemable marker."""
+
     class _BrokenStore:
         def store(self, **kwargs: Any) -> str:
             raise RuntimeError("boom")
 
-    result = ToolInputCompactor(_cfg(), compression_store=_BrokenStore()).apply(
+    messages = _openai_conversation()
+    result = ToolInputCompactor(_cfg(), compression_store=_BrokenStore()).apply(messages)
+    assert result.compacted_count == 0
+    assert result.messages is messages
+    assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == LARGE_ARGS
+
+
+def test_missing_store_leaves_arguments_intact():
+    """No store at all == no persistence == no compaction."""
+    messages = _openai_conversation()
+    result = ToolInputCompactor(_cfg(), compression_store=None).apply(messages)
+    assert result.compacted_count == 0
+    assert result.messages is messages
+
+
+def test_store_returning_empty_hash_leaves_arguments_intact():
+    class _EmptyHashStore:
+        def store(self, **kwargs: Any) -> str:
+            return ""
+
+    result = ToolInputCompactor(_cfg(), compression_store=_EmptyHashStore()).apply(
         _openai_conversation()
     )
-    # Marker still emitted with the locally computed hash.
-    assert result.compacted_count == 1
-    args = json.loads(result.messages[1]["tool_calls"][0]["function"]["arguments"])
-    assert "Retrieve original: hash=" in args[CCR_INPUT_KEY]
+    assert result.compacted_count == 0
 
 
 def test_result_before_call_does_not_count_as_completed():
@@ -192,9 +214,118 @@ def test_result_before_call_does_not_count_as_completed():
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "Write", "arguments": LARGE_ARGS},
+                    "function": {"name": "Grep", "arguments": LARGE_ARGS},
                 }
             ],
+        },
+        {"role": "assistant", "content": "done"},
+    ]
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(messages)
+    assert result.compacted_count == 0
+
+
+# ---------------------------------------------------------------------------
+# THE RULE: only reproducible / read-only inputs are compacted (Codex P1).
+# A mutating call's result is a bare acknowledgement, so its arguments are the
+# sole exact record of the change — and CCR entries expire (default 1,800s).
+# ---------------------------------------------------------------------------
+
+
+def _openai_call(name: str, args: str) -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": name, "arguments": args}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+def test_write_tool_input_is_never_compacted():
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Write", MUTATING_ARGS)
+    )
+    assert result.compacted_count == 0
+
+
+def test_apply_patch_input_is_never_compacted():
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("apply_patch", json.dumps({"patch": "@@\n+" + "a" * 2000}))
+    )
+    assert result.compacted_count == 0
+
+
+def test_mcp_prefixed_write_tool_is_never_compacted():
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("mcp__fs__write_file", MUTATING_ARGS)
+    )
+    assert result.compacted_count == 0
+
+
+def test_sql_mutation_input_is_never_compacted():
+    sql = "INSERT INTO users (id, name) VALUES " + ",".join(f"({i},'n{i}')" for i in range(200))
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("run_query", json.dumps({"sql": sql}))
+    )
+    assert result.compacted_count == 0
+
+
+def test_select_query_input_is_still_compacted():
+    sql = "SELECT id, name FROM users WHERE name IN (" + ",".join(
+        f"'n{i}'" for i in range(300)
+    ) + ")"
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("run_query", json.dumps({"sql": sql}))
+    )
+    assert result.compacted_count == 1
+
+
+def test_shell_heredoc_input_is_never_compacted():
+    cmd = "cat <<'EOF' > /tmp/config.yaml\n" + ("key: value\n" * 200) + "EOF"
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Bash", json.dumps({"command": cmd}))
+    )
+    assert result.compacted_count == 0
+
+
+def test_shell_redirection_input_is_never_compacted():
+    cmd = "printf '%s' '" + "x" * 2000 + "' > /tmp/out.txt"
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Bash", json.dumps({"command": cmd}))
+    )
+    assert result.compacted_count == 0
+
+
+def test_read_only_shell_input_is_still_compacted():
+    cmd = "rg -n 'def handler' " + " ".join(f"pkg{i}" for i in range(300))
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Bash", json.dumps({"command": cmd}))
+    )
+    assert result.compacted_count == 1
+
+
+def test_anthropic_mutating_block_is_never_compacted():
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Write",
+                    "input": {"file_path": "/tmp/x.py", "content": "y" * 2000},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}],
         },
         {"role": "assistant", "content": "done"},
     ]
