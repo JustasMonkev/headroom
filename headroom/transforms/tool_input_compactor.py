@@ -103,6 +103,25 @@ MUTATING_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Cost discipline. ``is_mutating_tool_input`` runs on EVERY completed tool call
+# of EVERY request, over the full serialized arguments (tens of KB is normal,
+# and the arguments are attacker-influenced). Two rules keep it cheap:
+#
+# 1. Every content check is guarded by a plain-substring precondition. Python's
+#    ``str.__contains__`` is a C-speed two-way search; a Python ``re`` pass over
+#    the same bytes is ~50x slower. If a required literal is absent, the shape
+#    provably cannot match and the regex never runs.
+# 2. No pattern may contain an unbounded gap between two literals. The original
+#    in-place-edit alternative ``\bsed\b[^|;&]*\s-i\b`` was quadratic in the
+#    tail — every ``sed`` occurrence scanned to end-of-string and backtracked —
+#    measured at multiple seconds on a 64 KB ``sed``-dense blob. It is now a
+#    linear segment scan (``_has_inplace_edit``).
+#
+# The detection SET is unchanged: each helper below matches exactly what its
+# predecessor alternative matched.
+# ---------------------------------------------------------------------------
+
 #: SQL statements that change data or schema. Matched anywhere in the
 #: serialized arguments (a query string may be nested arbitrarily).
 _SQL_MUTATION_RE = re.compile(
@@ -116,25 +135,124 @@ _SQL_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Leading verbs of every ``_SQL_MUTATION_RE`` alternative. The regex is
+#: case-insensitive, so the prescreen tests a lowercased copy.
+_SQL_MUTATION_VERBS: tuple[str, ...] = (
+    "insert",
+    "update",
+    "delete",
+    "merge",
+    "replace",
+    "drop",
+    "alter",
+    "truncate",
+    "create",
+    "grant",
+    "revoke",
+)
+
 #: Shell heredoc (``cat <<'EOF' > file``) — the body IS the written content.
 #: The arguments are JSON-serialized, so a real newline appears as the two
 #: characters ``\`` ``n``; accept both forms.
 _HEREDOC_RE = re.compile(r"<<-?\s*[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?\s*(?:\\n|\n|\\\\n)")
 
-#: Shell write-redirection / in-place edit / destructive file ops.
-#: The redirection alternative excludes arrows/comparisons (``->``, ``=>``,
-#: ``>=``, ``>>=``) so an ordinary search pattern like ``def f() -> int`` is not
-#: mistaken for a write.
-_SHELL_MUTATION_RE = re.compile(
-    r"(?:(?<![-=<>])>>?(?![=>])\s*[\w./~$-]*[\w/])"  # `> path` / `>> path`
-    r"|(?:\btee\b)"
-    r"|(?:\bsed\b[^|;&]*\s-i\b)"
-    r"|(?:\bperl\b[^|;&]*\s-i\b)"
-    r"|(?:\b(?:rm|mv|cp|mkdir|rmdir|chmod|chown|ln|truncate|dd)\s)"
-    r"|(?:\bgit\s+(?:commit|apply|checkout|reset|push|rebase|merge|am|revert|clean)\b)"
-    r"|(?:\b(?:npm|pnpm|yarn|pip|uv|cargo|apt|apt-get|brew)\s+(?:install|add|remove|"
-    r"uninstall|publish)\b)",
+#: Write-redirection body, matched ANCHORED at a candidate ``>``. The caller
+#: (:func:`_has_write_redirect`) supplies the ``(?<![-=<>])`` guard by checking
+#: the preceding character, so arrows/comparisons (``->``, ``=>``, ``>=``,
+#: ``>>=``) still never look like a write and an ordinary search pattern such
+#: as ``def f() -> int`` stays compactable.
+_REDIRECT_AT_RE = re.compile(r">>?(?![=>])\s*[\w./~$-]*[\w/]")
+
+#: ``sed``/``perl`` in-place editing, split into two anchors so the gap between
+#: them is bounded by one shell segment instead of the whole input.
+_INPLACE_TOOL_RE = re.compile(r"\b(?:sed|perl)\b")
+_INPLACE_FLAG_RE = re.compile(r"\s-i\b")
+#: Shell command separators. ``[^|;&]*`` in the original pattern meant "same
+#: segment"; splitting on the same three characters preserves that exactly.
+_SHELL_SEGMENT_RE = re.compile(r"[|;&]")
+
+#: Word-anchored destructive commands. Each entry is
+#: ``(required-substrings, pattern)``: the pattern can only match if at least
+#: one of its literals is present, so the cheap membership test gates it.
+_TEE_RE = re.compile(r"\btee\b")
+_FILEOP_RE = re.compile(r"\b(?:rm|mv|cp|mkdir|rmdir|chmod|chown|ln|truncate|dd)\s")
+_GIT_MUTATION_RE = re.compile(
+    r"\bgit\s+(?:commit|apply|checkout|reset|push|rebase|merge|am|revert|clean)\b"
 )
+_PKG_MUTATION_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn|pip|uv|cargo|apt|apt-get|brew)\s+(?:install|add|remove|"
+    r"uninstall|publish)\b"
+)
+
+_WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
+    (("tee",), _TEE_RE),
+    (
+        ("rm", "mv", "cp", "mkdir", "rmdir", "chmod", "chown", "ln", "truncate", "dd"),
+        _FILEOP_RE,
+    ),
+    (("git",), _GIT_MUTATION_RE),
+    (("npm", "pnpm", "yarn", "pip", "uv", "cargo", "apt", "brew"), _PKG_MUTATION_RE),
+)
+
+
+def _has_write_redirect(text: str) -> bool:
+    """``> path`` / ``>> path`` write redirection.
+
+    Walks the (rare) ``>`` positions with ``str.find`` instead of letting the
+    regex engine try a lookbehind at every character. Equivalent to the former
+    ``(?<![-=<>])>>?(?![=>])\\s*[\\w./~$-]*[\\w/]`` alternative: the manual
+    predecessor check is the lookbehind.
+    """
+    pos = text.find(">")
+    while pos != -1:
+        if pos == 0 or text[pos - 1] not in "-=<>":
+            if _REDIRECT_AT_RE.match(text, pos):
+                return True
+        pos = text.find(">", pos + 1)
+    return False
+
+
+def _has_inplace_edit(text: str) -> bool:
+    """``sed … -i`` / ``perl … -i`` within a single shell command segment.
+
+    Linear: one split on ``[|;&]``, then at most two bounded scans per segment.
+    The former ``\\bsed\\b[^|;&]*\\s-i\\b`` form re-scanned the whole tail from
+    every ``sed`` occurrence (quadratic, seconds on a 64 KB blob).
+    """
+    if "-i" not in text:
+        return False
+    if "sed" not in text and "perl" not in text:
+        return False
+    for segment in _SHELL_SEGMENT_RE.split(text):
+        tool = _INPLACE_TOOL_RE.search(segment)
+        # The FIRST sed/perl in the segment is the most permissive anchor: any
+        # `-i` reachable from a later occurrence is reachable from this one.
+        if tool is not None and _INPLACE_FLAG_RE.search(segment, tool.end()):
+            return True
+    return False
+
+
+def _has_shell_mutation(text: str) -> bool:
+    """Shell write-redirection / in-place edit / destructive file ops."""
+    if ">" in text and _has_write_redirect(text):
+        return True
+    if _has_inplace_edit(text):
+        return True
+    for literals, pattern in _WORD_MUTATION_PROBES:
+        for literal in literals:
+            if literal in text:
+                if pattern.search(text):
+                    return True
+                break
+    return False
+
+
+def _has_sql_mutation(text: str) -> bool:
+    """SQL DML/DDL anywhere in the serialized arguments."""
+    lowered = text.lower()
+    if not any(verb in lowered for verb in _SQL_MUTATION_VERBS):
+        return False
+    return bool(_SQL_MUTATION_RE.search(text))
 
 
 #: Verb prefixes that mark an arbitrary (e.g. MCP) tool as mutating. A fixed
@@ -197,11 +315,53 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
         return True
     if leaf.startswith(_MUTATING_NAME_PREFIXES):
         return True
-    if _SQL_MUTATION_RE.search(serialized_args):
+    # Content checks are ordered cheapest-guard-first; each is substring-gated
+    # so the regex engine only ever sees inputs that could actually match.
+    if _has_sql_mutation(serialized_args):
         return True
-    if _HEREDOC_RE.search(serialized_args):
+    if "<<" in serialized_args and _HEREDOC_RE.search(serialized_args):
         return True
-    return bool(_SHELL_MUTATION_RE.search(serialized_args))
+    return _has_shell_mutation(serialized_args)
+
+
+#: A retrievable CCR hash: 12-24 lowercase hex characters. This is the exact
+#: shape every pattern in ``CCRToolInjector._marker_patterns`` captures — see
+#: ``ccr/tool_injection.py``. Anything else in ``markers_inserted`` is
+#: provenance metadata, not a redeemable handle. Case-insensitive because the
+#: scanner's generic bracket pattern is ``re.IGNORECASE`` and can therefore
+#: capture an upper-case hex hash; dropping those would weaken the fix this
+#: filter protects.
+_CCR_HASH_RE = re.compile(r"\A[a-fA-F0-9]{12,24}\Z")
+
+
+def ccr_hashes_from_markers(markers: Any) -> list[str]:
+    """The redeemable CCR hashes among a ``TransformResult.markers_inserted``.
+
+    ``markers_inserted`` is a mixed bag: this pass and read-lifecycle put
+    redeemable CCR hashes in it, but SmartCrusher appends
+    ``<headroom:tool_digest sha256="…">`` provenance strings and CacheAligner
+    appends ``stable_prefix_hash:…``. Only the hash-shaped entries may reach
+    the injection decision.
+
+    Why the filter is load-bearing (#1850): the merged list feeds
+    ``has_new_ccr_markers``, which asks "is any of these absent from the
+    previously-forwarded messages?" by re-scanning those messages with
+    ``CCRToolInjector.scan_for_markers``. That scanner can only ever return
+    hash-shaped strings, so a non-hash entry is *unconditionally* "new" — and
+    on a byte-identical replayed prefix it would re-inject ``headroom_retrieve``
+    every frozen turn, busting the tools cache segment the frozen prefix exists
+    to protect. Filtering here, at the point markers are contributed, keeps a
+    future emitter from reintroducing that.
+    """
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for marker in markers or ():
+        if not isinstance(marker, str) or marker in seen:
+            continue
+        if _CCR_HASH_RE.match(marker):
+            seen.add(marker)
+            hashes.append(marker)
+    return hashes
 
 
 def merge_pipeline_ccr_hashes(
@@ -219,6 +379,12 @@ def merge_pipeline_ccr_hashes(
     the pipeline reported minting (``TransformResult.markers_inserted``) into
     the injection decision.
 
+    Both sides are shape-filtered to real CCR hashes — see
+    :func:`ccr_hashes_from_markers` for why anything else would re-inject the
+    retrieval tool on every frozen turn. ``detected_hashes`` is already
+    hash-shaped by construction; filtering it too costs nothing and makes the
+    invariant hold at the choke point rather than only at the callers.
+
     Order-stable and de-duplicated: the merged list feeds
     ``has_new_ccr_markers``, whose result drives cache-affecting tool
     injection, so a stable order keeps that decision reproducible.
@@ -226,8 +392,8 @@ def merge_pipeline_ccr_hashes(
     merged: list[str] = []
     seen: set[str] = set()
     for source in (detected_hashes or (), pipeline_ccr_hashes or ()):
-        for h in source:
-            if isinstance(h, str) and h and h not in seen:
+        for h in ccr_hashes_from_markers(source):
+            if h not in seen:
                 seen.add(h)
                 merged.append(h)
     return merged

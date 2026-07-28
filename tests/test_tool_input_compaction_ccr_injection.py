@@ -23,6 +23,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.transforms.tool_input_compactor import (
     CCR_INPUT_KEY,
+    ccr_hashes_from_markers,
     merge_pipeline_ccr_hashes,
 )
 
@@ -162,6 +163,114 @@ def test_without_the_merge_the_tool_is_not_injected() -> None:
 
 
 def test_merge_is_order_stable_and_deduplicated() -> None:
-    assert merge_pipeline_ccr_hashes(["a", "b"], ["b", "c"]) == ["a", "b", "c"]
+    a, b, c, d = (
+        "aaaaaaaaaaaa",
+        "bbbbbbbbbbbb",
+        "cccccccccccc",
+        "dddddddddddd",
+    )
+    assert merge_pipeline_ccr_hashes([a, b], [b, c]) == [a, b, c]
     assert merge_pipeline_ccr_hashes(None, None) == []
-    assert merge_pipeline_ccr_hashes(["a"], [None, "", "a", "d"]) == ["a", "d"]
+    assert merge_pipeline_ccr_hashes([a], [None, "", a, d]) == [a, d]
+
+
+# ---------------------------------------------------------------------------
+# #1850 regression: only REDEEMABLE hashes may drive the injection decision.
+#
+# `markers_inserted` is a mixed bag. SmartCrusher appends
+# `<headroom:tool_digest sha256="…">` provenance strings that
+# `CCRToolInjector.scan_for_markers` can never return, so an unfiltered merge
+# made every such entry unconditionally "new" — re-injecting `headroom_retrieve`
+# on a byte-identical replayed prefix and busting the tools cache segment the
+# frozen prefix exists to protect.
+# ---------------------------------------------------------------------------
+
+
+def test_non_hash_markers_are_not_treated_as_ccr_hashes() -> None:
+    from headroom.utils import create_tool_digest_marker
+
+    digest = create_tool_digest_marker("0123456789ab")
+    assert ccr_hashes_from_markers([digest]) == []
+    assert ccr_hashes_from_markers(["stable_prefix_hash:0123456789abcdef"]) == []
+    assert ccr_hashes_from_markers([HASH, digest, None, 7, HASH]) == [HASH]
+    # SmartCrusher's 12-hex short hashes and the 24-hex form both survive.
+    assert ccr_hashes_from_markers(["0123456789ab"]) == ["0123456789ab"]
+    # The scanner's generic bracket pattern is IGNORECASE, so upper-case hex
+    # hashes are reachable and must not be filtered out.
+    assert ccr_hashes_from_markers(["ABC123DEF456ABC123DEF456"]) == ["ABC123DEF456ABC123DEF456"]
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_replayed_identical_prefix_does_not_reinject_the_retrieve_tool(provider: str) -> None:
+    """A byte-identical frozen prefix must NOT look like it carries new markers.
+
+    SmartCrusher crushed something earlier in the session, so `markers_inserted`
+    carries a `tool_digest` provenance string every turn. The forwarded bytes are
+    unchanged, so nothing new is redeemable and the tools cache segment must
+    stay intact.
+    """
+    from headroom.utils import create_tool_digest_marker
+
+    messages = _anthropic_messages() if provider == "anthropic" else _openai_messages()
+    # What the pipeline reports this turn: provenance only, no new CCR hash.
+    markers_inserted = [create_tool_digest_marker("0123456789ab"), "stable_prefix_hash:deadbeef"]
+
+    injector = CCRToolInjector(
+        provider=provider, inject_tool=False, inject_system_instructions=False
+    )
+    injector.scan_for_markers(messages)
+    detected = merge_pipeline_ccr_hashes(injector.detected_hashes, markers_inserted)
+    assert detected == []
+
+    has_new = has_new_ccr_markers(
+        current_detected_hashes=detected,
+        previous_forwarded_messages=messages,
+        provider=provider,  # type: ignore[arg-type]
+    )
+    assert has_new is False
+
+    should_inject, is_override = should_inject_ccr_tool(
+        configured_inject_tool=True,
+        frozen_message_count=len(messages),
+        has_compressed_content=has_new,
+    )
+    assert should_inject is False
+    assert is_override is False
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_a_genuine_tool_input_marker_still_reinjects_on_a_replayed_prefix(provider: str) -> None:
+    """The point of the original fix: a real minted hash still forces injection.
+
+    Same replayed prefix as above, but this turn the tool-input compactor minted
+    a real CCR hash that lives only inside `tool_use.input` — invisible to the
+    scanner on BOTH the current and the previous messages. It must still count
+    as new, or the agent holds a marker it cannot redeem.
+    """
+    from headroom.utils import create_tool_digest_marker
+
+    messages = _anthropic_messages() if provider == "anthropic" else _openai_messages()
+    fresh = "f00dcafef00dcafef00dcafe"
+    markers_inserted = [create_tool_digest_marker("0123456789ab"), fresh]
+
+    injector = CCRToolInjector(
+        provider=provider, inject_tool=False, inject_system_instructions=False
+    )
+    injector.scan_for_markers(messages)
+    detected = merge_pipeline_ccr_hashes(injector.detected_hashes, markers_inserted)
+    assert detected == [fresh]
+
+    has_new = has_new_ccr_markers(
+        current_detected_hashes=detected,
+        previous_forwarded_messages=messages,
+        provider=provider,  # type: ignore[arg-type]
+    )
+    assert has_new is True
+
+    should_inject, is_override = should_inject_ccr_tool(
+        configured_inject_tool=True,
+        frozen_message_count=len(messages),
+        has_compressed_content=has_new,
+    )
+    assert should_inject is True
+    assert is_override is True

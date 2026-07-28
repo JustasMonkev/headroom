@@ -114,6 +114,8 @@ Zero consumers — every compressor hardcodes its own f-string, which is *why* t
 
 Default mode re-emits the path per match (×5/file) plus once more in the footer — ~1,000 tokens of pure redundancy in a large Grep result at default caps. The grouped `--heading` mode exists but is only enabled in token mode (`proxy/server.py:899`). **Flip the default**, or auto-group when a file has ≥2 matches.
 
+> **Outcome:** auto-group at ≥2 shipped and is confirmed correct — grouping trades N−1 path repetitions for one heading, so it is already ahead at N=2 and never behind. `o200k_base`: 20 files × 2 matches 500 → 380, one file × 2 matches 16 → 12, 40 files × 1 match unchanged (correctly no-ops). A floor of 3 buys nothing. The headline "324 → 204 (−37%)" was overstated; the real range is −18% to −29%, 0% when every file has a single match.
+
 ### C2. Log compressor: double annotation, no error dedup, over-eager context
 `headroom/transforms/log_compressor.py` (+ Rust mirror)
 
@@ -121,6 +123,8 @@ Default mode re-emits the path per match (×5/file) plus once more in the footer
 - **Misleading counts** (`:474-486`): the level breakdown counts *all* lines, not omitted ones — `[300 lines omitted: 12 ERROR ...]` advertises errors still present above. Subtract selected counts; drop the never-actionable INFO term.
 - **No dedup on errors/fails** (`:374-384`): `_dedupe_similar` applies only to warnings; the same assertion across N parametrized tests is kept verbatim up to `max_errors=10`. **But don't extend `_dedupe_similar` wholesale** — its similarity normalization would collapse failures that differ only in IDs, values, or paths into one `×N` entry, hiding *which* inputs failed. Use **byte-identical** dedup for errors/fails (first occurrence + `×N`), or keep each distinct normalized suffix. Stack traces are safer: hash the exact frame list and emit `[same trace ×3]` only for byte-identical traces.
 - **Context expansion around everything** (`:445-459`): `error_context_lines` expands ±3 around errors *and* warnings, summaries, and stack-trace lines. pytest's `====` banners all match `summary_patterns`, dragging in up to 120 low-value neighbors against the `max_total_lines=100` budget. Restrict to ERROR/FAIL lines; make the window asymmetric (1 before, 2 after).
+
+> **Outcome:** shipped, but it cost accuracy until paired with a second change. The narrowed window dropped the assertion text on pytest runs (load-bearing signals 2/4 → 1/4), because the level classifier never matches `AssertionError:` (no word boundary inside the name) or `E   assert 4 == 5`, so those lines were surviving only as context. Failure detail is now *selected on its own merit* (`is_failure_detail`), and `^_{3,}` was added to the summary patterns so pytest's `____ test_name ____` header still attributes it. Signals 3/4, tokens 303 (merge-base) → 197 — a smaller win than the 109 the bare narrowing produced, and the right one.
 
 ### C3. Diff output repeats each path 4× per file
 `crates/headroom-core/src/transforms/diff_compressor.rs:1101-1129`
@@ -144,10 +148,14 @@ The `... (repeated N times)` marker (~22 chars) is emitted for any run ≥ 2 wit
 
 Verified: a 45-char span becomes a 49-char pointer; `chars_removed` goes negative and is reported as savings. The `↑` glyph costs 2–3 tokens alone and `{anchor!r}` quoting fragments tokenization. Add an explicit `len(ptr) < len(span_text)` acceptance check, drop `↑`/`!r`, raise `DEFAULT_MIN_CHARS` from 40 to ~120.
 
+> **Outcome:** the acceptance check and the marker trim shipped; the floor raise was **measured as a loss and reverted to 40**. On 600 blocks the raise removed *fewer* chars (11,329 → 0) for *more* CPU (10.9 ms → 37.1 ms) — folding less leaves a larger corpus for the anchor matcher. With the acceptance check in place the floor is not load-bearing for safety: dropped to 1 over 11-char spans it performs 0 folds and grows nothing.
+
 ### C7. Universal compressor's per-span banner
 `headroom/compression/universal.py:199-221`, `:331-345`
 
 ` ...[compressed]... ` (20 chars, padded) is emitted per non-structural span >50 chars — 40 spans ≈ 200 tok of identical framing, and at the 51-char threshold the banner is ~40% of the span. Shorten the banner and raise the per-span threshold to ~200 chars.
+
+> **Outcome:** the banner shortened to `…[c]…` and a per-span net-win guard was added; the threshold raise was **measured as a loss and reverted to 50**. Swept with the marker held constant (`cl100k_base`, Kompress off so the fallback path is observable), 50 wins on every fixture and 100 is a total no-op on a 600-line log: 20,415 vs 29,999 tokens. Real log spans after entropy preservation sit in the 50–100 char band. The "banner is ~40% of the span" risk is what the net-win guard now answers, so the floor no longer has to.
 
 **Do not replace it with a bare `…`.** This is the `_simple_compress` fallback path: it adds no CCR hash and no other recovery marker, so the banner is the *only* signal that bytes were deliberately removed. A bare ellipsis is indistinguishable from ellipses already present in source text, and an agent would read the truncated span as exact content. Keep a short but unambiguous marker.
 

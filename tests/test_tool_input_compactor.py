@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from headroom.config import ToolInputCompactionConfig
 from headroom.transforms.tool_input_compactor import (
     CCR_INPUT_KEY,
@@ -384,3 +386,172 @@ def test_read_only_mcp_tools_are_still_compactable():
         "WebFetch",
     ):
         assert is_mutating_tool_input(name, "{}") is False, name
+
+
+# ---------------------------------------------------------------------------
+# THE RULE, pinned exhaustively. `is_mutating_tool_input` was rewritten from
+# three broad regex passes to substring-gated linear scans for cost reasons
+# (see the "Cost discipline" note in the module); the detection SET must not
+# have moved. A false negative here silently destroys the only record of a
+# mutation, so every shape gets an explicit case.
+# ---------------------------------------------------------------------------
+
+MUTATING_COMMANDS = [
+    # write redirection
+    "echo hi > out.txt",
+    "cat a.py >> b.py",
+    "printf x >/tmp/f",
+    "make 2> build.log",
+    "ls | tee listing.txt",
+    # in-place edits
+    "sed -i s/a/b/ f.py",
+    "sed --regexp-extended -i 's/a/b/' f.py",
+    "grep foo f.py | sed -i s/x/y/ g.py",
+    "perl -i -pe s/a/b/ f.py",
+    # destructive file ops
+    "rm -rf build/",
+    "mv a.py b.py",
+    "cp a.py b.py",
+    "mkdir -p out",
+    "chmod 755 run.sh",
+    "chown me:me f",
+    "ln -s a b",
+    "truncate -s 0 log",
+    "dd if=/dev/zero of=f",
+    # vcs / package mutations
+    "git commit -m x",
+    "git apply patch.diff",
+    "git checkout -- .",
+    "npm install left-pad",
+    "pip install requests",
+    "cargo add serde",
+    "apt-get remove foo",
+    # heredocs (JSON-escaped and raw newline forms)
+    "cat <<EOF > f\\nbody\\nEOF",
+    "cat <<'EOF'\nbody\nEOF",
+    "python - <<-PY\nprint(1)\nPY",
+]
+
+NON_MUTATING_COMMANDS = [
+    "ls -la | wc -l",
+    "git log --oneline -3",
+    "grep -rn 'def f() -> int' src/",
+    "rg 'x => y' .",
+    "awk '$1 >= 5 {print}' data.txt",
+    "cat f.py",
+    "grep -rn 'sed' docs/",  # mentions sed, no -i
+    "sed -n '1,20p' f.py",  # sed without -i
+    "sed 's/a/b/' f.py | head -20",
+    "git status --porcelain",
+    "npm ls --depth 0",
+    "find . -name '*.py' -newer f",
+]
+
+
+@pytest.mark.parametrize("command", MUTATING_COMMANDS)
+def test_mutating_shell_inputs_are_never_compacted(command: str) -> None:
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    args = json.dumps({"command": command})
+    assert is_mutating_tool_input("Bash", args) is True, command
+
+
+@pytest.mark.parametrize("command", NON_MUTATING_COMMANDS)
+def test_read_only_shell_inputs_stay_compactable(command: str) -> None:
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    args = json.dumps({"command": command})
+    assert is_mutating_tool_input("Bash", args) is False, command
+
+
+MUTATING_SQL = [
+    "INSERT INTO t VALUES (1)",
+    "insert into t values (1)",
+    "UPDATE t SET a=1",
+    "DELETE FROM t WHERE id=1",
+    "MERGE INTO t USING s ON (1=1)",
+    "REPLACE INTO t VALUES (1)",
+    "DROP TABLE t",
+    "ALTER TABLE t ADD COLUMN c INT",
+    "TRUNCATE TABLE t",
+    "CREATE INDEX i ON t (c)",
+    "CREATE OR REPLACE VIEW v AS SELECT 1",
+    "GRANT SELECT ON t TO u",
+    "REVOKE SELECT ON t FROM u",
+]
+
+NON_MUTATING_SQL = [
+    "SELECT * FROM t",
+    "SELECT count(*) FROM updates",
+    "WITH x AS (SELECT 1) SELECT * FROM x",
+    "SHOW TABLES",
+]
+
+#: Known over-conservative classifications, unchanged by the rewrite. A bare
+#: `>` or `>>` followed by a word is read as write-redirection even inside an
+#: expression, so these read-only inputs forgo compaction. Pinned so the
+#: rewrite's equivalence with the original regex is explicit: the cost is
+#: missed savings, never a lost record, which is the direction THE RULE picks.
+OVER_CONSERVATIVE_INPUTS = [
+    ("Bash", "python -c 'print(1 >> 2)'"),
+    ("query", "EXPLAIN SELECT a FROM t WHERE a > 5"),
+]
+
+
+@pytest.mark.parametrize(("tool", "text"), OVER_CONSERVATIVE_INPUTS)
+def test_over_conservative_cases_are_unchanged(tool: str, text: str) -> None:
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    assert is_mutating_tool_input(tool, json.dumps({"command": text})) is True
+
+
+@pytest.mark.parametrize("sql", MUTATING_SQL)
+def test_sql_mutations_are_never_compacted(sql: str) -> None:
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    assert is_mutating_tool_input("query", json.dumps({"sql": sql})) is True, sql
+
+
+@pytest.mark.parametrize("sql", NON_MUTATING_SQL)
+def test_read_only_sql_stays_compactable(sql: str) -> None:
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    assert is_mutating_tool_input("query", json.dumps({"sql": sql})) is False, sql
+
+
+def test_mutation_detection_is_bounded_on_a_hostile_blob() -> None:
+    """The scan must stay linear on adversarial input.
+
+    `\\bsed\\b[^|;&]*\\s-i\\b` re-scanned the whole tail from every `sed`
+    occurrence: a 64 KB `sed`-dense argument blob took multiple SECONDS, which
+    is a DoS-shaped risk since tool arguments are attacker-influenced and this
+    runs on every completed call of every request.
+    """
+    import time
+
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    blobs = [
+        ("sed expression foo bar baz qux " * 2200)[:65536],  # no shell separators
+        ("sed 's/foo/bar/' file.txt && " * 2400)[:65536],
+        ("grep -rn 'a -> b' src/ " * 3000)[:65536],  # `->`-dense, redirect branch
+        ("perl print scalar keys " * 3000)[:65536],
+    ]
+    for blob in blobs:
+        start = time.perf_counter()
+        is_mutating_tool_input("Bash", blob)
+        elapsed = time.perf_counter() - start
+        # Comfortably above the ~1 ms the linear scan needs, far below the
+        # multi-second quadratic blowup it replaced.
+        assert elapsed < 0.25, f"{elapsed:.3f}s on a 64 KB blob: {blob[:40]!r}"
+
+
+def test_hostile_blob_still_detects_a_trailing_mutation() -> None:
+    """Bounded cost must not come from truncating the inspected text."""
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    padding = ("grep -rn 'a -> b' src/ " * 3000)[:65536]
+    assert is_mutating_tool_input("Bash", padding) is False
+    assert is_mutating_tool_input("Bash", padding + " ; echo x > out.txt") is True
+    assert is_mutating_tool_input("Bash", padding + " ; sed -i s/a/b/ f.py") is True
+    assert is_mutating_tool_input("Bash", padding + " ; DROP TABLE t") is True

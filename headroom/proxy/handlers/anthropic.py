@@ -1596,11 +1596,21 @@ class AnthropicHandlerMixin:
                             optimized_tokens = original_tokens
 
                     if result is not None:
-                        pipeline_ccr_hashes = [
-                            h
-                            for h in (getattr(result, "markers_inserted", None) or [])
-                            if isinstance(h, str) and h
-                        ]
+                        # Shape-filtered to REDEEMABLE hashes at the point of
+                        # contribution: `markers_inserted` also carries
+                        # SmartCrusher's `<headroom:tool_digest sha256="…">`
+                        # provenance strings, which `scan_for_markers` can never
+                        # return — so feeding them to `has_new_ccr_markers` made
+                        # every byte-identical replayed prefix look "new" and
+                        # re-injected `headroom_retrieve` on every frozen turn,
+                        # busting the tools cache segment.
+                        from headroom.transforms.tool_input_compactor import (
+                            ccr_hashes_from_markers,
+                        )
+
+                        pipeline_ccr_hashes = ccr_hashes_from_markers(
+                            getattr(result, "markers_inserted", None)
+                        )
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
                 except Exception as e:

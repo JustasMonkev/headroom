@@ -5042,8 +5042,9 @@ class ContentRouter(Transform):
                 # output. Fold it instead of the lossy strategy path.
                 bash_folded = self._bash_search_fold(tool_name, tool_call_id, content)
                 if bash_folded is not None:
-                    result_slots[i] = {**message, "content": bash_folded}
-                    transforms_applied.append("router:bash:lossless_search")
+                    folded_text, folded_label = bash_folded
+                    result_slots[i] = {**message, "content": folded_text}
+                    transforms_applied.append(f"router:bash:{folded_label}")
                     route_counts["bash_lossless_search"] = (
                         route_counts.get("bash_lossless_search", 0) + 1
                     )
@@ -5728,7 +5729,9 @@ class ContentRouter(Transform):
         minified = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         return minified if len(minified) < len(content) else None
 
-    def _bash_search_fold(self, tool_name: str, tool_id: str, content: Any) -> str | None:
+    def _bash_search_fold(
+        self, tool_name: str, tool_id: str, content: Any
+    ) -> tuple[str, str] | None:
         """Byte-lossless fold for a read-only search run through a shell tool.
 
         ``bash`` is not excluded, so its output normally takes the lossy strategy
@@ -5740,7 +5743,20 @@ class ContentRouter(Transform):
         gated command (``grep -l`` path-lists, ``grep -c`` counts) simply falls
         through to the normal path with no accuracy risk.
 
-        Returns the folded text (smaller, recoverable) or ``None`` to fall through.
+        The ``search`` fold decides WHETHER to pre-empt — it shrinking is the
+        proof that the output really is ``path:line:content`` search output — but
+        it does NOT decide WHICH fold is emitted. This path ``continue``s past
+        the normal per-block route, whose STAGE 0 (:meth:`_lossless_first`) picks
+        the best of every lossless fold; emitting the ``search`` fold
+        unconditionally handed a block whose ``log``/``paths``/``text`` fold
+        folds harder the strictly worse one, for no accuracy gain. Measured at
+        +840 tokens on a 400-turn transcript of small ``grep -rn`` results once
+        the C11 floor admitted small blocks to this path. Comparing costs one
+        extra pure-stdlib fold pass on blocks that were going to be folded
+        anyway, and can never lose: the returned candidate is by construction no
+        larger than the ``search`` fold.
+
+        Returns ``(folded text, lossless label)`` or ``None`` to fall through.
         """
         if not isinstance(content, str) or len(content) < LOSSLESS_FOLD_MIN_CHARS:
             return None
@@ -5755,7 +5771,17 @@ class ContentRouter(Transform):
             folded = compact_lossless(content, "search")
         except Exception:  # noqa: BLE001
             return None
-        return folded if len(folded) < len(content) else None
+        if len(folded) >= len(content):
+            return None
+        best, label = self._lossless_first(content, CompressionStrategy.SEARCH)
+        # `lossless_diff` is the one fold that is purely subtractive with no
+        # exact-inverse check (it drops `index <hex>..<hex>` lines). This path
+        # never emitted it before and must not start: a `grep`ped diff can trip
+        # `_looks_like_diff` and lose a real matched line. Every other fold
+        # self-verifies, so it is safe to take whichever of them wins.
+        if label is not None and label != "lossless_diff" and len(best) < len(folded):
+            return best, label
+        return folded, "lossless_search"
 
     def _get_tool_bias(self, tool_name: str) -> float:
         """Look up compression bias for a tool name.
@@ -6134,17 +6160,18 @@ class ContentRouter(Transform):
                 # instead of taking the lossy strategy path.
                 bash_folded = self._bash_search_fold(tool_name, tool_use_id, tool_text)
                 if bash_folded is not None:
+                    folded_text, folded_label = bash_folded
                     new_blocks.append(
                         {
                             **block,
                             "content": (
-                                [{"type": "text", "text": bash_folded}]
+                                [{"type": "text", "text": folded_text}]
                                 if _tr_list_form
-                                else bash_folded
+                                else folded_text
                             ),
                         }
                     )
-                    transforms_applied.append("router:bash:lossless_search")
+                    transforms_applied.append(f"router:bash:{folded_label}")
                     if route_counts is not None:
                         route_counts["bash_lossless_search"] = (
                             route_counts.get("bash_lossless_search", 0) + 1
