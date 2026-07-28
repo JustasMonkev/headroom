@@ -574,49 +574,59 @@ class SQLiteMemoryStore:
 
         Used when per-entry predicates would grow the SQL expression tree
         beyond SQLite's MAX_EXPR_DEPTH (oversized containers, spent predicate
-        budget, or nested keys unsafe for JSON paths). A recursive CTE
-        enumerates every node path of the FILTER json (via json_each's
-        properly-escaped ``fullkey``), and each path is checked against the
-        stored container: presence, type (integer/real grouped as one numeric
-        class, matching the per-entry branch), scalar value, and per-container
-        entry count. Object entries are addressed by NAME at every depth —
-        key order never matters — while array entries are addressed by index,
-        so array order is enforced. Extra stored entries fail the count check
-        of their parent container; missing ones fail the presence check.
+        budget, or nested keys unsafe for JSON paths). A recursive CTE walks
+        (filter, stored) value pairs in lockstep, joining a matched container
+        pair's children on key/index, and checks each pair: presence, type
+        (integer/real grouped as one numeric class, matching the per-entry
+        branch), scalar value, and per-container entry count. Object entries
+        are matched by NAME at every depth — key order never matters — while
+        array entries are matched by index, so array order is enforced.
+        Extra stored entries fail the count check of their parent container;
+        missing ones fail the presence check.
 
         The SQL is constant-size regardless of container size or nesting
         depth (the CTE's row count follows the filter's node count, which is
-        data, not expression depth). Filter-derived paths are bound as
-        parameters, never interpolated, so arbitrary key names are safe.
+        data, not expression depth). Keys participate only as join DATA —
+        never as JSON path syntax — so any key spelling, including quotes,
+        is safe and compares correctly.
         """
         json_kind = "array" if isinstance(value, (list, tuple)) else "object"
         serialized = json.dumps(value, separators=(",", ":"))
         stored = f"json_extract(metadata, '{json_path}')"
         conditions.append(f"json_type(metadata, '{json_path}') = '{json_kind}'")
+        # The CTE walks (filter, stored) VALUE pairs in lockstep, descending
+        # a matched container pair by joining its children on key/index.
+        # Node addressing never round-trips through JSON path syntax —
+        # json_each.fullkey representations of keys containing quotes are not
+        # re-parseable by json_type/json_extract — keys participate only as
+        # join DATA, so any key spelling works. Descent happens only when
+        # both sides are the same container type; the CASE dummy keeps
+        # json_each off scalar values for the rows that don't descend.
         conditions.append(
             "NOT EXISTS ("
-            " WITH RECURSIVE fnodes(p) AS ("
-            "   SELECT '$'"
+            " WITH RECURSIVE pair(fv, ft, sv, st) AS ("
+            f"   SELECT json(?), json_type(?), {stored}, json_type(metadata, '{json_path}')"
             "   UNION ALL"
-            "   SELECT fe.fullkey FROM fnodes, json_each(?, fnodes.p) AS fe"
-            "   WHERE json_type(?, fnodes.p) IN ('object', 'array')"
+            "   SELECT fe.value, fe.type, se.value, se.type"
+            "   FROM pair, json_each(pair.fv) AS fe"
+            "   LEFT JOIN json_each(CASE WHEN pair.st IN ('object', 'array')"
+            "                       THEN pair.sv ELSE '{}' END) AS se"
+            "     ON se.key = fe.key"
+            "   WHERE pair.ft IN ('object', 'array') AND pair.st = pair.ft"
             " )"
-            " SELECT 1 FROM fnodes"
-            f" WHERE json_type({stored}, fnodes.p) IS NULL"
-            f" OR (json_type({stored}, fnodes.p) != json_type(?, fnodes.p)"
-            f"     AND NOT (json_type({stored}, fnodes.p) IN ('integer', 'real')"
-            "              AND json_type(?, fnodes.p) IN ('integer', 'real')))"
-            " OR (json_type(?, fnodes.p) IN ('integer', 'real', 'text')"
-            f"    AND json_extract({stored}, fnodes.p) IS NOT json_extract(?, fnodes.p))"
-            " OR (json_type(?, fnodes.p) IN ('object', 'array')"
-            f"    AND CASE WHEN json_type({stored}, fnodes.p) = json_type(?, fnodes.p)"
-            f"        THEN (SELECT COUNT(*) FROM json_each({stored}, fnodes.p))"
-            "             != (SELECT COUNT(*) FROM json_each(?, fnodes.p))"
-            "        ELSE 1 END)"
+            " SELECT 1 FROM pair"
+            " WHERE st IS NULL"
+            " OR (ft != st AND NOT (ft IN ('integer', 'real') AND st IN ('integer', 'real')))"
+            " OR (ft IN ('integer', 'real', 'text') AND sv IS NOT fv)"
+            " OR (ft IN ('object', 'array')"
+            "     AND CASE WHEN st = ft"
+            "         THEN (SELECT COUNT(*) FROM json_each(fv))"
+            "              != (SELECT COUNT(*) FROM json_each(sv))"
+            "         ELSE 1 END)"
             ")"
         )
         # One bind per '?' in the condition above, in order of appearance.
-        params.extend([serialized] * 9)
+        params.extend([serialized] * 2)
 
     def _append_metadata_condition(
         self,

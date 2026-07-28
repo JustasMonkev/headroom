@@ -323,3 +323,22 @@ async def test_bounded_path_structural_at_arbitrary_depth(store: SQLiteMemorySto
     subset["k0"] = {"wrap": {"deep": {"a": 1}, "arr": [1, 2]}}
     found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": subset}))
     assert found == []
+
+
+async def test_bounded_path_handles_quoted_keys(store: SQLiteMemoryStore) -> None:
+    """Keys containing double quotes can't round-trip through JSON path
+    syntax; the pair-walking CTE joins on key values instead, so they must
+    compare correctly at any depth."""
+    await store.save(
+        Memory(id="q", content="quoted", user_id="u1", metadata={"cfg": {'a"b': {"x": 1}}})
+    )
+
+    found = await store.query(
+        MemoryFilter(user_id="u1", metadata_filters={"cfg": {'a"b': {"x": 1}}})
+    )
+    assert [m.id for m in found] == ["q"]
+
+    found = await store.query(
+        MemoryFilter(user_id="u1", metadata_filters={"cfg": {'a"b': {"x": 2}}})
+    )
+    assert found == []

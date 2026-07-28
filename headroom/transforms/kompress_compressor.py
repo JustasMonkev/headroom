@@ -73,6 +73,26 @@ def _add_kompress_must_keep_words(
             kept_ids.add(word_idx + chunk_start)
 
 
+def _sequence_truncated(encoding: Any, batch_idx: int, length_at_cap: bool) -> bool:
+    """Whether the encoded sequence for ``batch_idx`` was truncated.
+
+    Prefers the fast tokenizer's own overflow metadata (exact — an
+    untruncated sequence that naturally lands on the max_length cap is NOT
+    flagged). Falls back to the length-at-cap heuristic when the metadata is
+    unavailable (slow tokenizers, mocks): conservative, may keep one extra
+    boundary word in the exact-length case.
+    """
+    encodings = getattr(encoding, "encodings", None)
+    if encodings:
+        try:
+            overflowing = getattr(encodings[batch_idx], "overflowing", None)
+        except IndexError:
+            overflowing = None
+        if overflowing is not None:
+            return len(overflowing) > 0
+    return length_at_cap
+
+
 def _keep_tokenizer_truncated_tail(
     kept_ids: set[int],
     word_ids: list[int | None],
@@ -1454,10 +1474,10 @@ class KompressCompressor(Transform):
                     word_ids,
                     len(chunk_words),
                     chunk_start,
-                    # Single-chunk batch: padded length == real length, so
-                    # hitting max_length means the tokenizer (possibly) cut
-                    # inside the final word.
-                    sequence_full=len(word_ids) >= 512,
+                    # Exact overflow metadata when available; length-at-cap
+                    # heuristic otherwise (single-chunk batch: padded length
+                    # == real length).
+                    sequence_full=_sequence_truncated(encoding, 0, len(word_ids) >= 512),
                 )
 
                 # Hard override: always keep must-keep tokens regardless of model score.
@@ -1814,7 +1834,10 @@ class KompressCompressor(Transform):
                         word_ids,
                         len(chunk_words),
                         chunk_start,
-                        sequence_full=real_len >= 512,
+                        # Exact overflow metadata when available; per-item
+                        # length from the attention mask otherwise (padding
+                        # inflates word_ids for the whole batch).
+                        sequence_full=_sequence_truncated(encoding, batch_idx, real_len >= 512),
                     )
 
                     if not word_scores:

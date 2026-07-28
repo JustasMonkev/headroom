@@ -52,3 +52,28 @@ def test_full_coverage_without_cap_keeps_nothing() -> None:
         kept, [None, 0, 1, 2, None], chunk_len=3, chunk_start=10, sequence_full=False
     )
     assert kept == set()
+
+
+class _FakeEnc:
+    def __init__(self, overflowing):
+        self.overflowing = overflowing
+
+
+class _FakeBatchEncoding:
+    def __init__(self, encodings):
+        self.encodings = encodings
+
+
+def test_sequence_truncated_prefers_overflow_metadata() -> None:
+    from headroom.transforms.kompress_compressor import _sequence_truncated
+
+    # Exactly-512 natural length: metadata says NOT truncated, heuristic says
+    # full — metadata wins.
+    enc = _FakeBatchEncoding([_FakeEnc(overflowing=[])])
+    assert _sequence_truncated(enc, 0, length_at_cap=True) is False
+    # Real truncation is flagged even when the heuristic is unavailable.
+    enc = _FakeBatchEncoding([_FakeEnc(overflowing=[object()])])
+    assert _sequence_truncated(enc, 0, length_at_cap=False) is True
+    # No metadata (slow tokenizer / mock): heuristic decides.
+    assert _sequence_truncated(object(), 0, length_at_cap=True) is True
+    assert _sequence_truncated(object(), 0, length_at_cap=False) is False
