@@ -55,7 +55,7 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
     outcomes: list[Any] = []
 
     payload = {
-        "model": "gpt-5",
+        "model": "gpt-5.5",
         "input": [
             {
                 "type": "function_call_output",
@@ -90,7 +90,8 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
 
     assert response.status_code == 200
     sent = captured["body"]
-    # gpt-5 has native output controls, so the steering paragraph is NOT
+    # gpt-5.5 is at/above MIN_GPT_FEATURE_VERSION, so it has native output
+    # controls and the steering paragraph is NOT
     # appended (F5) — text.verbosity carries the output shaping instead.
     assert "instructions" not in sent
     assert sent["reasoning"]["effort"] == "low"

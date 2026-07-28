@@ -1,9 +1,11 @@
-"""Server-side Tool Search deferral for OpenAI Responses (gpt-5.4+).
+"""Server-side Tool Search deferral for OpenAI Responses (gpt-5.5+).
 
 The OpenAI-side analogue of the Anthropic path (issue #746): mark non-core
 function / MCP tools ``defer_loading: true`` and inject ``{"type": "tool_search"}``
 so OpenAI keeps their heavy parameter schemas out of the model's context until
-searched. Gated to gpt-5.4+ (older models 400 on the fields).
+searched. Gated on the shared model-feature cutoff
+(``MIN_GPT_FEATURE_VERSION`` = gpt 5.5); older models 400 on the fields, and
+they keep working through the proxy with ordinary compression instead.
 """
 
 from __future__ import annotations
@@ -33,13 +35,28 @@ def _tools() -> list[dict]:
 # --- model gating ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.5", "gpt-5.4-2026-02-01", "gpt-6", "gpt-6.2"])
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-5.5", "gpt-5.5-codex", "gpt-5.5-2026-02-01", "gpt-6", "gpt-6.2", "openai/gpt-5.5"],
+)
 def test_model_supported(model):
     assert _model_supports_openai_tool_search(model) is True
 
 
 @pytest.mark.parametrize(
-    "model", ["gpt-4o", "gpt-4.1", "gpt-5", "gpt-5.3", "o3", "", None, "claude-opus-4-8"]
+    "model",
+    [
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "gpt-5.3",
+        "gpt-5.4",
+        "gpt-5.4-2026-02-01",
+        "o3",
+        "",
+        None,
+        "claude-opus-4-8",
+    ],
 )
 def test_model_unsupported(model):
     assert _model_supports_openai_tool_search(model) is False
@@ -48,10 +65,11 @@ def test_model_unsupported(model):
 def test_env_override_wins_then_falls_back(monkeypatch):
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", r"^my-model")
     assert _model_supports_openai_tool_search("my-model-v1") is True
-    assert _model_supports_openai_tool_search("gpt-5.4") is False  # override replaces the gate
+    assert _model_supports_openai_tool_search("gpt-5.5") is False  # override replaces the gate
     # a malformed regex must not crash — fall back to the version gate.
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
-    assert _model_supports_openai_tool_search("gpt-5.4") is True
+    assert _model_supports_openai_tool_search("gpt-5.5") is True
+    assert _model_supports_openai_tool_search("gpt-5.4") is False
 
 
 # --- deferral behavior -------------------------------------------------------

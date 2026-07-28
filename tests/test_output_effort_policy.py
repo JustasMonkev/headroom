@@ -43,10 +43,18 @@ def test_clamp_legacy_thinking_budget_only_clamps_enabled_over_floor() -> None:
     assert clamp_legacy_thinking_budget(thinking_type="enabled", budget_tokens="32000") is None
 
 
-def test_can_create_openai_text_verbosity_only_for_gpt5_family() -> None:
-    assert can_create_openai_text_verbosity("gpt-5")
-    assert can_create_openai_text_verbosity("GPT-5.1")
+def test_can_create_openai_text_verbosity_only_at_or_above_the_feature_cutoff() -> None:
+    """Native output controls are gated on MIN_GPT_FEATURE_VERSION (gpt >= 5.5)."""
+    assert can_create_openai_text_verbosity("gpt-5.5")
+    assert can_create_openai_text_verbosity("GPT-5.5-codex")
+    assert can_create_openai_text_verbosity("openai/gpt-6")
+    # Below the cutoff the model still works — it just falls back to the
+    # portable instruction-steering lever instead of the native knob.
+    assert not can_create_openai_text_verbosity("gpt-5")
+    assert not can_create_openai_text_verbosity("GPT-5.1")
+    assert not can_create_openai_text_verbosity("gpt-5.4")
     assert not can_create_openai_text_verbosity("gpt-4o")
+    assert not can_create_openai_text_verbosity("o3")
     assert not can_create_openai_text_verbosity(None)
 
 

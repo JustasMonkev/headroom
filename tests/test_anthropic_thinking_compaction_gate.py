@@ -3,8 +3,11 @@
 `compact_thinking_to_text()` had zero production callers. It is now invoked
 from the Anthropic handler, but only when BOTH hold:
 
-  * `bills_prior_thinking(model)` — pre-4.6 Claude strips prior thinking
+  * `bills_prior_thinking(model)` — older Claude strips prior thinking
     server-side, so compacting there would turn free tokens into billed text.
+    Gated on the shared model-feature cutoff (`MIN_CLAUDE_FEATURE_VERSION` =
+    Claude 4.8); models below it still proxy and still get ordinary
+    compression, they just skip this transform.
   * `HEADROOM_THINKING_COMPACT` — the transform is LOSSY (signed reasoning
     becomes a generated summary). The billing predicate establishes that
     compaction *could* pay, not that the user accepted a lossy transform.
@@ -72,16 +75,29 @@ def test_handler_gates_on_both_the_billing_predicate_and_the_opt_in() -> None:
 # --------------------------------------------------------------------------
 # Gate semantics
 # --------------------------------------------------------------------------
-@pytest.mark.parametrize("model", ["claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-5"])
-def test_billing_gate_open_for_46_plus(model: str) -> None:
+@pytest.mark.parametrize(
+    "model",
+    ["claude-opus-4-8", "claude-sonnet-5", "anthropic/claude-opus-4-8", "claude-opus-5-20260301"],
+)
+def test_billing_gate_open_at_or_above_the_feature_cutoff(model: str) -> None:
     assert bills_prior_thinking(model) is True
 
 
 @pytest.mark.parametrize(
     "model",
-    ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"],
+    [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-7",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+        "claude-3-5-sonnet-20241022",
+        "",
+        "not-a-model",
+    ],
 )
-def test_billing_gate_closed_for_pre_46(model: str) -> None:
+def test_billing_gate_closed_below_the_feature_cutoff(model: str) -> None:
+    """Fail closed: compacting where thinking is stripped would BILL free tokens."""
     assert bills_prior_thinking(model) is False
 
 

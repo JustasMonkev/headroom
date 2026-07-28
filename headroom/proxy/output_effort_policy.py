@@ -7,6 +7,8 @@ legacy budget clamping stay testable without request dictionaries.
 
 from __future__ import annotations
 
+from headroom.config import model_supports_gated_features
+
 EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
 TEXT_VERBOSITY_RANK = {"low": 0, "medium": 1, "high": 2}
 LEGACY_THINKING_FLOOR = 1024
@@ -40,8 +42,17 @@ def clamp_legacy_thinking_budget(
 
 
 def can_create_openai_text_verbosity(model: object) -> bool:
-    """Whether it is safe to create a new OpenAI ``text.verbosity`` block."""
-    return str(model or "").lower().startswith("gpt-5")
+    """Whether it is safe to CREATE a new OpenAI ``text.verbosity`` block.
+
+    Native output controls are a model-specific optimization, so they engage
+    only at or above the shared cutoff (``MIN_GPT_FEATURE_VERSION``, gpt >=
+    5.5). Fail-closed on anything unparseable: injecting ``text.verbosity``
+    where the model does not support it 400s the request. Models below the
+    cutoff are not broken by this — they simply fall back to the portable
+    instruction-steering lever, and an *existing* client-sent verbosity is
+    still lowered for them by :func:`lower_text_verbosity_value`.
+    """
+    return model_supports_gated_features(model, family="gpt")
 
 
 def lower_text_verbosity_value(current: object) -> str | None:

@@ -1,9 +1,12 @@
 """Convert prior-turn extended-thinking blocks into Kompressed ``text`` blocks.
 
-On Claude 4.6+ models, prior-turn thinking is re-sent as input and **billed**
-(verified live: opus-4-6 +995 tok/block, sonnet-4-6 +688; pre-4.6 models strip
-it server-side, so this transform is a no-op there — gate on model generation at
-the call site). Two findings dictate the mechanism:
+On recent Claude models, prior-turn thinking is re-sent as input and **billed**
+(verified live: opus-4-6 +995 tok/block, sonnet-4-6 +688; older models strip it
+server-side, so this transform is a no-op there — gate on model generation at
+the call site). This is a model-specific optimization, so it only engages at or
+above ``MIN_CLAUDE_FEATURE_VERSION`` (see :mod:`headroom.config`); older Claude
+models still go through the proxy and still get ordinary compression. Two
+findings dictate the mechanism:
 
 1. **Editing a thinking block in place is futile** — Anthropic pins the original
    via the block ``signature`` and re-expands it server-side, ignoring whatever
@@ -33,6 +36,8 @@ import logging
 from collections import OrderedDict
 from typing import Any
 
+from headroom.config import model_supports_gated_features
+
 log = logging.getLogger(__name__)
 
 # original-thinking-hash -> compacted text. Deterministic memo so the same
@@ -50,24 +55,17 @@ _MARKER = "[prior reasoning, compressed]"
 def bills_prior_thinking(model: str) -> bool:
     """True if ``model`` re-bills prior-turn thinking as input (so compaction pays).
 
-    Claude 4.6+ (and the 5 family) keep prior-turn thinking in context and bill it;
-    pre-4.6 (sonnet-4-5, haiku-4-5, 3.x) strip it server-side. Verified live:
-    opus-4-6/sonnet-4-6 bill, sonnet-4-5/haiku-4-5 strip. **Conservative** — returns
-    False unless the version is confidently >= 4.6, because compacting on a stripping
-    model would turn free (stripped) thinking into billed text. (Opus 4.5 reportedly
-    bills too, but is excluded here pending verification — costs only missed savings.)
+    Gated on :data:`headroom.config.MIN_CLAUDE_FEATURE_VERSION` (Claude >= 4.8),
+    like every other model-specific optimization. Recent Claude models keep
+    prior-turn thinking in context and bill it (verified live: opus-4-6 and
+    sonnet-4-6 bill); older ones (sonnet-4-5, haiku-4-5, 3.x) strip it
+    server-side. **Conservative / fail-closed** — returns False unless the model
+    parses as a Claude at or above the cutoff, because compacting on a stripping
+    model would turn free (stripped) thinking into billed text. A false negative
+    costs only missed savings; a false positive costs real tokens. Models below
+    the cutoff keep working, they just skip this transform.
     """
-    nums: list[int] = []
-    for part in model.lower().split("-"):
-        if part.isdigit():
-            nums.append(int(part))
-        elif nums:
-            break  # version digits are contiguous; stop at the family/date boundary
-    if not nums:
-        return False
-    major = nums[0]
-    minor = nums[1] if len(nums) > 1 else 0
-    return major >= 5 or (major, minor) >= (4, 6)
+    return model_supports_gated_features(model, family="claude")
 
 
 def _memo_compact(text: str, kompress: Any) -> str | None:
@@ -348,11 +346,11 @@ def _demo() -> None:
     assert out3[3]["content"][0]["type"] == "text", "keep_last_turns=0 compacts all"
     assert stats3["turns_compacted"] == 2, stats3
 
-    # model gate: 4.6+ / 5.x bill (compact); pre-4.6 strip (skip)
-    assert bills_prior_thinking("claude-opus-4-6")
-    assert bills_prior_thinking("claude-sonnet-4-6")
+    # model gate: Claude >= MIN_CLAUDE_FEATURE_VERSION (4.8) compacts; below it we skip
     assert bills_prior_thinking("claude-opus-4-8")
     assert bills_prior_thinking("claude-sonnet-5")
+    assert not bills_prior_thinking("claude-opus-4-6")
+    assert not bills_prior_thinking("claude-sonnet-4-6")
     assert not bills_prior_thinking("claude-sonnet-4-5-20250929")
     assert not bills_prior_thinking("claude-haiku-4-5-20251001")
     assert not bills_prior_thinking("claude-3-5-sonnet-20241022")

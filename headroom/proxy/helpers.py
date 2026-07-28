@@ -24,6 +24,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
+from headroom.config import (
+    MIN_CLAUDE_FEATURE_VERSION,
+    MIN_GPT_FEATURE_VERSION,
+    model_supports_gated_features,
+)
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -2899,9 +2904,11 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 # The deferral is deterministic (same input tools -> same output bytes), so the
 # tools prefix still prompt-caches, and it already no-ops for small tool sets
 # and for clients that ship their own tool_search tool. The remaining risk is
-# purely model support: pre-4.5 Claude models 400 on `defer_loading` /
-# `tool_search_tool_*`. Hence a version gate plus two escape hatches.
-_ANTHROPIC_TOOL_SEARCH_MIN_VERSION = (4, 5)
+# purely model support: older Claude models 400 on `defer_loading` /
+# `tool_search_tool_*`. Hence a version gate plus two escape hatches. The
+# threshold is the shared one (`MIN_CLAUDE_FEATURE_VERSION`, Claude >= 4.8) —
+# every model-specific optimization engages at the same generation.
+_ANTHROPIC_TOOL_SEARCH_MIN_VERSION = MIN_CLAUDE_FEATURE_VERSION
 _TOOL_SEARCH_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 _TOOL_SEARCH_OFF_VALUES = frozenset({"0", "false", "no", "off", "none", "disabled"})
 
@@ -2909,11 +2916,12 @@ _TOOL_SEARCH_OFF_VALUES = frozenset({"0", "false", "no", "off", "none", "disable
 def tool_search_mode() -> str:
     """Resolve ``HEADROOM_TOOL_SEARCH`` to ``"on"`` / ``"off"`` / ``"auto"``.
 
-    Unset (or ``auto``) means auto: inject for first-party Anthropic models
-    that support the GA tool-search shape. ``0``/``off``/``false``/``no`` is the
-    explicit opt-out. ``1``/``on``/``true``/``yes`` forces injection even when
-    the version gate does not recognise the model name (escape hatch for model
-    IDs newer than this code).
+    Unset (or ``auto``) means auto: inject for first-party Anthropic models at
+    or above the shared feature cutoff (Claude >= 4.8).
+    ``0``/``off``/``false``/``no`` is the explicit opt-out.
+    ``1``/``on``/``true``/``yes`` forces injection even when the version gate
+    does not recognise the model name (escape hatch for model IDs newer than
+    this code).
     """
     raw = os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
     if not raw or raw == "auto":
@@ -2930,13 +2938,14 @@ def tool_search_mode() -> str:
 def _model_supports_anthropic_tool_search(model: str | None) -> bool:
     """True when a Claude model supports the server-side Tool Search Tool.
 
-    Default gate: Claude generation >= 4.5 (``claude-sonnet-4-5``,
-    ``claude-opus-4-6``, ``claude-*-5*``, …). A regex in
-    ``HEADROOM_TOOL_SEARCH_MODELS`` (matched against the model name) wins when
-    set; a malformed pattern falls back to the version gate rather than
-    crashing. Conservative: an unparseable model name returns False, which
-    costs only missed savings (the explicit ``HEADROOM_TOOL_SEARCH=1`` escape
-    hatch overrides it).
+    Default gate: the shared model-feature cutoff, Claude generation >=
+    ``MIN_CLAUDE_FEATURE_VERSION`` (4.8) — ``claude-opus-4-8``,
+    ``claude-*-5*``, …; ``claude-sonnet-4-5``/``4-6`` and ``claude-haiku-4-5``
+    are below it. A regex in ``HEADROOM_TOOL_SEARCH_MODELS`` (matched against
+    the model name) wins when set; a malformed pattern falls back to the
+    version gate rather than crashing. Conservative / fail-closed: an
+    unparseable model name returns False, which costs only missed savings (the
+    explicit ``HEADROOM_TOOL_SEARCH=1`` escape hatch overrides it).
     """
     if not model:
         return False
@@ -2946,19 +2955,7 @@ def _model_supports_anthropic_tool_search(model: str | None) -> bool:
             return re.search(override, model) is not None
         except re.error:
             pass  # malformed override -> fall back to the version gate
-    # Version digits are contiguous and follow the family name:
-    # claude-sonnet-4-5-20250929 -> (4, 5); claude-opus-4-6 -> (4, 6).
-    nums: list[int] = []
-    for part in model.strip().lower().split("-"):
-        if part.isdigit():
-            nums.append(int(part))
-        elif nums:
-            break  # stop at the family/date boundary
-    if not nums:
-        return False
-    major = nums[0]
-    minor = nums[1] if len(nums) > 1 else 0
-    return (major, minor) >= _ANTHROPIC_TOOL_SEARCH_MIN_VERSION
+    return model_supports_gated_features(model, family="claude")
 
 
 def anthropic_tool_search_enabled(model: str | None) -> bool:
@@ -3081,27 +3078,29 @@ def inject_tool_search_deferral(
 #     ``function`` (non-core) and ``mcp`` tools and keep OTHER typed/hosted tools
 #     (web_search, file_search, code_interpreter, computer, image_generation, and
 #     the search tool itself) resident.
-#   * Model-gated: only gpt-5.4+ support it; older models 400 on the fields.
+#   * Model-gated: only recent GPT models support it; older ones 400 on the
+#     fields. Uses the shared cutoff (MIN_GPT_FEATURE_VERSION, gpt >= 5.5).
 #   * No ``cache_control`` (OpenAI caches automatically), so no breakpoint move.
 # ---------------------------------------------------------------------------
 
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-# gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
-# gated by default; overridable per deployment via a regex in
-# HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
-# model families can be enabled without a code edit + release.
-_OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
+# Version-gated on the shared model-feature cutoff so every model-specific
+# optimization engages at the same generation; overridable per deployment via a
+# regex in HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name)
+# so new model families can be enabled without a code edit + release.
+_OPENAI_TOOL_SEARCH_MIN_VERSION = MIN_GPT_FEATURE_VERSION
 
 
 def _model_supports_openai_tool_search(model: str | None) -> bool:
     """True when an OpenAI model supports the Responses ``tool_search`` feature.
 
-    Default gate: ``gpt-<major>.<minor>`` >= 5.4. A regex in
+    Default gate: ``gpt-<major>.<minor>`` >= ``MIN_GPT_FEATURE_VERSION`` (5.5),
+    so ``gpt-5`` through ``gpt-5.4`` are below it. A regex in
     ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (matched against the model name) wins
     when set; a malformed pattern falls back to the version gate rather than
-    crashing.
+    crashing. Fail-closed on an unparseable model id.
     """
     if not model:
         return False
@@ -3111,11 +3110,7 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
             return re.search(override, model) is not None
         except re.error:
             pass  # malformed override → fall back to the version gate
-    match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
-    if not match:
-        return False
-    major, minor = int(match.group(1)), int(match.group(2) or 0)
-    return (major, minor) >= _OPENAI_TOOL_SEARCH_MIN_VERSION
+    return model_supports_gated_features(model, family="gpt")
 
 
 def inject_tool_search_deferral_openai(

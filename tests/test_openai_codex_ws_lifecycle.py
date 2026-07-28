@@ -347,14 +347,15 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
     ]
     upstream = _FakeUpstream(upstream_events)
     fake_ws_mod = _make_fake_websockets_module(upstream)
-    # Mechanical continuation frame: gpt-5.x has native output controls, so
-    # the shaper sets text.verbosity instead of appending steering text (F5),
-    # and only does so on mechanical turns.
+    # Mechanical continuation frame: gpt-5.5 is at/above the shared model
+    # feature cutoff (MIN_GPT_FEATURE_VERSION), so it has native output
+    # controls and the shaper sets text.verbosity instead of appending
+    # steering text (F5) — and only does so on mechanical turns.
     mechanical_frame = json.dumps(
         {
             "type": "response.create",
             "response": {
-                "model": "gpt-5.4",
+                "model": "gpt-5.5",
                 "input": [
                     {
                         "type": "function_call_output",
@@ -380,7 +381,7 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
 
     sent = json.loads(upstream.sent[0])
     payload = sent["response"]
-    # Native controls replace the steering paragraph on gpt-5 models.
+    # Native controls replace the steering paragraph above the cutoff.
     assert "instructions" not in payload
     assert payload["text"]["verbosity"] == "low"
     transforms = outcomes[-1].transforms_applied

@@ -2396,7 +2396,8 @@ class AnthropicHandlerMixin:
                 )
 
             # F2: prior-turn thinking compaction (HEADROOM_THINKING_COMPACT,
-            # off by default). On Claude 4.6+ / 5.x prior-turn `thinking` blocks
+            # off by default). On recent Claude models (>= the shared
+            # MIN_CLAUDE_FEATURE_VERSION cutoff) prior-turn `thinking` blocks
             # are re-sent AND re-billed as input (~688 tok/block on sonnet-4-6,
             # ~995 on opus-4-6). Editing a thinking block in place is futile —
             # Anthropic re-expands it from the signature — so the only way to
@@ -2406,7 +2407,7 @@ class AnthropicHandlerMixin:
             # the active reasoning the model is still using.
             #
             # DOUBLE-GATED, deliberately:
-            #   * `bills_prior_thinking(model)` — on pre-4.6 models the provider
+            #   * `bills_prior_thinking(model)` — below the cutoff the provider
             #     strips thinking server-side, so compaction would turn FREE
             #     tokens into billed text. This gate establishes that compaction
             #     *could* pay.
@@ -2509,7 +2510,8 @@ class AnthropicHandlerMixin:
             # direct API and leave those paths untouched.
             #
             # F1: this is now default-on. `anthropic_tool_search_enabled` resolves
-            # HEADROOM_TOOL_SEARCH (unset/`auto` = on for models >= Claude 4.5,
+            # HEADROOM_TOOL_SEARCH (unset/`auto` = on for models at/above the
+            # shared MIN_CLAUDE_FEATURE_VERSION cutoff,
             # `0`/`off` = explicit opt-out, `1`/`on` = force on regardless of the
             # version gate) and `inject_tool_search_deferral` still no-ops for
             # <12 tools and for clients that already ship a tool_search tool.

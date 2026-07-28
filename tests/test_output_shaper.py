@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from headroom.proxy.output_shaper import (
     LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
@@ -362,14 +364,18 @@ class TestOpenAIResponsesReasoning:
 
 
 class TestOpenAIResponsesTextVerbosity:
-    def test_text_verbosity_set_for_gpt5_family(self):
-        body = {"model": "gpt-5.1"}
+    def test_text_verbosity_set_at_or_above_the_feature_cutoff(self):
+        # Native output controls engage only on gpt >= MIN_GPT_FEATURE_VERSION.
+        body = {"model": "gpt-5.5"}
         labels = route_openai_text_verbosity(body, TurnKind.MECHANICAL_CONTINUATION)
         assert labels == ["output_shaper:text_verbosity:unset->low"]
         assert body["text"] == {"verbosity": "low"}
 
-    def test_text_verbosity_not_injected_for_non_gpt5(self):
-        body = {"model": "gpt-4o"}
+    @pytest.mark.parametrize("model", ["gpt-4o", "gpt-5", "gpt-5.1", "gpt-5.4", "o3"])
+    def test_text_verbosity_not_injected_below_the_feature_cutoff(self, model):
+        # Below the cutoff the request still flows — we just never CREATE the
+        # native knob (models that lack it 400 on the field).
+        body = {"model": model}
         assert route_openai_text_verbosity(body, TurnKind.MECHANICAL_CONTINUATION) == []
         assert "text" not in body
 
@@ -382,12 +388,12 @@ class TestOpenAIResponsesTextVerbosity:
     def test_text_verbosity_untouched_on_new_user_ask(self):
         # Fresh questions keep the verbosity the client asked for — the
         # low-verbosity knob only applies to mechanical continuations.
-        body = {"model": "gpt-5.1", "text": {"verbosity": "medium"}}
+        body = {"model": "gpt-5.5", "text": {"verbosity": "medium"}}
         assert route_openai_text_verbosity(body, TurnKind.NEW_USER_ASK) == []
         assert body["text"]["verbosity"] == "medium"
 
     def test_text_verbosity_untouched_on_error_continuation(self):
-        body = {"model": "gpt-5.1", "text": {"verbosity": "high"}}
+        body = {"model": "gpt-5.5", "text": {"verbosity": "high"}}
         assert route_openai_text_verbosity(body, TurnKind.ERROR_CONTINUATION) == []
         assert body["text"]["verbosity"] == "high"
 
@@ -395,7 +401,7 @@ class TestOpenAIResponsesTextVerbosity:
         # F5: on models with native output controls, text.verbosity replaces
         # the steering paragraph — no instruction bytes are spent.
         body = {
-            "model": "gpt-5",
+            "model": "gpt-5.5",
             "input": [
                 {
                     "type": "function_call_output",
@@ -445,7 +451,7 @@ class TestOpenAIResponsesTextVerbosity:
         # override — the request goes through unshaped (except effort, which
         # is already gated on mechanical turns).
         body = {
-            "model": "gpt-5",
+            "model": "gpt-5.5",
             "input": [{"type": "message", "role": "user", "content": "explain X"}],
             "instructions": "System.",
             "text": {"verbosity": "medium"},

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -23,6 +24,109 @@ class HeadroomMode(str, Enum):
 # Model context limits should be provided by the Provider
 # This dict allows user overrides only
 DEFAULT_MODEL_CONTEXT_LIMITS: dict[str, int] = {}
+
+
+# ---------------------------------------------------------------------------
+# Model-specific feature gates
+# ---------------------------------------------------------------------------
+# Headroom's *ordinary* compression runs on every model. A handful of transforms
+# are different: they exploit provider behaviour that only exists on recent
+# frontier models (server-side tool search, native output controls, prior-turn
+# thinking being re-billed as input). Firing those on an older model is not
+# merely a missed saving — it can cost tokens or 400 the request.
+#
+# These two constants are the SINGLE definition of "recent enough". Every
+# model-specific optimization routes its version predicate through
+# :func:`model_supports_gated_features` below; do not re-derive a threshold at
+# a call site. Older models keep working through the proxy and keep getting
+# ordinary compression — they just don't get the gated features.
+MIN_CLAUDE_FEATURE_VERSION: tuple[int, int] = (4, 8)
+MIN_GPT_FEATURE_VERSION: tuple[int, int] = (5, 5)
+
+_MODEL_FEATURE_MIN_VERSIONS: dict[str, tuple[int, int]] = {
+    "claude": MIN_CLAUDE_FEATURE_VERSION,
+    "gpt": MIN_GPT_FEATURE_VERSION,
+}
+
+# Everything that is not [0-9a-z] is a separator in a model id. This collapses
+# every real-world shape onto the same token stream:
+#   claude-opus-4-6 / anthropic/claude-opus-4-6 / us.anthropic.claude-opus-4-6-v1:0
+#   claude-sonnet-4-5-20250929 / claude-3-5-sonnet-20241022 / claude-opus-4-6[1m]
+#   gpt-5.5 / gpt-5.5-codex / openai/gpt-5 / gpt-5.4-2026-02-01
+_MODEL_ID_SEPARATORS = re.compile(r"[^0-9a-z]+")
+
+
+def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | None:
+    """Parse a model id into ``(family, (major, minor))``; ``None`` if unknown.
+
+    ``family`` is ``"claude"`` or ``"gpt"`` — the only two families with
+    version-gated optimizations. Vendor prefixes (``anthropic/``,
+    ``us.anthropic.``, ``openai/``), date suffixes, variant suffixes
+    (``-codex``, ``[1m]``, ``-v1:0``) and dotted or dashed version separators
+    are all handled.
+
+    The version is the first contiguous run of all-digit tokens, which is where
+    every id in this repo puts it (``claude-opus-4-6`` -> ``(4, 6)``;
+    ``claude-3-5-sonnet-20241022`` -> ``(3, 5)``; ``gpt-5.5-codex`` ->
+    ``(5, 5)``; ``gpt-5`` -> ``(5, 0)``). A missing minor is 0.
+
+    Returns ``None`` — never a guess — for anything unparseable, so callers
+    fail closed. Non-versioned families (``o1``, ``o3``, ``gpt-4o``, embedding
+    models, …) also return ``None``.
+    """
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().lower()
+    if not normalized:
+        return None
+    tokens = [t for t in _MODEL_ID_SEPARATORS.split(normalized) if t]
+    family: str | None = None
+    start = 0
+    for name in _MODEL_FEATURE_MIN_VERSIONS:
+        if name in tokens:
+            family = name
+            start = tokens.index(name) + 1  # version digits follow the family name
+            break
+    if family is None:
+        return None
+    digits: list[int] = []
+    for token in tokens[start:]:
+        if token.isdigit():
+            digits.append(int(token))
+        elif digits:
+            break  # version digits are contiguous; stop at the family/date boundary
+    if not digits:
+        return None
+    major = digits[0]
+    minor = digits[1] if len(digits) > 1 else 0
+    return family, (major, minor)
+
+
+def model_supports_gated_features(model: object, *, family: str | None = None) -> bool:
+    """True when ``model`` is new enough for Headroom's model-specific features.
+
+    The cutoffs are :data:`MIN_CLAUDE_FEATURE_VERSION` and
+    :data:`MIN_GPT_FEATURE_VERSION`. Applied strictly by version number — there
+    are no per-model carve-outs, so e.g. ``claude-haiku-4-5`` and
+    ``claude-sonnet-4-6`` are below the Claude cutoff and ``gpt-5.4`` is below
+    the GPT cutoff.
+
+    ``family`` optionally restricts the answer to one family (``"claude"`` or
+    ``"gpt"``) so a provider-specific gate can't be opened by a model id from
+    the other vendor.
+
+    **Fails closed**: an unrecognized, unparseable or empty model id returns
+    False. That direction is deliberate — every gated feature costs tokens or
+    errors when fired on a model that does not support it, whereas a false
+    negative costs only a missed saving.
+    """
+    parsed = parse_model_family_version(model)
+    if parsed is None:
+        return False
+    parsed_family, version = parsed
+    if family is not None and parsed_family != family:
+        return False
+    return version >= _MODEL_FEATURE_MIN_VERSIONS[parsed_family]
 
 
 @dataclass
