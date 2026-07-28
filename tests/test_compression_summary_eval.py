@@ -210,8 +210,8 @@ class TestCodeSummaryAccuracy:
             ("def create_engine(url: str) -> DatabaseConnection:", "...", 38),
         ]
         summary = summarize_compressed_code(bodies, 6)
-        assert "6 bodies compressed" in summary
+        assert summary.startswith("6 bodies: ")
         has_names = any(
-            name in summary for name in ["connect()", "release()", "close_all()", "create_engine()"]
+            name in summary for name in ["connect", "release", "close_all", "create_engine"]
         )
         assert has_names, f"Summary missing function names: {summary}"

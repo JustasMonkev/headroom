@@ -123,7 +123,7 @@ class TestUniversalCompressor:
     def test_compress_json_content(self, compressor):
         """Test compression of JSON content."""
         content = json.dumps(
-            {"users": [{"id": i, "name": f"User {i}", "bio": "x" * 100} for i in range(10)]}
+            {"users": [{"id": i, "name": f"User {i}", "bio": "x" * 400} for i in range(10)]}
         )
 
         result = compressor.compress(content)
@@ -132,6 +132,19 @@ class TestUniversalCompressor:
         assert result.handler_used == "json"
         # Compression should reduce size
         assert len(result.compressed) < len(content)
+
+    def test_short_spans_are_left_verbatim(self, compressor):
+        """A span smaller than the threshold is not worth its elision marker.
+
+        At the old 51-char floor the marker was ~40% of the span, so 40 such
+        spans bought ~200 tokens of identical framing and nothing else.
+        """
+        content = json.dumps({"users": [{"id": i, "bio": "x" * 100} for i in range(10)]})
+
+        result = compressor.compress(content)
+
+        assert result.compressed == content
+        assert "…[c]…" not in result.compressed
 
     def test_compress_code_content(self, compressor):
         """Test compression of code content."""

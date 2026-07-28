@@ -45,6 +45,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -1813,8 +1814,13 @@ LOSSLESS_FOLD_MIN_CHARS = 80
 
 # Outer dict is keyed by ``id(router)`` so two routers active on the same
 # context (a pipeline holding more than one, a nested standalone router) keep
-# separate state. Inner dict is attribute name -> value.
-_REQUEST_SCOPE: ContextVar[dict[int, dict[str, Any]]] = ContextVar("headroom_router_request_scope")
+# separate state. The value pairs a WEAK reference to the owning router with
+# that router's ``attribute name -> value`` store: the weakref keeps the scope
+# from pinning a router alive AND lets a lookup reject a stale entry whose
+# ``id()`` was recycled by a later allocation.
+_REQUEST_SCOPE: ContextVar[dict[int, tuple[weakref.ref[Any], dict[str, Any]]]] = ContextVar(
+    "headroom_router_request_scope"
+)
 
 #: Ceiling on distinct routers tracked in one context before the scope is
 #: recycled. Requests normally involve a single router; the cap only bounds the
@@ -1847,9 +1853,11 @@ class _RequestScoped:
     def _store(obj: Any) -> dict[str, Any]:
         scope = _REQUEST_SCOPE.get(None)
         if scope is not None:
-            per_router = scope.get(id(obj))
-            if per_router is not None:
-                return per_router
+            entry = scope.get(id(obj))
+            # Identity check: an entry whose owner has been collected (and whose
+            # id() this object happens to have reused) must not be inherited.
+            if entry is not None and entry[0]() is obj:
+                return entry[1]
         fallback = obj.__dict__.get(_SCOPE_FALLBACK_ATTR)
         if fallback is None:
             fallback = {}
@@ -1880,7 +1888,7 @@ def _open_router_request_scope(router: Any) -> None:
     if scope is None or len(scope) > _REQUEST_SCOPE_MAX_ROUTERS:
         scope = {}
         _REQUEST_SCOPE.set(scope)
-    scope[id(router)] = {}
+    scope[id(router)] = (weakref.ref(router), {})
 
 
 class ContentRouter(Transform):
