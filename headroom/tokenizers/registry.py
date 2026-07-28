@@ -217,9 +217,15 @@ class TokenizerRegistry:
         registry = cls()
         model_lower = model.lower()
 
+        # The latest registration wins: clear the opposing per-model table,
+        # otherwise a model first registered with an instance and later
+        # re-registered with a factory (or vice versa) would keep serving the
+        # stale entry — get() consults _tokenizers first.
         if tokenizer is not None:
+            registry._model_factories.pop(model_lower, None)
             registry._tokenizers[model_lower] = tokenizer
         elif factory is not None:
+            registry._tokenizers.pop(model_lower, None)
             registry._model_factories[model_lower] = factory
         else:
             raise ValueError("Must provide either tokenizer or factory")

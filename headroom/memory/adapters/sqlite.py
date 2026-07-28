@@ -559,10 +559,21 @@ class SQLiteMemoryStore:
                     # key) extract to SQL NULL, so use IS NULL.
                     conditions.append(f"json_extract(metadata, '$.{key}') IS NULL")
                     continue
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
                 if isinstance(value, bool):
-                    params.append(int(value))
-                elif isinstance(value, (int, float, str)):
+                    # json_extract() collapses JSON true/1 (and false/0) to the
+                    # same SQL integer, so equality alone can't tell a boolean
+                    # flag from a numeric one. json_type() names booleans
+                    # 'true'/'false' directly — the type IS the value.
+                    conditions.append(f"json_type(metadata, '$.{key}') = ?")
+                    params.append("true" if value else "false")
+                    continue
+                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
+                if isinstance(value, (int, float)):
+                    # Require a numeric JSON type so {"active": true} doesn't
+                    # match a filter of 1 (the mirror of the boolean case).
+                    conditions.append(f"json_type(metadata, '$.{key}') IN ('integer', 'real')")
+                    params.append(value)
+                elif isinstance(value, str):
                     params.append(value)
                 else:
                     # Lists/dicts: json_extract returns their minified JSON text.

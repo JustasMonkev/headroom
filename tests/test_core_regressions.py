@@ -69,6 +69,24 @@ class TestCompressFailOpen:
         # Fail-open must hand back the caller's messages, not the hook's None.
         assert result.messages == original
 
+    def test_returns_unmutated_snapshot_when_hook_mutates_in_place(self) -> None:
+        from headroom.compress import compress
+        from headroom.hooks import CompressionHooks
+
+        class MutatingThenFailingHooks(CompressionHooks):
+            def pre_compress(self, messages, ctx):  # type: ignore[override]
+                # Mutates the caller's dicts in place, then a later stage blows up.
+                messages[0]["content"] = "MANGLED"
+                return messages
+
+            def compute_biases(self, messages, ctx):  # type: ignore[override]
+                raise RuntimeError("hook exploded")
+
+        original = [{"role": "user", "content": "keep me"}]
+        result = compress(original, model="gpt-4o", hooks=MutatingThenFailingHooks())
+        # Fail-open must return the PRE-hook content, not the mangled alias.
+        assert result.messages == [{"role": "user", "content": "keep me"}]
+
 
 class TestSimpleCompressTinyTarget:
     def test_never_grows_input(self) -> None:
@@ -107,6 +125,33 @@ class TestRegistryModelFactory:
             assert "factory-backed-model-x" in TokenizerRegistry.list_registered()
         finally:
             TokenizerRegistry._model_factories.pop("factory-backed-model-x", None)
+            TokenizerRegistry.clear_cache()
+
+    def test_reregistration_swaps_instance_and_factory(self) -> None:
+        from headroom.tokenizers.base import TokenCounter
+        from headroom.tokenizers.registry import TokenizerRegistry, register_tokenizer
+
+        class N(TokenCounter):
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+            def count_text(self, text: str) -> int:
+                return self.n
+
+            def count_messages(self, messages) -> int:
+                return self.n
+
+        try:
+            # Instance first, then factory: the factory must take effect.
+            register_tokenizer("factory-backed-model-z", tokenizer=N(1))
+            register_tokenizer("factory-backed-model-z", factory=lambda m: N(2))
+            assert TokenizerRegistry.get("factory-backed-model-z").count_text("x") == 2
+            # Factory first, then instance: the instance must take effect.
+            register_tokenizer("factory-backed-model-z", tokenizer=N(3))
+            assert TokenizerRegistry.get("factory-backed-model-z").count_text("x") == 3
+        finally:
+            TokenizerRegistry._tokenizers.pop("factory-backed-model-z", None)
+            TokenizerRegistry._model_factories.pop("factory-backed-model-z", None)
             TokenizerRegistry.clear_cache()
 
     def test_explicit_backend_still_bypasses_model_factory(self) -> None:

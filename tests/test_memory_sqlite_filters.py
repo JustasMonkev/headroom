@@ -80,3 +80,22 @@ async def test_metadata_filters_match_typed_values(store: SQLiteMemoryStore) -> 
     assert await ids(score=7) == ["m2"]
     assert await ids(weight=1.5) == ["m1"]
     assert await ids(score=99) == []
+
+
+async def test_metadata_filters_distinguish_bool_from_number(store: SQLiteMemoryStore) -> None:
+    """json_extract collapses JSON true and 1 to the same SQL integer; the
+    filter must not — a boolean filter matches only booleans and a numeric
+    filter only numbers."""
+    await store.save(Memory(id="b1", content="bool flag", user_id="u1", metadata={"flag": True}))
+    await store.save(Memory(id="n1", content="numeric flag", user_id="u1", metadata={"flag": 1}))
+    await store.save(Memory(id="b0", content="bool off", user_id="u1", metadata={"flag": False}))
+    await store.save(Memory(id="n0", content="numeric zero", user_id="u1", metadata={"flag": 0}))
+
+    async def ids(**metadata_filters):
+        found = await store.query(MemoryFilter(user_id="u1", metadata_filters=metadata_filters))
+        return sorted(m.id for m in found)
+
+    assert await ids(flag=True) == ["b1"]
+    assert await ids(flag=1) == ["n1"]
+    assert await ids(flag=False) == ["b0"]
+    assert await ids(flag=0) == ["n0"]

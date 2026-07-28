@@ -56,6 +56,7 @@ Examples:
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from dataclasses import dataclass, field, replace
@@ -231,8 +232,15 @@ def compress(
     # "returning original messages", but `messages` gets rebound by
     # hooks.pre_compress / pipeline extensions — a hook that forgets to
     # return the list would otherwise make the fail-open path hand None
-    # (or a hook-mangled list) to the provider.
-    original_messages = messages
+    # (or a hook-mangled list) to the provider. A deep snapshot, not an
+    # alias: a hook may mutate the list or its dicts IN PLACE and then a
+    # later stage may raise, and an alias would forward the mutated request
+    # anyway. Only paid when third-party code (hooks / extensions) actually
+    # gets a mutable reference — the plain path never mutates the input.
+    if hooks is not None or pipeline_extensions.enabled:
+        original_messages = copy.deepcopy(messages)
+    else:
+        original_messages = messages
 
     try:
         # Compute biases from hooks if provided
