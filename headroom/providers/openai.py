@@ -149,9 +149,16 @@ def _load_custom_model_config() -> dict[str, Any]:
     2. ~/.headroom/models.json config file
 
     Returns:
-        Dict with 'context_limits' and 'pricing' keys.
+        Dict with merged 'context_limits'/'pricing'/'encodings' keys, plus
+        per-source 'env_layer' and 'file_layer' dicts of the same shape so
+        prefix matching can honor source precedence (env beats file) instead
+        of letting a longer lower-priority key win.
     """
     config: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
+    env_layer: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
+    file_layer: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
+    config["env_layer"] = env_layer
+    config["file_layer"] = file_layer
 
     # Check environment variable
     env_config = os.environ.get("HEADROOM_MODEL_LIMITS", "")
@@ -168,10 +175,13 @@ def _load_custom_model_config() -> dict[str, Any]:
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
+                env_layer["context_limits"].update(openai_config["context_limits"])
             if "pricing" in openai_config:
                 config["pricing"].update(openai_config["pricing"])
+                env_layer["pricing"].update(openai_config["pricing"])
             if "encodings" in openai_config:
                 config["encodings"].update(openai_config["encodings"])
+                env_layer["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
         except (json.JSONDecodeError, OSError) as e:
@@ -194,14 +204,17 @@ def _load_custom_model_config() -> dict[str, Any]:
                 for model, limit in openai_config["context_limits"].items():
                     if model not in config["context_limits"]:
                         config["context_limits"][model] = limit
+                        file_layer["context_limits"][model] = limit
             if "pricing" in openai_config:
                 for model, pricing in openai_config["pricing"].items():
                     if model not in config["pricing"]:
                         config["pricing"][model] = pricing
+                        file_layer["pricing"][model] = pricing
             if "encodings" in openai_config:
                 for model, encoding in openai_config["encodings"].items():
                     if model not in config["encodings"]:
                         config["encodings"][model] = encoding
+                        file_layer["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
         except (json.JSONDecodeError, OSError) as e:
@@ -443,20 +456,26 @@ class OpenAIProvider(Provider):
         # config-file "o1-mini") cannot out-rank a shorter explicit override
         # either. Merged-table matching alone would let prefix length trump
         # configuration precedence in both directions.
-        config_limit_layer: dict[str, int] = {}
-        config_pricing_layer: dict[str, tuple[float, float]] = {}
-
-        # Load from config file and env var
+        # Load from config file and env var — kept as separate layers too,
+        # since the env var out-ranks the config file and a longer file key
+        # must not beat a shorter env family override in prefix matching.
         custom_config = _load_custom_model_config()
         self._context_limits.update(custom_config["context_limits"])
-        config_limit_layer.update(custom_config["context_limits"])
         self._encodings.update(custom_config["encodings"])
+        env_limit_layer: dict[str, int] = dict(custom_config["env_layer"]["context_limits"])
+        file_limit_layer: dict[str, int] = dict(custom_config["file_layer"]["context_limits"])
 
         # Handle pricing (can be tuple or list from JSON)
+        env_pricing_layer: dict[str, tuple[float, float]] = {}
+        file_pricing_layer: dict[str, tuple[float, float]] = {}
+        env_pricing_keys = set(custom_config["env_layer"]["pricing"])
         for model, pricing in custom_config["pricing"].items():
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
-                config_pricing_layer[model] = self._pricing[model]
+                if model in env_pricing_keys:
+                    env_pricing_layer[model] = self._pricing[model]
+                else:
+                    file_pricing_layer[model] = self._pricing[model]
 
         # Explicit overrides take precedence
         explicit_limit_layer: dict[str, int] = {}
@@ -465,10 +484,10 @@ class OpenAIProvider(Provider):
             explicit_limit_layer.update(context_limits)
 
         self._custom_limit_layers: list[dict[str, int]] = [
-            layer for layer in (explicit_limit_layer, config_limit_layer) if layer
+            layer for layer in (explicit_limit_layer, env_limit_layer, file_limit_layer) if layer
         ]
         self._custom_pricing_layers: list[dict[str, tuple[float, float]]] = [
-            layer for layer in (config_pricing_layer,) if layer
+            layer for layer in (env_pricing_layer, file_pricing_layer) if layer
         ]
 
         self._token_counters: dict[str, TokenCounter] = {}

@@ -85,6 +85,12 @@ class TestCustomLayerPrecedence:
                 "context_limits": {"o1-mini": 128000},
                 "pricing": {},
                 "encodings": {},
+                "env_layer": {"context_limits": {}, "pricing": {}, "encodings": {}},
+                "file_layer": {
+                    "context_limits": {"o1-mini": 128000},
+                    "pricing": {},
+                    "encodings": {},
+                },
             },
         )
         provider = OpenAIProvider(context_limits={"o1": 64000})
@@ -92,3 +98,33 @@ class TestCustomLayerPrecedence:
         # Without an explicit override, the config-file entry applies.
         provider2 = OpenAIProvider()
         assert provider2._get_context_limit_manual("o1-mini-2024-09-12") == 128000
+
+
+class TestEnvVsFileLayerPrecedence:
+    def test_env_family_override_beats_longer_file_key(self, monkeypatch) -> None:
+        """An env-var family prefix must not be out-ranked by a longer key
+        from the lower-priority config file."""
+        import headroom.providers.openai as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_load_custom_model_config",
+            lambda: {
+                "context_limits": {"o1": 64000, "o1-mini": 128000},
+                "pricing": {"o1": (1.0, 2.0), "o1-mini": (9.0, 9.0)},
+                "encodings": {},
+                "env_layer": {
+                    "context_limits": {"o1": 64000},
+                    "pricing": {"o1": (1.0, 2.0)},
+                    "encodings": {},
+                },
+                "file_layer": {
+                    "context_limits": {"o1-mini": 128000},
+                    "pricing": {"o1-mini": (9.0, 9.0)},
+                    "encodings": {},
+                },
+            },
+        )
+        provider = OpenAIProvider()
+        assert provider._get_context_limit_manual("o1-mini-2024-09-12") == 64000
+        assert provider._get_pricing("o1-mini-2024-09-12") == (1.0, 2.0)

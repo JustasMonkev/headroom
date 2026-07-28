@@ -95,7 +95,12 @@ def _keep_tokenizer_truncated_tail(
         if wid is not None and wid > max_covered:
             max_covered = wid
     if max_covered < chunk_len - 1:
-        kept_ids.update(range(chunk_start + max_covered + 1, chunk_start + chunk_len))
+        # Keep from the BOUNDARY word (max_covered), not the one after it:
+        # when truncation lands mid-word, that word's ID still appears in
+        # word_ids, so it looks covered — but the classifier only scored its
+        # retained sub-word prefix and may drop the whole word on that
+        # partial evidence.
+        kept_ids.update(range(chunk_start + max(max_covered, 0), chunk_start + chunk_len))
 
 
 # ONNX artifacts are resolved against the model repo in this order, falling

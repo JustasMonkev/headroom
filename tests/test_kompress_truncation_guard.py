@@ -16,9 +16,11 @@ def test_truncated_tail_is_kept_verbatim() -> None:
     kept: set[int] = set()
     # Chunk of 10 words; the tokenizer only covered words 0..5 before hitting
     # the sub-word-token cap ([CLS]/None entries mixed in, as real word_ids are).
+    # The BOUNDARY word (5) is kept too: truncation may have landed mid-word,
+    # so its score reflects only a sub-word prefix.
     word_ids = [None, 0, 0, 1, 2, 3, 3, 4, 5, None]
     _keep_tokenizer_truncated_tail(kept, word_ids, chunk_len=10, chunk_start=100)
-    assert kept == {106, 107, 108, 109}
+    assert kept == {105, 106, 107, 108, 109}
 
 
 def test_fully_covered_chunk_adds_nothing() -> None:

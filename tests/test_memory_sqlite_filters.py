@@ -189,16 +189,30 @@ async def test_objects_inside_arrays_match_regardless_of_key_order(
     assert await ids(steps=[{"a": 1, "b": 2}]) == []
 
 
-async def test_invalid_nested_key_makes_filter_non_matching(store: SQLiteMemoryStore) -> None:
-    """A nested key that can't be expressed as a safe JSON path must make the
-    whole filter match nothing — silently dropping it would leave only the
-    entry count enforced, matching ANY one-entry object."""
+async def test_invalid_nested_key_uses_bounded_comparison(store: SQLiteMemoryStore) -> None:
+    """A nested key that can't be expressed as a safe JSON path routes the
+    object through the bounded json_each-join comparison (keys are joined as
+    DATA, not interpolated into paths): the filter matches exactly the
+    intended object — never an arbitrary same-size one."""
     await store.save(
         Memory(id="other", content="unrelated", user_id="u1", metadata={"prefs": {"other": "v"}})
+    )
+    await store.save(
+        Memory(
+            id="dotted",
+            content="dotted key",
+            user_id="u1",
+            metadata={"prefs": {"display.name": "alice"}},
+        )
     )
 
     found = await store.query(
         MemoryFilter(user_id="u1", metadata_filters={"prefs": {"display.name": "alice"}})
+    )
+    assert sorted(m.id for m in found) == ["dotted"]
+
+    found = await store.query(
+        MemoryFilter(user_id="u1", metadata_filters={"prefs": {"display.name": "bob"}})
     )
     assert found == []
 
@@ -221,3 +235,42 @@ async def test_large_array_filter_does_not_blow_expression_depth(
 
     assert await ids(ids=big) == ["big"]
     assert await ids(ids=big[:-1] + [998]) == []
+
+
+async def test_deeply_nested_containers_stay_within_expression_depth(
+    store: SQLiteMemoryStore,
+) -> None:
+    """Per-container limits compose multiplicatively: an outer array of eight
+    64-element arrays passes every local check but would emit 1000+ ANDs.
+    The shared budget must keep the query executable and still exact."""
+    nested = [[i * 64 + j for j in range(64)] for i in range(8)]
+    await store.save(Memory(id="deep", content="nested", user_id="u1", metadata={"m": nested}))
+    almost = [row[:] for row in nested]
+    almost[7][63] = -1
+    await store.save(Memory(id="near", content="almost", user_id="u1", metadata={"m": almost}))
+
+    async def ids(**metadata_filters):
+        found = await store.query(MemoryFilter(user_id="u1", metadata_filters=metadata_filters))
+        return sorted(m.id for m in found)
+
+    assert await ids(m=nested) == ["deep"]
+    assert await ids(m=almost) == ["near"]
+
+
+async def test_huge_object_filter_stays_key_order_insensitive(
+    store: SQLiteMemoryStore,
+) -> None:
+    """Above the structural threshold the bounded json_each-join comparison
+    keys on entry NAME, so a 65+-key object still matches a filter built in
+    reversed insertion order."""
+    big = {f"k{i}": i for i in range(70)}
+    await store.save(Memory(id="bigobj", content="big", user_id="u1", metadata={"cfg": big}))
+
+    reversed_order = {k: big[k] for k in reversed(list(big))}
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": reversed_order}))
+    assert [m.id for m in found] == ["bigobj"]
+
+    wrong = dict(big)
+    wrong["k69"] = -1
+    found = await store.query(MemoryFilter(user_id="u1", metadata_filters={"cfg": wrong}))
+    assert found == []
