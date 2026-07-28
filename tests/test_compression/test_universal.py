@@ -123,7 +123,7 @@ class TestUniversalCompressor:
     def test_compress_json_content(self, compressor):
         """Test compression of JSON content."""
         content = json.dumps(
-            {"users": [{"id": i, "name": f"User {i}", "bio": "x" * 400} for i in range(10)]}
+            {"users": [{"id": i, "name": f"User {i}", "bio": "x" * 300} for i in range(10)]}
         )
 
         result = compressor.compress(content)
@@ -139,7 +139,7 @@ class TestUniversalCompressor:
         At the old 51-char floor the marker was ~40% of the span, so 40 such
         spans bought ~200 tokens of identical framing and nothing else.
         """
-        content = json.dumps({"users": [{"id": i, "bio": "x" * 100} for i in range(10)]})
+        content = json.dumps({"users": [{"id": i, "bio": "x" * 60} for i in range(10)]})
 
         result = compressor.compress(content)
 

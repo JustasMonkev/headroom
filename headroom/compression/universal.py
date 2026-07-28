@@ -55,8 +55,16 @@ logger = logging.getLogger(__name__)
 _ELISION_MARKER = "…[c]…"
 
 # Minimum non-structural span worth compressing. Every compressed span pays
-# for one `_ELISION_MARKER`, so below this the framing dominates the saving.
-_MIN_SPAN_TO_COMPRESS = 200
+# for one `_ELISION_MARKER`, so below this the framing dominates the saving:
+# at the previous floor of 50 the old 20-char banner was ~40% of the span.
+#
+# NOT 200. Measured against this repo's own representative fixtures
+# (`tests/test_compression/test_evals.py`), the longest non-structural span
+# after entropy preservation is 109 chars in the GitHub API response and 116
+# in the application log — a 200-char floor makes this compressor a no-op on
+# both. 100 is the largest floor that still compresses realistic payloads, and
+# at 100 chars the marker is ~6% of the span rather than ~40%.
+_MIN_SPAN_TO_COMPRESS = 100
 
 
 @dataclass
@@ -355,7 +363,13 @@ class UniversalCompressor:
                 # 40 such spans were ~200 tokens of identical framing.
                 if len(span_content) > _MIN_SPAN_TO_COMPRESS:
                     compressed = self._compress_fn(span_content)
-                    result_parts.append(compressed)
+                    # Net-win guard: `_compress_fn` is pluggable (Kompress, or
+                    # the truncating fallback), so nothing guarantees its
+                    # output is smaller. Keeping the original when it isn't
+                    # costs nothing and can only help.
+                    result_parts.append(
+                        compressed if len(compressed) < len(span_content) else span_content
+                    )
                 else:
                     result_parts.append(span_content)
 
