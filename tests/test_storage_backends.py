@@ -333,3 +333,22 @@ def test_jsonl_query_handles_mixed_timestamp_awareness(tmp_path: Path) -> None:
     results = storage.query(limit=10)
     assert [m.request_id for m in results] == ["aware", "naive"]
     assert [m.request_id for m in storage.query(limit=1)] == ["aware"]
+
+
+def test_jsonl_time_filters_handle_mixed_awareness(tmp_path: Path) -> None:
+    """Aware filter bounds against naive records (and vice versa) must not
+    raise TypeError — paging exhausts the history, so one mismatched record
+    would break every filtered page."""
+    from datetime import timezone
+
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    storage.save(_metrics("naive", datetime(2026, 4, 23, 12, 0, 0)))
+    storage.save(_metrics("aware", datetime(2026, 4, 23, 13, 0, 0, tzinfo=timezone.utc)))
+
+    aware_bound = datetime(2026, 4, 23, 12, 30, 0, tzinfo=timezone.utc)
+    naive_bound = datetime(2026, 4, 23, 12, 30, 0)
+    for bound in (aware_bound, naive_bound):
+        assert [m.request_id for m in storage.query(start_time=bound)] == ["aware"]
+        assert [m.request_id for m in storage.query(end_time=bound)] == ["naive"]
+        assert storage.count(start_time=bound) == 1
+        assert storage.get_summary_stats(start_time=bound)["total_requests"] == 1

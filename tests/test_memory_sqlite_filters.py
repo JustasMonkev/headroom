@@ -161,3 +161,29 @@ async def test_object_filters_match_regardless_of_key_order(store: SQLiteMemoryS
     assert await ids(prefs={"a": 1, "b": "x", "c": True}) == ["obj3"]
     # Nested type discipline still applies inside objects.
     assert await ids(prefs={"a": True, "b": "x"}) == []
+
+
+async def test_objects_inside_arrays_match_regardless_of_key_order(
+    store: SQLiteMemoryStore,
+) -> None:
+    """Array order matters, but the key order of objects NESTED in arrays
+    must not — elements are compared structurally, per index."""
+    await store.save(
+        Memory(
+            id="arrobj",
+            content="steps",
+            user_id="u1",
+            metadata={"steps": [{"a": 1, "b": 2}, "x"]},
+        )
+    )
+
+    async def ids(**metadata_filters):
+        found = await store.query(MemoryFilter(user_id="u1", metadata_filters=metadata_filters))
+        return sorted(m.id for m in found)
+
+    # Nested object in either key order matches.
+    assert await ids(steps=[{"b": 2, "a": 1}, "x"]) == ["arrobj"]
+    assert await ids(steps=[{"a": 1, "b": 2}, "x"]) == ["arrobj"]
+    # Array ORDER still matters; wrong length still fails.
+    assert await ids(steps=["x", {"a": 1, "b": 2}]) == []
+    assert await ids(steps=[{"a": 1, "b": 2}]) == []

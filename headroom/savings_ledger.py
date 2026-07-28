@@ -422,27 +422,33 @@ def _should_compact(target: Path, st: os.stat_result) -> bool:
         return False
     # If a previous compaction couldn't get below the threshold (the 30-day
     # working set is simply that big), don't rewrite the whole file again on
-    # every append — wait until it has regrown meaningfully. The floor comes
-    # from this process's cache, or the cross-process sidecar when another
-    # worker did the compaction.
+    # every append — wait until it has regrown meaningfully. BOTH floor
+    # sources are consulted every time: a worker whose process-local floor
+    # predates another worker's more recent compaction must see the newer
+    # sidecar floor, or every worker with an old local entry would repeat
+    # the rewrite once per cycle. A floor is valid only if it describes the
+    # file we are looking at: same (device, inode) — a rotation/replacement
+    # is a different file — and not larger than the current size (a shrink
+    # means someone else already compacted below that floor).
     path_key = str(target)
-    cached = _last_compact_sizes.get(path_key)
-    if cached is None:
-        cached = _read_shared_floor(target)
-    if cached is None:
+    identity = (st.st_dev, st.st_ino)
+    floors: list[int] = []
+
+    local = _last_compact_sizes.get(path_key)
+    if local is not None:
+        if (local[0], local[1]) != identity or st.st_size < local[2]:
+            _last_compact_sizes.pop(path_key, None)
+        else:
+            floors.append(local[2])
+
+    shared = _read_shared_floor(target)
+    if shared is not None and (shared[0], shared[1]) == identity and st.st_size >= shared[2]:
+        floors.append(shared[2])
+
+    if not floors:
         return True
-    dev, ino, floor = cached
-    if (st.st_dev, st.st_ino) != (dev, ino) or st.st_size < floor:
-        # The pathname now refers to a different file (rotation/replacement),
-        # or the file shrank below our recorded floor (another process
-        # compacted it). Either way the cached floor describes a file that no
-        # longer exists in that form — keeping it would suppress retention
-        # enforcement on the new content. Forget it and re-evaluate fresh.
-        _last_compact_sizes.pop(path_key, None)
-        return True
-    if st.st_size <= floor + _COMPACT_REGROWTH_BYTES:
-        return False
-    return True
+    # The largest valid floor reflects the most recent compaction.
+    return st.st_size > max(floors) + _COMPACT_REGROWTH_BYTES
 
 
 def _maybe_compact(target: Path) -> None:

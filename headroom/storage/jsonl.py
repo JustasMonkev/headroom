@@ -14,6 +14,17 @@ from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
 
 
+def _utc_key(ts: datetime) -> datetime:
+    """Comparable UTC form of a possibly-naive timestamp.
+
+    A long-lived file can mix naive and timezone-aware timestamps
+    (parse_timestamp keeps a "+00:00" offset but strips "Z"), and comparing
+    the two raises TypeError. Naive values are treated as UTC — the
+    convention format_timestamp writes.
+    """
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
 class JSONLStorage(Storage):
     """JSONL file-based metrics storage."""
 
@@ -115,18 +126,19 @@ class JSONLStorage(Storage):
         if page_end <= 0:
             return []
 
-        def _key_ts(ts: datetime) -> datetime:
-            # A long-lived file can mix naive and timezone-aware timestamps
-            # (parse_timestamp keeps a "+00:00" offset but strips "Z"), and
-            # comparing the two raises TypeError. Order everything as UTC,
-            # treating naive as UTC — the convention format_timestamp writes.
-            return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+        # Normalize BOTH the filter bounds and each record's timestamp: the
+        # file can mix naive and aware timestamps (see _utc_key), and a raw
+        # comparison between the two raises TypeError — since paging exhausts
+        # the history, one mismatched old record would break every page.
+        start_key = _utc_key(start_time) if start_time is not None else None
+        end_key = _utc_key(end_time) if end_time is not None else None
 
         def _matches() -> Any:
             for idx, metrics in enumerate(self.iter_all()):
-                if start_time is not None and metrics.timestamp < start_time:
+                ts = _utc_key(metrics.timestamp)
+                if start_key is not None and ts < start_key:
                     continue
-                if end_time is not None and metrics.timestamp > end_time:
+                if end_key is not None and ts > end_key:
                     continue
                 if model is not None and metrics.model != model:
                     continue
@@ -134,7 +146,7 @@ class JSONLStorage(Storage):
                     continue
                 # Tie-break equal timestamps by earlier file position first,
                 # matching the previous stable descending sort.
-                yield (_key_ts(metrics.timestamp), -idx), metrics
+                yield (ts, -idx), metrics
 
         newest = heapq.nlargest(page_end, _matches(), key=lambda pair: pair[0])
         return [metrics for _, metrics in newest[offset:]]
@@ -148,11 +160,14 @@ class JSONLStorage(Storage):
     ) -> int:
         """Count metrics matching filters."""
         count = 0
+        start_key = _utc_key(start_time) if start_time is not None else None
+        end_key = _utc_key(end_time) if end_time is not None else None
 
         for metrics in self.iter_all():
-            if start_time is not None and metrics.timestamp < start_time:
+            ts = _utc_key(metrics.timestamp)
+            if start_key is not None and ts < start_key:
                 continue
-            if end_time is not None and metrics.timestamp > end_time:
+            if end_key is not None and ts > end_key:
                 continue
             if model is not None and metrics.model != model:
                 continue
@@ -195,11 +210,14 @@ class JSONLStorage(Storage):
         total_cache_alignment = 0.0
         audit_count = 0
         optimize_count = 0
+        start_key = _utc_key(start_time) if start_time is not None else None
+        end_key = _utc_key(end_time) if end_time is not None else None
 
         for metrics in self.iter_all():
-            if start_time is not None and metrics.timestamp < start_time:
+            ts = _utc_key(metrics.timestamp)
+            if start_key is not None and ts < start_key:
                 continue
-            if end_time is not None and metrics.timestamp > end_time:
+            if end_key is not None and ts > end_key:
                 continue
 
             total_requests += 1

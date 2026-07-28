@@ -290,3 +290,38 @@ def test_corrupt_utf8_line_is_skipped_not_repaired(tmp_path: Path) -> None:
     report = sl.aggregate_savings(target, now=now)
     assert report.lifetime["tokens_saved"] == 300  # torn line dropped entirely
     assert report.lifetime["calls"] == 2
+
+
+def test_stale_local_floor_defers_to_newer_sidecar(tmp_path: Path, monkeypatch) -> None:
+    """Worker A's process-local floor predates worker B's compaction. A's
+    local floor alone says "regrown, compact again" — but the sidecar B
+    published reflects the newer compaction, so A must skip the rewrite."""
+    target = tmp_path / "events.jsonl"
+    now = datetime.now(timezone.utc)
+    for _ in range(200):
+        _write_event_line(target, ts=now)
+
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 128)
+    monkeypatch.setattr(sl, "_COMPACT_REGROWTH_BYTES", 64 * 1024)
+    sl._last_compact_sizes.clear()
+
+    st = target.stat()
+    # A's stale local floor: same inode, but far below the current size —
+    # wait, a floor BELOW current-size-minus-regrowth would trigger a
+    # rewrite; that is exactly the stale state being tested.
+    stale_floor = st.st_size - 70 * 1024 if st.st_size > 70 * 1024 else 1
+    sl._last_compact_sizes[str(target)] = (st.st_dev, st.st_ino, max(stale_floor, 1))
+    # B's newer compaction published the current size as the floor.
+    sl._write_shared_floor(target, (st.st_dev, st.st_ino, st.st_size))
+
+    real_open = open
+    rewrites: list[str] = []
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        if str(file) == str(target) and "+" in mode:
+            rewrites.append(mode)
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", counting_open)
+    sl._maybe_compact(target)
+    assert rewrites == []

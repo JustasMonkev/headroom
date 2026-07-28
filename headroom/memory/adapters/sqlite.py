@@ -615,12 +615,15 @@ class SQLiteMemoryStore:
                     f"{json_path}.{sub_key}", sub_value, conditions, params
                 )
             return
-        # Arrays: JSON arrays are ordered, so minified-text equality is
-        # well-defined. Pin the container type so the filter doesn't match a
-        # STRING holding the same minified representation.
+        # Arrays: JSON arrays are ordered, so compare element-by-element in
+        # order — but recurse per element, because an element may itself be
+        # an OBJECT whose key order must not matter (raw minified-text
+        # equality of the whole array would be order-sensitive there).
         conditions.append(f"json_type(metadata, '{json_path}') = 'array'")
-        conditions.append(f"json_extract(metadata, '{json_path}') = ?")
-        params.append(json.dumps(value, separators=(",", ":")))
+        conditions.append(f"json_array_length(metadata, '{json_path}') = ?")
+        params.append(len(value))
+        for index, item in enumerate(value):
+            self._append_metadata_condition(f"{json_path}[{index}]", item, conditions, params)
 
     async def query(self, filter: MemoryFilter) -> list[Memory]:
         """Query memories matching the given filter.
