@@ -141,7 +141,11 @@ class EstimatingTokenCounter(BaseTokenizer):
         Returns:
             Number of dense-script characters in the text.
         """
-        return len(self.CJK_PATTERN.findall(text))
+        # finditer, not findall: findall materializes one single-char string
+        # per match, spiking ~80x the input size in transient allocations on a
+        # CJK-heavy payload — and this runs on the live proxy count path,
+        # twice per request (before and after compression).
+        return sum(1 for _ in self.CJK_PATTERN.finditer(text))
 
     def _detect_ratio(self, text: str) -> float:
         """Detect optimal chars-per-token ratio based on content.

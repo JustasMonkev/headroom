@@ -149,9 +149,16 @@ def _load_custom_model_config() -> dict[str, Any]:
     2. ~/.headroom/models.json config file
 
     Returns:
-        Dict with 'context_limits' and 'pricing' keys.
+        Dict with merged 'context_limits'/'pricing'/'encodings' keys, plus
+        per-source 'env_layer' and 'file_layer' dicts of the same shape so
+        prefix matching can honor source precedence (env beats file) instead
+        of letting a longer lower-priority key win.
     """
     config: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
+    env_layer: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
+    file_layer: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
+    config["env_layer"] = env_layer
+    config["file_layer"] = file_layer
 
     # Check environment variable
     env_config = os.environ.get("HEADROOM_MODEL_LIMITS", "")
@@ -168,10 +175,13 @@ def _load_custom_model_config() -> dict[str, Any]:
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
+                env_layer["context_limits"].update(openai_config["context_limits"])
             if "pricing" in openai_config:
                 config["pricing"].update(openai_config["pricing"])
+                env_layer["pricing"].update(openai_config["pricing"])
             if "encodings" in openai_config:
                 config["encodings"].update(openai_config["encodings"])
+                env_layer["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
         except (json.JSONDecodeError, OSError) as e:
@@ -194,14 +204,17 @@ def _load_custom_model_config() -> dict[str, Any]:
                 for model, limit in openai_config["context_limits"].items():
                     if model not in config["context_limits"]:
                         config["context_limits"][model] = limit
+                        file_layer["context_limits"][model] = limit
             if "pricing" in openai_config:
                 for model, pricing in openai_config["pricing"].items():
                     if model not in config["pricing"]:
                         config["pricing"][model] = pricing
+                        file_layer["pricing"][model] = pricing
             if "encodings" in openai_config:
                 for model, encoding in openai_config["encodings"].items():
                     if model not in config["encodings"]:
                         config["encodings"][model] = encoding
+                        file_layer["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
         except (json.JSONDecodeError, OSError) as e:
@@ -246,14 +259,44 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get a bounded, offline-aware tiktoken encoding, cached."""
+    """Get a bounded, offline-aware tiktoken encoding, cached.
+
+    Routed through the shared bounded loader: tiktoken's vocab download has no
+    network timeout, so a raw ``tiktoken.get_encoding`` here could hang a
+    request indefinitely on a stalled connection (GH #956). The shared loader
+    bounds the load, honors HEADROOM_OFFLINE, and — when the download is
+    unreachable or forbidden — falls back to the exact BPE table bundled in
+    ``headroom._core`` instead of failing.
+    """
     if not TIKTOKEN_AVAILABLE:
+        from headroom.tokenizers.tiktoken_counter import _rust_bundled_encoding
+
+        bundled = _rust_bundled_encoding(encoding_name)
+        if bundled is not None:
+            return bundled
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
     from headroom.tokenizers.tiktoken_counter import load_encoding
 
     return load_encoding(encoding_name)
+
+
+def _longest_prefix_match(model: str, table: dict[str, Any]) -> str | None:
+    """Longest key in ``table`` that prefixes ``model``, or None.
+
+    First-match iteration over a dict is insertion-order-dependent and wrong
+    for overlapping keys: "gpt-4o-mini-2024-07-18" would resolve via "gpt-4o"
+    (16.7x the real price) and "o1-mini-2024-09-12" via "o1" (a 200k context
+    claim for a 128k model). Longest prefix always picks the most specific
+    entry regardless of table ordering. Same hazard already documented and
+    fixed in headroom/tokenizers/tiktoken_counter.py:get_encoding_for_model.
+    """
+    best: str | None = None
+    for prefix in table:
+        if model.startswith(prefix) and (best is None or len(prefix) > len(best)):
+            best = prefix
+    return best
 
 
 def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
@@ -267,9 +310,9 @@ def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | 
         return _MODEL_ENCODINGS[model]
 
     # Prefix match for versioned models
-    for prefix, encoding in _MODEL_ENCODINGS.items():
-        if model.startswith(prefix):
-            return encoding
+    prefix = _longest_prefix_match(model, _MODEL_ENCODINGS)
+    if prefix is not None:
+        return _MODEL_ENCODINGS[prefix]
 
     # Pattern-based inference
     family = _infer_model_family(model)
@@ -302,6 +345,11 @@ class OpenAITokenCounter:
         """Count tokens in text."""
         if not text:
             return 0
+        count_tokens = getattr(self._encoding, "count_tokens", None)
+        if count_tokens is not None:
+            # Rust-bundled fallback encoding: count without materializing the
+            # token-id list across the FFI boundary.
+            return int(count_tokens(text))
         try:
             return len(self._encoding.encode(text))
         except ValueError:
@@ -399,19 +447,48 @@ class OpenAIProvider(Provider):
         self._pricing = {**_PRICING}
         self._encodings: dict[str, str] = {**_MODEL_ENCODINGS}
 
-        # Load from config file and env var
+        # Caller-supplied entries are also kept in separate LAYERS, ordered
+        # by precedence (explicit constructor arg first, then env/config
+        # file): prefix matching consults each layer before the built-in
+        # table, so a family override like {"o1": 64000} applies to
+        # "o1-mini-2024-09-12" even though the built-in "o1-mini" key is a
+        # longer prefix — and a longer key in a LOWER-priority source (a
+        # config-file "o1-mini") cannot out-rank a shorter explicit override
+        # either. Merged-table matching alone would let prefix length trump
+        # configuration precedence in both directions.
+        # Load from config file and env var — kept as separate layers too,
+        # since the env var out-ranks the config file and a longer file key
+        # must not beat a shorter env family override in prefix matching.
         custom_config = _load_custom_model_config()
         self._context_limits.update(custom_config["context_limits"])
         self._encodings.update(custom_config["encodings"])
+        env_limit_layer: dict[str, int] = dict(custom_config["env_layer"]["context_limits"])
+        file_limit_layer: dict[str, int] = dict(custom_config["file_layer"]["context_limits"])
 
         # Handle pricing (can be tuple or list from JSON)
+        env_pricing_layer: dict[str, tuple[float, float]] = {}
+        file_pricing_layer: dict[str, tuple[float, float]] = {}
+        env_pricing_keys = set(custom_config["env_layer"]["pricing"])
         for model, pricing in custom_config["pricing"].items():
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
+                if model in env_pricing_keys:
+                    env_pricing_layer[model] = self._pricing[model]
+                else:
+                    file_pricing_layer[model] = self._pricing[model]
 
         # Explicit overrides take precedence
+        explicit_limit_layer: dict[str, int] = {}
         if context_limits:
             self._context_limits.update(context_limits)
+            explicit_limit_layer.update(context_limits)
+
+        self._custom_limit_layers: list[dict[str, int]] = [
+            layer for layer in (explicit_limit_layer, env_limit_layer, file_limit_layer) if layer
+        ]
+        self._custom_pricing_layers: list[dict[str, tuple[float, float]]] = [
+            layer for layer in (env_pricing_layer, file_pricing_layer) if layer
+        ]
 
         self._token_counters: dict[str, TokenCounter] = {}
 
@@ -472,6 +549,15 @@ class OpenAIProvider(Provider):
         # warning and skew compression. Configuring the alias via
         # HEADROOM_MODEL_LIMITS / ~/.headroom/models.json makes it authoritative
         # here, before the dynamic LiteLLM lookup. Fail-soft, no network.
+        # Layers before the merged table: a merged exact entry may come from a
+        # lower-priority source (or the built-ins) and must not bypass a
+        # higher-priority family override.
+        for layer in self._custom_limit_layers:
+            if model in layer:
+                return layer[model]
+            layer_prefix = _longest_prefix_match(model, layer)
+            if layer_prefix is not None:
+                return layer[layer_prefix]
         if model in self._context_limits:
             return self._context_limits[model]
 
@@ -492,13 +578,23 @@ class OpenAIProvider(Provider):
 
     def _get_context_limit_manual(self, model: str) -> int:
         """Get context limit using hardcoded values (fallback)."""
+        # Custom layers are consulted in precedence order (explicit > env >
+        # file) BEFORE the merged table's exact matches: a merged exact entry
+        # can originate from a lower-priority source or the built-ins, and
+        # returning it first would let it bypass a higher-priority family
+        # override (env "o1" must beat a built-in exact "o1-mini"). Within a
+        # layer, exact beats prefix; across layers, source precedence wins.
+        for layer in self._custom_limit_layers:
+            if model in layer:
+                return layer[model]
+            prefix = _longest_prefix_match(model, layer)
+            if prefix is not None:
+                return layer[prefix]
         if model in self._context_limits:
             return self._context_limits[model]
-
-        # Prefix match
-        for prefix, limit in self._context_limits.items():
-            if model.startswith(prefix):
-                return limit
+        prefix = _longest_prefix_match(model, self._context_limits)
+        if prefix is not None:
+            return self._context_limits[prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)
@@ -596,14 +692,20 @@ class OpenAIProvider(Provider):
 
     def _get_pricing(self, model: str) -> tuple[float, float] | None:
         """Get pricing for a model with fallback logic."""
-        # Direct match
+        # Custom layers first, in precedence order (env > file), each with
+        # exact-then-prefix — see _get_context_limit_manual for why merged
+        # exact matches must not be consulted before the layers.
+        for layer in self._custom_pricing_layers:
+            if model in layer:
+                return layer[model]
+            model_prefix = _longest_prefix_match(model, layer)
+            if model_prefix is not None:
+                return layer[model_prefix]
         if model in self._pricing:
             return self._pricing[model]
-
-        # Prefix match
-        for model_prefix, pricing in self._pricing.items():
-            if model.startswith(model_prefix):
-                return pricing
+        model_prefix = _longest_prefix_match(model, self._pricing)
+        if model_prefix is not None:
+            return self._pricing[model_prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)

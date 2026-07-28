@@ -647,10 +647,17 @@ class HeadroomConfig:
         """
         if model in self.model_context_limits:
             return self.model_context_limits[model]
-        # Try prefix matching for versioned model names
-        for known_model, limit in self.model_context_limits.items():
-            if model.startswith(known_model):
-                return limit
+        # Try prefix matching for versioned model names. Longest prefix wins:
+        # with {"gpt-4": 8192, "gpt-4o": 128000} configured, "gpt-4o-mini"
+        # must resolve via "gpt-4o", not whichever key dict order yields first.
+        best_match: str | None = None
+        for known_model in self.model_context_limits:
+            if model.startswith(known_model) and (
+                best_match is None or len(known_model) > len(best_match)
+            ):
+                best_match = known_model
+        if best_match is not None:
+            return self.model_context_limits[best_match]
         return None
 
 

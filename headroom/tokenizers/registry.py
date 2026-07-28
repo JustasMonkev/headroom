@@ -103,6 +103,12 @@ class TokenizerRegistry:
     # Registered factories (backend -> factory function)
     _factories: dict[str, Callable[[str], TokenCounter]] = {}
 
+    # Per-model factories registered via register(model, factory=...). Kept
+    # separate from _factories, which is keyed by backend name — a model name
+    # stored there was never consulted by get() (detect_backend only returns
+    # names from MODEL_PATTERNS), making the documented factory API a no-op.
+    _model_factories: dict[str, Callable[[str], TokenCounter]] = {}
+
     # Cache for auto-detected tokenizers
     _cache: dict[str, TokenCounter] = {}
 
@@ -159,6 +165,26 @@ class TokenizerRegistry:
         if cache_key in registry._cache:
             return registry._cache[cache_key]
 
+        # Check for a per-model factory registered via register(model, factory=...)
+        model_factory = registry._model_factories.get(model_lower)
+        if model_factory is not None and backend is None:
+            try:
+                tokenizer = model_factory(model)
+                registry._cache[cache_key] = tokenizer
+                return tokenizer
+            except Exception as e:
+                if fallback:
+                    # NOT cached: the cache key carries no fallback policy, so
+                    # a cached estimator would also satisfy a later
+                    # get(fallback=False) — hiding the factory failure it
+                    # promises to surface — and would pin a transient failure
+                    # forever. Only successful products are cached.
+                    logger.warning(
+                        f"Registered factory for {model} failed: {e}. Falling back to estimation."
+                    )
+                    return EstimatingTokenCounter()
+                raise ValueError(f"Factory for {model} failed: {e}") from e
+
         # Create tokenizer
         try:
             tokenizer = registry._create_tokenizer(model, backend)
@@ -166,12 +192,11 @@ class TokenizerRegistry:
             return tokenizer
         except Exception as e:
             if fallback:
+                # NOT cached — see the factory branch above.
                 logger.warning(
                     f"Failed to create tokenizer for {model}: {e}. Falling back to estimation."
                 )
-                tokenizer = EstimatingTokenCounter()
-                registry._cache[cache_key] = tokenizer
-                return tokenizer
+                return EstimatingTokenCounter()
             raise ValueError(f"No tokenizer available for {model}: {e}") from e
 
     @classmethod
@@ -194,15 +219,23 @@ class TokenizerRegistry:
         registry = cls()
         model_lower = model.lower()
 
+        # The latest registration wins: clear the opposing per-model table,
+        # otherwise a model first registered with an instance and later
+        # re-registered with a factory (or vice versa) would keep serving the
+        # stale entry — get() consults _tokenizers first.
         if tokenizer is not None:
+            registry._model_factories.pop(model_lower, None)
             registry._tokenizers[model_lower] = tokenizer
         elif factory is not None:
-            registry._factories[model_lower] = factory
+            registry._tokenizers.pop(model_lower, None)
+            registry._model_factories[model_lower] = factory
         else:
             raise ValueError("Must provide either tokenizer or factory")
 
-        # Clear cache for this model
-        keys_to_remove = [k for k in registry._cache if k.startswith(model_lower)]
+        # Clear cache for this model. Cache keys are "<model>:<backend>", so
+        # match on the full "model:" prefix — a bare startswith(model) would
+        # also evict e.g. "gpt-4o:auto" when registering "gpt-4".
+        keys_to_remove = [k for k in registry._cache if k.startswith(f"{model_lower}:")]
         for key in keys_to_remove:
             del registry._cache[key]
 
@@ -229,9 +262,9 @@ class TokenizerRegistry:
 
     @classmethod
     def list_registered(cls) -> list[str]:
-        """List explicitly registered models."""
+        """List explicitly registered models (instances and factories)."""
         registry = cls()
-        return list(registry._tokenizers.keys())
+        return sorted(set(registry._tokenizers) | set(registry._model_factories))
 
     @classmethod
     def clear_cache(cls) -> None:
