@@ -19,6 +19,8 @@ import random
 import pytest
 
 from headroom.transforms.lossless_compaction import (
+    _tree_colon_row,
+    _tree_split_row,
     compact_lossless,
     search_dir_heading,
     search_fold_recovers,
@@ -264,6 +266,138 @@ def test_long_bodies_still_fold_despite_the_scan_bounds():
     grep = "".join(f"a/f.py:{n}:{'x' * 20000}\n" for n in (1, 2))
     assert roundtrips(grep)
     assert len(search_tree_heading(grep)) < len(grep)
+
+
+# --- context rows are anchored to files the colon pass established ---
+#
+# A dash is legal inside a path, so no textual rule can say which `-<digits>-`
+# is the line-number marker. grep and ripgrep always print the matching line
+# itself with `:`, so a file with context rows always has a match row too, and
+# the fold anchors on that instead of guessing.
+
+
+def test_context_row_binds_to_the_dashed_filename_not_its_first_marker():
+    # `report.log-2026-backup` is the file. Guessing stopped at the extension
+    # and read this as file `report.log`, line `2026` — byte-reversible, so the
+    # round-trip guard passed it through to the model as a bogus file heading.
+    rg = "report.log-2026-backup:1:MATCH\nreport.log-2026-backup-2-after\n"
+    folded = search_tree_heading(rg)
+    assert folded.startswith("report.log-2026-backup\n")
+    assert "\n2026-backup" not in folded
+    assert search_tree_unheading(folded) == rg
+
+
+def test_unanchored_dash_row_is_left_alone():
+    assert _tree_split_row("report.log-2026-backup-1-before") is None
+
+
+def test_ripgrep_json_records_are_never_folded():
+    # `rg --json` is a search command, so it reaches the search fold. A `-12-`
+    # inside a matched string used to split the record, factoring the repeated
+    # JSON prefix into headings and emitting invalid JSON fragments as rows.
+    records = (
+        '{"type":"match","data":{"path":{"text":"src/a.rs"},'
+        '"lines":{"text":"foo-12-bar"},"line_number":7}}\n'
+        '{"type":"match","data":{"path":{"text":"src/a.rs"},'
+        '"lines":{"text":"foo-12-baz"},"line_number":9}}\n'
+    )
+    assert search_tree_heading(records) == records
+    assert compact_lossless(records, "search") == records
+
+
+def test_a_reference_inside_a_context_body_does_not_hijack_the_parse():
+    # The body of a context row quoting `other.py:12:` must not be read as a
+    # path — that is what the space guard on the colon tier is for.
+    assert _tree_colon_row("src/app.py-40-    see other.py:12: for details") is None
+
+
+def test_paths_containing_spaces_still_fold():
+    # A line with no dash marker anywhere cannot be a context row, so a space
+    # before the marker is just part of the path.
+    rg = (
+        "very/long/directory name/f.py-1-before\n"
+        "very/long/directory name/f.py:2:MATCH\n"
+        "very/long/directory name/f.py-3-after\n"
+        "very/long/directory name/g.py-8-before\n"
+        "very/long/directory name/g.py:9:MATCH\n"
+    )
+    folded = compact_lossless(rg, "search")
+    assert search_fold_recovers(folded, rg)
+    assert len(folded) / len(rg) < 0.55
+
+
+# --- savings floors: these pin the win, so a later parser change cannot
+# quietly trade compression away while every round-trip test still passes ---
+
+
+def _corpus(kind: str) -> str:
+    if kind == "grep-rn":  # several matches in each of several files, one dir
+        return "".join(
+            f"headroom/transforms/module_{f}.py:{ln}:    result = compute(value_{ln})\n"
+            for f in range(8)
+            for ln in range(1, 13)
+        )
+    if kind == "context":  # rg -C 1: match rows interleaved with context rows
+        return "".join(
+            f"headroom/proxy/handler_{f}.py-{ln - 1}-    before line\n"
+            f"headroom/proxy/handler_{f}.py:{ln}:    logger.warning(msg)\n"
+            f"headroom/proxy/handler_{f}.py-{ln + 1}-    after line\n"
+            for f in range(6)
+            for ln in range(2, 20, 3)
+        )
+    if kind == "one-per-file":  # grep -rn across many files, one hit each
+        return "".join(f"headroom/cli/command_{f:03d}.py:{f + 1}:import os\n" for f in range(120))
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    ("kind", "ceiling"),
+    [
+        # Ceilings sit just above what the fold achieves today, so an erosion
+        # trips them while ordinary noise does not. Measured: 50.5 / 13.2 / 68.7.
+        ("grep-rn", 0.53),
+        ("context", 0.16),
+        ("one-per-file", 0.71),
+    ],
+)
+def test_savings_floor_per_shape(kind, ceiling):
+    corpus = _corpus(kind)
+    folded = compact_lossless(corpus, "search")
+    assert search_fold_recovers(folded, corpus)
+    ratio = len(folded) / len(corpus)
+    assert ratio <= ceiling, f"{kind}: fold kept {ratio:.1%}, ceiling {ceiling:.0%}"
+
+
+@pytest.mark.parametrize("kind", ["grep-rn", "context"])
+def test_tree_fold_beats_both_older_folds(kind):
+    corpus = _corpus(kind)
+    assert len(search_tree_heading(corpus)) < len(search_heading(corpus))
+    assert len(search_tree_heading(corpus)) < len(search_dir_heading(corpus))
+
+
+def test_tree_fold_ties_the_dir_fold_when_every_file_has_one_match():
+    # With a single row per file the tree fold spends a newline on the file
+    # header and saves the basename on the row — an exact wash. This is why all
+    # three folds stay as candidates rather than the tree fold replacing them.
+    corpus = _corpus("one-per-file")
+    assert len(search_tree_heading(corpus)) == len(search_dir_heading(corpus))
+    assert len(search_tree_heading(corpus)) < len(search_heading(corpus))
+
+
+def test_fold_stays_linear_in_payload_size():
+    # Guards the whole pipeline, not just the marker scan: the colon pass, the
+    # block walk and the three-candidate selection all have to stay linear.
+    import time
+
+    small, big = _corpus("grep-rn"), _corpus("grep-rn") * 8
+    timings = []
+    for corpus in (small, big):
+        start = time.perf_counter()
+        for _ in range(3):
+            compact_lossless(corpus, "search")
+        timings.append((time.perf_counter() - start) / 3)
+    # 8x the input must not cost more than 24x the time (3x headroom for noise).
+    assert timings[1] < timings[0] * 24, f"{timings[0]:.4f}s -> {timings[1]:.4f}s for 8x input"
 
 
 # --- integration with compact_lossless ---

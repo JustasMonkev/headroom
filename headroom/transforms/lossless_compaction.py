@@ -395,75 +395,107 @@ _TREE_MAX_PATH = 4096
 _TREE_MAX_MARKERS = 64
 
 
-def _tree_split_row(line: str) -> tuple[str, str, str, str] | None:
-    """Split a grep/ripgrep row into ``(path, sep, line_digits, content)``.
+def _tree_digit_run_end(line: str, pos: int) -> int:
+    """Index just past the digit run starting at ``pos + 1``."""
+    end = pos + 1
+    while end < len(line) and end - pos <= _TREE_MAX_DIGITS and line[end] in "0123456789":
+        end += 1
+    return end
 
-    Handles both row shapes ripgrep emits — ``path:line:content`` for matches
-    and ``path-line-content`` for ``-C`` context — and requires the two
-    separators to agree, since a row never mixes them.
 
-    The colon shape is tried first and, because a path essentially never
-    contains ``:``, its leftmost marker is the right one. Only if that fails do
-    we look for a dash marker, where the leftmost is *not* reliable (real paths
-    hold dashes: ``logs/2026-05-03/app.log``). A misread there is not a
-    correctness problem the way it is for the lossy compressor — the digits are
-    carried through as the original *text*, so ``compact_lossless``'s round-trip
-    check still reproduces the row byte-for-byte — but it does cost savings, so
-    the dash scan skips markers whose left side has no extension and whose right
-    side still carries path structure.
+def _tree_has_dash_marker(line: str) -> bool:
+    """True when the line holds any ``-<digits>-`` triplet at all."""
+    limit = min(len(line), _TREE_MAX_PATH)
+    pos = line.find("-")
+    seen = 0
+    while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
+        seen += 1
+        end = _tree_digit_run_end(line, pos)
+        if end > pos + 1 and end < len(line) and line[end] == "-":
+            return True
+        pos = line.find("-", pos + 1)
+    return False
 
-    Returns ``None`` for any line that isn't a data row.
+
+def _tree_colon_row(line: str) -> tuple[str, str, str, str] | None:
+    """Parse a ``path:line:content`` match row.
+
+    ``:`` is grep's *match* separator and a path essentially never contains one
+    (the Windows drive colon is skipped explicitly), so the leftmost marker is
+    the right one.
     """
     limit = min(len(line), _TREE_MAX_PATH)
-    # A path never contains a space, so the first one bounds every colon-tier
-    # candidate. Computed once instead of re-scanning the prefix per candidate.
+    # Skip a Windows drive colon (``C:\Users\...``) so it is never mistaken for
+    # the line-number marker.
+    start = 2 if len(line) >= 3 and line[0].isalpha() and line[1] == ":" and line[2] in "\\/" else 0
     first_space = line.find(" ")
-    for sep in (":", "-"):
-        start = 0
-        # Skip a Windows drive colon (``C:\Users\...``) so it is never mistaken
-        # for the line-number marker.
-        if (
-            sep == ":"
-            and len(line) >= 3
-            and line[0].isalpha()
-            and line[1] == ":"
-            and line[2] in "\\/"
-        ):
-            start = 2
-        pos = line.find(sep, start)
-        seen = 0
-        while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
-            seen += 1
-            end = pos + 1
-            while end < len(line) and end - pos <= _TREE_MAX_DIGITS and line[end] in "0123456789":
-                end += 1
-            if end > pos + 1 and end < len(line) and line[end] == sep:
-                if pos > 0 and (sep == "-" or first_space == -1 or first_space >= pos):
-                    if sep == ":" or not _tree_dash_continues(line, pos, end):
-                        return line[:pos], sep, line[pos + 1 : end], line[end + 1 :]
-            pos = line.find(sep, pos + 1)
+    pos = line.find(":", start)
+    seen = 0
+    while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
+        seen += 1
+        end = _tree_digit_run_end(line, pos)
+        if end > pos + 1 and end < len(line) and line[end] == ":" and pos > 0:
+            # A space before the marker usually means this is the *body* of a
+            # ``-`` context row quoting a ``foo.py:12:`` reference, not a path.
+            # But a line with no dash marker anywhere cannot be a context row,
+            # so there the space is simply part of a path that has one —
+            # ``very/long/directory name/file.py:2:MATCH`` is a real result row.
+            if first_space == -1 or first_space >= pos or not _tree_has_dash_marker(line):
+                return line[:pos], ":", line[pos + 1 : end], line[end + 1 :]
+        pos = line.find(":", pos + 1)
     return None
 
 
-def _tree_dash_continues(line: str, pos: int, end: int) -> bool:
-    """True when the dash marker at ``pos`` looks like it sits *inside* the path.
+def _tree_dash_row(
+    line: str, known_paths: frozenset[str], known_lengths: frozenset[int]
+) -> tuple[str, str, str, str] | None:
+    """Parse a ``path-line-content`` context row, anchored on ``known_paths``.
 
-    Positive evidence only: the path so far has no extension on its last
-    segment (``logs/2026``) and the text after the marker still carries path
-    structure (a ``/`` or an extension dot) before the first space. Absent that
-    evidence the caller stops at this marker, which is what the plain
-    leftmost-wins rule would do anyway.
+    Unlike ``:``, a dash appears inside real paths all the time
+    (``logs/2026-05-03/app.log``, ``CVE-2021-44228.md``), so no purely textual
+    rule can say which ``-<digits>-`` is the line-number marker. Guessing is
+    what made ``report.log-2026-backup-1-before`` read as file ``report.log``
+    line ``2026``, and what let a ``rg --json`` record split at a ``-12-`` inside
+    a matched string — both byte-reversible, so the round-trip guard accepted
+    them and the model got a bogus file heading.
 
-    Takes indices rather than slices so a long line doesn't get copied once per
-    candidate marker — that copying is what made the scan quadratic.
+    So this doesn't guess. ripgrep and grep always print the matching line
+    itself with ``:`` separators, so every file that has ``-C``/``-A``/``-B``
+    context rows also has at least one match row. A dash row is therefore only
+    recognised when its path is one the colon pass already established. Nothing
+    anchors a JSON record or a stray prose line, so they stay passthrough.
+
+    ``known_lengths`` lets the scan reject a candidate marker on an integer
+    compare instead of slicing the prefix, keeping the walk linear.
     """
-    segment = line.rfind("/", 0, pos) + 1
-    if line.find(".", segment, pos) != -1:
-        return False
-    stop = line.find(" ", end + 1)
-    if stop == -1:
-        stop = len(line)
-    return line.find("/", end + 1, stop) != -1 or line.find(".", end + 1, stop) != -1
+    if not known_paths:
+        return None
+    limit = min(len(line), _TREE_MAX_PATH)
+    pos = line.find("-")
+    seen = 0
+    while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
+        seen += 1
+        if pos > 0 and pos in known_lengths:
+            end = _tree_digit_run_end(line, pos)
+            if end > pos + 1 and end < len(line) and line[end] == "-":
+                path = line[:pos]
+                if path in known_paths:
+                    return path, "-", line[pos + 1 : end], line[end + 1 :]
+        pos = line.find("-", pos + 1)
+    return None
+
+
+def _tree_split_row(
+    line: str,
+    known_paths: frozenset[str] = frozenset(),
+    known_lengths: frozenset[int] = frozenset(),
+) -> tuple[str, str, str, str] | None:
+    """Split a grep/ripgrep row into ``(path, sep, line_digits, content)``.
+
+    Returns ``None`` for any line that isn't a data row. Context rows need the
+    ``known_*`` sets from the colon pass — see :func:`_tree_dash_row`.
+    """
+    return _tree_colon_row(line) or _tree_dash_row(line, known_paths, known_lengths)
 
 
 def _tree_is_data_row(line: str) -> bool:
@@ -494,13 +526,19 @@ def search_tree_heading(text: str) -> str:
     if not lines:
         return text
 
+    # Colon pass first: context rows are only recognised for files that already
+    # produced a match row, which is what keeps the ambiguous dash form from
+    # guessing. See :func:`_tree_dash_row`.
+    known_paths = frozenset(row[0] for line in lines if (row := _tree_colon_row(line)))
+    known_lengths = frozenset(len(p) for p in known_paths)
+
     out: list[str] = []
     # Mirrors the inverse's state: "" means no directory header is in effect.
     current_dir = ""
     i = 0
     n = len(lines)
     while i < n:
-        row = _tree_split_row(lines[i])
+        row = _tree_split_row(lines[i], known_paths, known_lengths)
         if row is None:
             out.append(lines[i])
             current_dir = ""
@@ -511,7 +549,7 @@ def search_tree_heading(text: str) -> str:
         path = row[0]
         block: list[tuple[str, str, str, str]] = []
         while i < n:
-            nxt = _tree_split_row(lines[i])
+            nxt = _tree_split_row(lines[i], known_paths, known_lengths)
             if nxt is None or nxt[0] != path:
                 break
             block.append(nxt)

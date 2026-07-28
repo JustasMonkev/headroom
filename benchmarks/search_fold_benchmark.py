@@ -76,12 +76,43 @@ def collect(pattern: str, flags: list[str]) -> str:
     )
     rows = proc.stdout.split("\n")
     if len(rows) > MAX_ROWS:
-        cut = MAX_ROWS
-        last = rows[cut - 1].split(":", 1)[0].split("-", 1)[0]
-        while cut > 1 and rows[cut - 1].startswith(last):
-            cut -= 1
-        rows = rows[: cut or MAX_ROWS]
+        rows = rows[: _trim_to_file_boundary(rows, MAX_ROWS)]
     return "\n".join(rows)
+
+
+def _row_file(row: str) -> str | None:
+    """The file a row belongs to, or ``None`` for a context row.
+
+    Splitting on ``-`` here would be a bug, not a shortcut: it turns
+    ``crates/headroom-core/src/x.rs`` into ``crates/headroom``, and the caller's
+    backtrack would then discard every row under that whole prefix instead of
+    the one partial file at the cut — hundreds of rows on the ``error`` corpus,
+    silently changing what the benchmark measures. A path cannot contain ``:``,
+    so the first one delimits the complete path. Context rows (``path-N-body``)
+    have no colon and return ``None``; they belong to whichever file surrounds
+    them, so the caller pulls them along.
+    """
+    head = row.split(":", 1)[0]
+    return None if head == row else head
+
+
+def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
+    """Back ``cut`` up so it lands between files, never inside one.
+
+    Context rows carry no colon, so they are attributed by path prefix rather
+    than by "the nearest colon row" — treating every context row as part of the
+    file being dropped would also swallow the *previous* file's trailing
+    context. A leading context row whose match row fell outside the cut can
+    still survive as an orphan; the fold leaves such a row as passthrough, so it
+    costs a row of corpus, not a skewed ratio.
+    """
+    target = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
+    if target is None:
+        return cut
+    prefix = target + "-"
+    while cut > 1 and (_row_file(rows[cut - 1]) == target or rows[cut - 1].startswith(prefix)):
+        cut -= 1
+    return cut or MAX_ROWS
 
 
 def previous_best(content: str) -> str:
