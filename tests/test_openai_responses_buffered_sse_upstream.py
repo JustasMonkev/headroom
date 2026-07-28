@@ -118,9 +118,7 @@ def test_buffered_json_upstream_still_parsed_normally() -> None:
         server = app.state.proxy
 
         async def fake_retry(method, url, headers, body_, stream=False, **kwargs):
-            return httpx.Response(
-                200, json=payload, request=httpx.Request(method, url)
-            )
+            return httpx.Response(200, json=payload, request=httpx.Request(method, url))
 
         server._retry_request = fake_retry
         resp = client.post(
@@ -220,6 +218,33 @@ class TestSseToResponseHelper:
         assert out is not None
         assert out["id"] == "resp_rt"
         assert out["usage"] == {"input_tokens": 3, "output_tokens": 2}
+
+
+def test_buffered_stream_ccr_with_sse_upstream_passes_through() -> None:
+    """stream:true + headroom_retrieve forces a buffered stream:false upstream
+    call; if that upstream answers with SSE, forward it instead of 502-ing."""
+    from headroom.ccr import CCR_TOOL_NAME
+
+    app = _make_app()
+    with TestClient(app) as client:
+        captured = _patch_sse_upstream(app)
+        resp = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-5.4",
+                "stream": True,
+                "input": "hello",
+                "tools": [{"type": "function", "name": CCR_TOOL_NAME, "parameters": {}}],
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert "proxy_error" not in resp.text
+    assert "response.completed" in resp.text
+    # The buffered path did force a non-streaming upstream request.
+    if captured.get("body"):
+        assert captured["body"].get("stream") is False
 
 
 def test_sse_body_is_not_reparsed_as_json_by_ccr(monkeypatch) -> None:

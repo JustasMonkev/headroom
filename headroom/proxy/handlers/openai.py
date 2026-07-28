@@ -27,6 +27,7 @@ from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     extract_tags,
     jitter_delay_ms,
+    parse_sse_events_from_byte_buffer,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -5204,9 +5205,43 @@ class OpenAIHandlerMixin:
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
                     cache_read_tokens = 0
+
+                    # A ``stream: false`` request is normally answered with JSON,
+                    # but some OpenAI-compatible upstreams reply with a valid
+                    # ``200 text/event-stream`` Responses body anyway (#8).
+                    # Parsing that as JSON used to raise JSONDecodeError out of
+                    # this handler and turn a *successful* upstream reply into
+                    # ``502 proxy_error``. Recover the terminal response object
+                    # for usage/telemetry instead, and leave ``resp_json`` None so
+                    # the JSON-rewriting blocks below (CCR, memory, buffered-SSE
+                    # replay) all skip and the SSE bytes pass through verbatim.
+                    upstream_is_sse = _is_event_stream_response(response)
+                    # Bound the unbound-name risk: every consumer below is already
+                    # guarded on ``resp_json`` being truthy.
+                    resp_json: dict[str, Any] | None = None
+                    usage_source: dict[str, Any] | None = None
                     try:
-                        resp_json = response.json()
-                        usage = resp_json.get("usage", {})
+                        if upstream_is_sse:
+                            usage_source = _openai_responses_sse_to_response(response.content)
+                            if usage_source is None:
+                                logger.debug(
+                                    f"[{request_id}] Upstream returned text/event-stream with no "
+                                    "terminal response event; forwarding as-is"
+                                )
+                        else:
+                            resp_json = response.json()
+                            usage_source = resp_json
+                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+                        # Not JSON and not SSE (e.g. an HTML error page from a
+                        # proxy in front of the upstream). Forward the bytes
+                        # untouched rather than manufacturing a 502.
+                        logger.debug(
+                            f"[{request_id}] OpenAI responses upstream body was not JSON "
+                            f"({type(e).__name__}); forwarding without parsing"
+                        )
+
+                    try:
+                        usage = (usage_source or {}).get("usage", {}) or {}
 
                         def _usage_int(value: Any, default: int = 0) -> int:
                             try:
