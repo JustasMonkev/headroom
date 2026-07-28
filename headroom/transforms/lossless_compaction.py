@@ -438,7 +438,7 @@ def _tree_structure_stop(line: str) -> int:
     return stop
 
 
-def _tree_colon_row(line: str, *, allow_space: bool = False) -> tuple[str, str, str, str] | None:
+def _tree_colon_row(line: str, *, lenient: bool = False) -> tuple[str, str, str, str] | None:
     """Parse a ``path:line:content`` match row.
 
     The marker has to be the line's **first** colon, because a path cannot
@@ -449,19 +449,21 @@ def _tree_colon_row(line: str, *, allow_space: bool = False) -> tuple[str, str, 
     under a fabricated ``1:see/`` directory. The Windows drive colon is the one
     exception, and it is skipped explicitly.
 
-    ``allow_space`` lifts the space guard. Callers use it to ask "would this
-    have been a match row but for the guard?" — see :func:`_tree_split_row`.
+    ``lenient`` lifts both guards below. Callers use it to ask "would this have
+    been a match row but for the guards?" — see :func:`_tree_split_row`.
     """
     # Skip a Windows drive colon (``C:\Users\...``) so it is never mistaken for
     # the line-number marker.
     start = 2 if len(line) >= 3 and line[0].isalpha() and line[1] == ":" and line[2] in "\\/" else 0
     pos = line.find(":", start)
-    if pos <= 0 or pos >= min(len(line), _TREE_MAX_PATH) or pos > _tree_structure_stop(line):
+    if pos <= 0 or pos >= min(len(line), _TREE_MAX_PATH):
         return None
     end = _tree_digit_run_end(line, pos)
     if end == pos + 1 or end >= len(line) or line[end] != ":":
         return None
-    if not allow_space:
+    if not lenient:
+        if pos > _tree_structure_stop(line):
+            return None
         # A space before the marker usually means this is the *body* of a ``-``
         # context row quoting a ``foo.py:12:`` reference, not a path. But a line
         # with no dash marker anywhere cannot be a context row, so there the
@@ -503,6 +505,12 @@ def _tree_dash_row(
 
     ``known_lengths`` lets the scan reject a candidate marker on an integer
     compare instead of slicing the prefix, keeping the walk linear.
+
+    A scan stopped by its own bounds declines too. The bounds exist for speed,
+    but a truncated walk cannot say whether a *second* anchored reading lay
+    beyond them — and on a path with 65-plus dash positions the first candidate
+    was returned as if it were the only one, filing the long file's context
+    under the short prefix. Not-yet-looked-at is not the same as not-there.
     """
     if not known_paths:
         return None
@@ -510,7 +518,9 @@ def _tree_dash_row(
     candidates: list[tuple[str, str, str, str]] = []
     pos = line.find("-")
     seen = 0
-    while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
+    while pos != -1:
+        if pos >= limit or seen >= _TREE_MAX_MARKERS:
+            return None
         seen += 1
         if pos > 0 and pos in known_lengths:
             end = _tree_digit_run_end(line, pos)
@@ -560,14 +570,16 @@ def _tree_split_row(
         return colon if dash is None or dash[0] == colon[0] else None
     if dash is None:
         return None
-    # The space guard can suppress a colon reading that was the right one: a
-    # path holding both a space and a ``-<digits>-`` (``report.log-2026-backup
-    # name:2:MATCH``) is rejected as a match row, and the dash tier then files
-    # it under ``report.log`` at line 2026 with no disagreement to notice. Ask
-    # what the colon tier would have said without the guard; if that is a
-    # different file, the row is ambiguous after all.
-    lenient = _tree_colon_row(line, allow_space=True)
-    return None if lenient is not None and lenient[0] != dash[0] else dash
+    # Either guard can suppress a colon reading that was the right one, leaving
+    # the dash tier to claim the row with no disagreement to notice:
+    #   * the space guard, on a path holding both a space and a ``-<digits>-``
+    #     (``report.log-2026-backup name:2:MATCH``);
+    #   * the structural guard, on a Unix filename holding a quote or brace
+    #     (``a-1-"file0":2:MATCH``) — a real result path, not a JSON record.
+    # Ask what the colon tier would have said without them; a different file
+    # means the row is ambiguous after all.
+    unguarded = _tree_colon_row(line, lenient=True)
+    return None if unguarded is not None and unguarded[0] != dash[0] else dash
 
 
 def _tree_anchor_paths(lines: list[str]) -> tuple[frozenset[str], frozenset[int]]:

@@ -160,7 +160,14 @@ def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
     if target is None:
         return cut
 
-    first_dropped = rows[cut] if cut < len(rows) else None
+    # The cut can point at the separator itself rather than into the group past
+    # it. Look through the separator for the row that decides whether the file
+    # continues; otherwise the backward pass never runs and the file keeps its
+    # earlier groups while its later ones are dropped.
+    ahead = cut
+    while ahead < len(rows) and rows[ahead] == _RG_GROUP_SEP:
+        ahead += 1
+    first_dropped = rows[ahead] if ahead < len(rows) else None
     if first_dropped is not None and _belongs(first_dropped, target):
         while cut > 0:
             if _belongs(rows[cut - 1], target):

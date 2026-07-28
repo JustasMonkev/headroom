@@ -449,6 +449,29 @@ def test_a_spaced_path_holding_a_dash_marker_is_not_filed_under_its_prefix():
     assert search_tree_unheading(folded) == rg
 
 
+def test_a_truncated_marker_scan_declines_rather_than_guessing():
+    # The scan's bounds exist for speed. A walk stopped by them cannot say
+    # whether a second anchored reading lay beyond, and returning the first
+    # candidate as if it were the only one filed a long file's context under a
+    # short prefix that happened to be anchored.
+    long_path = "a-1-" + "-".join("x" for _ in range(70)) + ".py"
+    rg = f"a:5:anchor\n{long_path}:9:MATCH\n{long_path}-10-ctx\n"
+    folded = search_tree_heading(rg)
+    assert f"{long_path}-10-ctx" in folded  # verbatim, not filed under `a`
+    assert search_tree_unheading(folded) == rg
+
+
+def test_a_filename_holding_a_quote_is_not_reinterpreted_as_context():
+    # The structural guard exists to keep JSON records out. A Unix filename may
+    # legitimately hold a quote or brace, and rejecting its colon reading left
+    # the dash tier free to claim the row as context of an anchored prefix.
+    rg = 'a:5:anchor\na-1-"file0":2:MATCH\na-1-"file1":3:MATCH\n'
+    folded = search_tree_heading(rg)
+    assert 'a-1-"file0":2:MATCH' in folded  # verbatim
+    assert 'a\n5:anchor\n1-"file0"' not in folded  # not filed under `a` at line 1
+    assert search_tree_unheading(folded) == rg
+
+
 def test_unambiguous_context_rows_still_fold():
     # Only one anchored path fits and the colon tier does not claim it.
     rg = "src/app.py-40-before\nsrc/app.py:41:MATCH\nsrc/app.py-42-after\n"

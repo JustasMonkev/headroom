@@ -166,6 +166,23 @@ def test_belongs_still_accepts_this_files_own_context():
     assert not _belongs("a/file.py-backup:1:x", "a/file.py")
 
 
+def test_trim_backtracks_when_the_cutoff_lands_on_the_separator():
+    # The cut can point at the `--` itself rather than into the group past it.
+    # Then the row it checks is the separator, which belongs to no file, so the
+    # backward pass never ran and the file kept its earlier groups.
+    rows = (
+        ["z/pre.py:1:M"]
+        + [f"a/f.py-{n}-ctx" for n in (8, 9)]
+        + ["a/f.py:10:MATCH"]
+        + ["--"]
+        + [f"a/f.py-{n}-ctx" for n in (98, 99)]
+        + ["a/f.py:100:MATCH"]
+    )
+    for requested in (4, 5):
+        cut = _trim_to_file_boundary(rows, requested)
+        assert not any(r.startswith("a/f.py") for r in rows[:cut])
+
+
 def test_trim_never_returns_an_empty_corpus():
     rows = [f"only/one.py:{n}:body" for n in range(1, 6)]
     assert _trim_to_file_boundary(rows, 3) > 0
