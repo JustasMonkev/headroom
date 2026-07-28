@@ -322,28 +322,37 @@ def test_unknown_provider_raises() -> None:
 # ``memory_search`` to discover its ID. Two round trips for one
 # operation, against the model-as-judge architecture.
 #
-# Post-this-PR the format is ``f"{i}. [{id}] {content}"``. The model
-# can call ``memory_update('mem_alpha_001', ...)`` directly from a
-# row it sees in the auto-injected tail.
+# Post-this-PR the format is ``f"{i}. [{alias}] {content}"`` where the
+# alias is a session-local short handle (m1, m2, ...) that resolves to
+# the real backend ID server-side. The model can call
+# ``memory_update('m1', ...)`` directly from a row it sees in the
+# auto-injected tail; full UUIDs never spend prompt tokens.
 # ---------------------------------------------------------------------------
 
 
 def test_auto_tail_block_includes_memory_ids() -> None:
-    """Each entry in the formatted block carries the memory's ID in
-    square brackets, immediately after the row number. The model uses
-    this to address rows directly (memory_update / memory_delete)
-    without round-tripping through memory_search."""
+    """Each entry in the formatted block carries a short session-local
+    alias in square brackets, immediately after the row number. The
+    model uses it to address rows directly (memory_update /
+    memory_delete) without round-tripping through memory_search; the
+    handler resolves the alias back to the real backend ID."""
     handler = _build_handler()
     context = asyncio.run(
         handler.search_and_format_context("alpha", [{"role": "user", "content": "hi"}])
     )
     assert context is not None
-    # IDs from the stub backend fixture.
-    assert "[mem_alpha_001]" in context
-    assert "[mem_alpha_002]" in context
-    # Format is row-number then bracketed-id then content.
-    assert "1. [mem_alpha_001] User prefers Python" in context
-    assert "2. [mem_alpha_002] User's timezone" in context
+    # Aliases are assigned in first-seen order; full backend IDs are
+    # never rendered into the prompt.
+    assert "[mem_alpha_001]" not in context
+    assert "1. [m1] User prefers Python" in context
+    assert "2. [m2] User's timezone" in context
+    # Server-side resolution maps aliases back to the real backend IDs
+    # (the effective user key for the default PROJECT scope resolution).
+    user_key = next(iter(handler._memory_id_by_alias))
+    assert handler._resolve_memory_alias(user_key, "m1") == "mem_alpha_001"
+    assert handler._resolve_memory_alias(user_key, "m2") == "mem_alpha_002"
+    # Unknown values (e.g. full IDs from memory_search) pass through.
+    assert handler._resolve_memory_alias(user_key, "mem_alpha_001") == "mem_alpha_001"
 
 
 def test_auto_tail_block_id_format_handles_missing_id() -> None:

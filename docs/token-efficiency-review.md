@@ -231,16 +231,22 @@ The deferral machinery already exists (`inject_tool_search_deferral`, min-tools 
 
 `compact_thinking_to_text()` exists, is self-tested in-module, and has **zero production callers** — grep finds it only in its own file. The module's own measurements report ~688 tokens per historical Sonnet 4.6 thinking block and ~995 for Opus 4.6, re-billed on every subsequent turn for models where `bills_prior_thinking()` is true. Wire it into the Anthropic handler gated on `bills_prior_thinking(model)`, preserving the latest turn (`keep_last_turns=1`). Saves ~688–995 tokens per eligible historical thinking block per turn.
 
-#### F3. Compact completed tool-call *inputs*, not only outputs — P1 [reported]
-In-place compression currently targets tool outputs; historical tool-call **arguments** (Write payloads, apply_patch bodies, shell heredocs, SQL/query strings) stay verbatim in context forever. Once the matching result has completed and aged past the read-protection window, large arguments could be replaced with a reversible CCR reference while preserving the call ID and name. Worth hundreds to thousands of tokens in coding sessions. (`content_router.py:4254-4304` already builds `_tool_call_args` maps during traversal — a natural attachment point.)
+#### F3. Compact completed tool-call *inputs*, not only outputs — P1 [implemented]
+In-place compression currently targets tool outputs; historical tool-call **arguments** (Write payloads, apply_patch bodies, shell heredocs, SQL/query strings) stay verbatim in context forever. Once the matching result has completed and aged past the read-protection window, large arguments could be replaced with a reversible CCR reference while preserving the call ID and name. Worth hundreds to thousands of tokens in coding sessions.
 
-#### F4. Memory rendering: UUIDs, content echo, optional metadata — P1 [verified in part]
+*Implemented:* `transforms/tool_input_compactor.py` — a pre-processing pass in `ContentRouter.apply` (alongside read-lifecycle) that replaces completed, large (≥800 chars), non-recent, non-frozen tool-call arguments with `{"_ccr": "[tool input elided. Retrieve original: hash=…]"}` in both OpenAI and Anthropic wire shapes, storing originals in the CCR store. Opt-in via `HEADROOM_COMPACT_TOOL_INPUTS=1` / `ProxyConfig.compact_tool_inputs` while validated in pilots.
+
+#### F4. Memory rendering: UUIDs, content echo, optional metadata — P1 [implemented]
 `headroom/proxy/memory_handler.py:1267`, `:1967`
 
-Passive recall repeats a full UUID per memory row solely so it can later be edited — render request-local aliases (`m1`, `m2`, …) and resolve them server-side in `memory_update`/`memory_delete`. Verified: `memory_save` results echo back the first 100 chars of the content the model just wrote (`:1267`, preview again at `:1967`) — pure round-trip waste, drop it. Make search scores/extracted-entities in results optional. Consistent savings on every memory-enabled request; combines with A1/A5.
+Passive recall repeats a full UUID per memory row solely so it can later be edited — render request-local aliases (`m1`, `m2`, …) and resolve them server-side in `memory_update`/`memory_delete`. Verified: `memory_save` results echo back the first 100 chars of the content the model just wrote (`:1267`) — pure round-trip waste, drop it. Make search scores/extracted-entities in results optional. Consistent savings on every memory-enabled request; combines with A1/A5.
 
-#### F5. Separate native output controls from instruction steering — P1 [reported]
+*Implemented:* recall rows now render session-local aliases (stable first-seen order, scoped per effective user), `memory_update`/`memory_delete` resolve aliases server-side (full IDs pass through; a known real ID always beats the alias map), the `memory_save` content echo is gone, search `score` is behind an opt-in `include_scores` param, and empty `entities` lists are omitted.
+
+#### F5. Separate native output controls from instruction steering — P1 [implemented]
 On OpenAI models that support it, apply `text.verbosity=low` and reduced reasoning effort to mechanical continuations *natively*, without also appending the input-token steering paragraph (D4) — and don't force reduced verbosity onto fresh user questions. Lowers output/reasoning cost without spending steering tokens on requests where the native knob suffices.
+
+*Implemented:* in `shape_openai_responses_request`, requests with native output controls (gpt-5 family, or a client-sent `text.verbosity`) never get the steering paragraph (keeping `instructions` byte-stable), and `text.verbosity` is now set/lowered only on mechanical continuations — new user asks and error continuations keep the client's verbosity.
 
 ### Latency & memory
 

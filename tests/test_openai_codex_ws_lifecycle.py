@@ -347,7 +347,25 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
     ]
     upstream = _FakeUpstream(upstream_events)
     fake_ws_mod = _make_fake_websockets_module(upstream)
-    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    # Mechanical continuation frame: gpt-5.x has native output controls, so
+    # the shaper sets text.verbosity instead of appending steering text (F5),
+    # and only does so on mechanical turns.
+    mechanical_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "ok",
+                    }
+                ],
+            },
+        }
+    )
+    client_ws = _FakeWebSocket(frames=[mechanical_frame])
     handler = _DummyOpenAIHandler()
     handler.config.optimize = False
     outcomes = []
@@ -362,9 +380,12 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
 
     sent = json.loads(upstream.sent[0])
     payload = sent["response"]
-    assert "<headroom_output_shaping>" in payload["instructions"]
+    # Native controls replace the steering paragraph on gpt-5 models.
+    assert "instructions" not in payload
     assert payload["text"]["verbosity"] == "low"
-    assert any(t == "output_shaper:verbosity:L2" for t in outcomes[-1].transforms_applied)
+    transforms = outcomes[-1].transforms_applied
+    assert "output_shaper:verbosity:L2" not in transforms
+    assert "output_shaper:text_verbosity:unset->low" in transforms
 
 
 @pytest.mark.asyncio

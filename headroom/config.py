@@ -330,6 +330,38 @@ class ReadLifecycleConfig:
 
 
 @dataclass
+class ToolInputCompactionConfig:
+    """Compact completed tool-call INPUTS (arguments) via CCR.
+
+    Tool outputs are compressed by ContentRouter, but tool-call arguments —
+    Write payloads, apply_patch bodies, shell heredocs, SQL strings — stay
+    verbatim in context for the rest of the session. Once the matching tool
+    result has arrived, the model has acted on it; the full argument bytes
+    are historical record, not working context. This pass replaces large,
+    completed arguments with a compact marker + CCR hash, preserving the
+    call id and tool name so provider validation and conversation structure
+    are untouched. Originals stay retrievable via the CCR store.
+
+    Safety rules:
+    - Only calls whose matching tool result appears LATER in the
+      conversation are touched (completed calls).
+    - The trailing ``protect_recent_turns`` assistant messages are never
+      touched (the model may still be working with those arguments).
+    - Messages inside the provider's frozen cache prefix are never touched.
+
+    Disabled by default while the mechanism is validated in pilots
+    (opt-in via ``HEADROOM_COMPACT_TOOL_INPUTS=1`` on the proxy).
+    """
+
+    enabled: bool = False
+    # Only compact serialized arguments at least this large — below this a
+    # marker plus store entry costs more than it saves.
+    min_chars: int = 800
+    # Trailing assistant messages whose tool calls are never compacted.
+    protect_recent_turns: int = 2
+
+
+@dataclass
 class ReadMaturationConfig:
     """Mechanism B: hold-back Read maturation (compress before cache entry).
 

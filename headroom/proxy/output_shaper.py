@@ -37,6 +37,12 @@ block to the tail of the ``instructions`` string, and
 :func:`route_responses_effort` lowers an explicitly-present
 ``reasoning.effort`` on mechanical continuations. :func:`shape_responses_request`
 is the Responses-format counterpart of :func:`shape_request`.
+
+On models with native output controls (``text.verbosity``), the native knob
+replaces instruction steering rather than stacking on top of it: the steering
+paragraph is never appended for those requests, and ``text.verbosity`` is set
+to ``low`` only on mechanical continuations — new user asks and error
+continuations keep the verbosity the client asked for.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from headroom.proxy.output_effort_policy import (
 )
 from headroom.proxy.output_effort_policy import (
     LEGACY_THINKING_FLOOR,
+    TEXT_VERBOSITY_RANK,
     can_create_openai_text_verbosity,
     clamp_legacy_thinking_budget,
     lower_effort_value,
@@ -260,8 +267,35 @@ def route_openai_reasoning_effort(
     return []
 
 
-def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
-    """Set or lower OpenAI ``text.verbosity`` conservatively."""
+def _native_output_controls_available(body: dict[str, Any]) -> bool:
+    """Whether this request can be shaped via native OpenAI output controls.
+
+    True when ``text.verbosity`` can safely be created for the model, or when
+    the client already sent a recognized ``text.verbosity`` value (presence
+    proves the target model accepts the parameter). Requests with native
+    controls skip the instruction-steering paragraph entirely: the native
+    knob shapes output without spending input tokens, and never appending
+    keeps ``instructions`` byte-stable across every turn of the conversation.
+    """
+    if can_create_openai_text_verbosity(body.get("model")):
+        return True
+    text_config = body.get("text")
+    if isinstance(text_config, dict):
+        verbosity = text_config.get("verbosity")
+        return isinstance(verbosity, str) and verbosity in TEXT_VERBOSITY_RANK
+    return False
+
+
+def route_openai_text_verbosity(body: dict[str, Any], kind: TurnKind) -> list[str]:
+    """Set or lower OpenAI ``text.verbosity`` on mechanical continuations only.
+
+    New user asks and error continuations keep their original verbosity —
+    forcing ``low`` onto a fresh question degrades answers the user actually
+    wants to read. ``text`` is a per-request parameter, not prompt prefix, so
+    varying it by turn kind has no prefix-cache cost.
+    """
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return []
     text_config = body.get("text")
     can_create = can_create_openai_text_verbosity(body.get("model"))
     if text_config is None:
@@ -299,12 +333,23 @@ def shape_openai_responses_request(
 
     assert result.labels is not None  # __post_init__ guarantees
 
+    kind = classify_openai_responses_input(body.get("input"))
+    native_controls = _native_output_controls_available(body)
+
+    # Steering paragraph and native output controls are alternatives, not a
+    # stack (F5): when the model supports text.verbosity, the native knob
+    # shapes output without spending input tokens, so the steering block is
+    # never appended for those requests — which also keeps ``instructions``
+    # byte-stable across the whole conversation.
     level = settings.verbosity_level if level_override is None else level_override
-    if level > 0 and apply_openai_responses_verbosity_steering(body, level):
+    if (
+        level > 0
+        and not native_controls
+        and apply_openai_responses_verbosity_steering(body, level)
+    ):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
 
-    kind = classify_openai_responses_input(body.get("input"))
     if settings.effort_router_enabled:
         labels = route_openai_reasoning_effort(body, kind, settings)
         if labels:
@@ -312,7 +357,7 @@ def shape_openai_responses_request(
             result.labels.extend(labels)
             logger.debug("OpenAIOutputShaper: turn=%s mutations=%s", kind.value, labels)
 
-    labels = route_openai_text_verbosity(body)
+    labels = route_openai_text_verbosity(body, kind)
     if labels:
         result.changed = True
         result.labels.extend(labels)

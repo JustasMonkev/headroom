@@ -363,22 +363,36 @@ class TestOpenAIResponsesReasoning:
 class TestOpenAIResponsesTextVerbosity:
     def test_text_verbosity_set_for_gpt5_family(self):
         body = {"model": "gpt-5.1"}
-        labels = route_openai_text_verbosity(body)
+        labels = route_openai_text_verbosity(body, TurnKind.MECHANICAL_CONTINUATION)
         assert labels == ["output_shaper:text_verbosity:unset->low"]
         assert body["text"] == {"verbosity": "low"}
 
     def test_text_verbosity_not_injected_for_non_gpt5(self):
         body = {"model": "gpt-4o"}
-        assert route_openai_text_verbosity(body) == []
+        assert route_openai_text_verbosity(body, TurnKind.MECHANICAL_CONTINUATION) == []
         assert "text" not in body
 
     def test_existing_text_verbosity_is_lowered_for_any_model(self):
         body = {"model": "gpt-4o", "text": {"verbosity": "medium"}}
-        labels = route_openai_text_verbosity(body)
+        labels = route_openai_text_verbosity(body, TurnKind.MECHANICAL_CONTINUATION)
         assert labels == ["output_shaper:text_verbosity:medium->low"]
         assert body["text"]["verbosity"] == "low"
 
-    def test_shape_openai_responses_combines_steering_native_knobs(self):
+    def test_text_verbosity_untouched_on_new_user_ask(self):
+        # Fresh questions keep the verbosity the client asked for — the
+        # low-verbosity knob only applies to mechanical continuations.
+        body = {"model": "gpt-5.1", "text": {"verbosity": "medium"}}
+        assert route_openai_text_verbosity(body, TurnKind.NEW_USER_ASK) == []
+        assert body["text"]["verbosity"] == "medium"
+
+    def test_text_verbosity_untouched_on_error_continuation(self):
+        body = {"model": "gpt-5.1", "text": {"verbosity": "high"}}
+        assert route_openai_text_verbosity(body, TurnKind.ERROR_CONTINUATION) == []
+        assert body["text"]["verbosity"] == "high"
+
+    def test_shape_openai_responses_native_knobs_replace_steering(self):
+        # F5: on models with native output controls, text.verbosity replaces
+        # the steering paragraph — no instruction bytes are spent.
         body = {
             "model": "gpt-5",
             "input": [
@@ -396,13 +410,50 @@ class TestOpenAIResponsesTextVerbosity:
 
         assert result.changed is True
         assert result.labels == [
-            "output_shaper:verbosity:L2",
             "output_shaper:reasoning_effort:xhigh->low",
             "output_shaper:text_verbosity:medium->low",
         ]
-        assert steering_text(2) in body["instructions"]
+        assert body["instructions"] == "System."
+        assert steering_text(2) not in body["instructions"]
         assert body["reasoning"]["effort"] == "low"
         assert body["text"]["verbosity"] == "low"
+
+    def test_shape_openai_responses_steering_kept_without_native_controls(self):
+        # Models without text.verbosity support still get the steering
+        # paragraph — it is the only output-shaping lever there.
+        body = {
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                }
+            ],
+            "instructions": "System.",
+        }
+        result = shape_openai_responses_request(body, ENABLED)
+
+        assert result.changed is True
+        assert result.labels == ["output_shaper:verbosity:L2"]
+        assert steering_text(2) in body["instructions"]
+        assert "text" not in body
+
+    def test_shape_openai_responses_native_new_ask_leaves_body_untouched(self):
+        # New user ask on a native-controls model: no steering, no verbosity
+        # override — the request goes through unshaped (except effort, which
+        # is already gated on mechanical turns).
+        body = {
+            "model": "gpt-5",
+            "input": [{"type": "message", "role": "user", "content": "explain X"}],
+            "instructions": "System.",
+            "text": {"verbosity": "medium"},
+        }
+        result = shape_openai_responses_request(body, ENABLED)
+
+        assert result.changed is False
+        assert body["instructions"] == "System."
+        assert body["text"]["verbosity"] == "medium"
 
 
 class TestShapeOpenAIChatRequest:

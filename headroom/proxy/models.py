@@ -277,6 +277,11 @@ class ProxyConfig:
     # Read lifecycle management
     read_lifecycle: bool = True
 
+    # Completed tool-call INPUT compaction (opt-in; also enabled via
+    # HEADROOM_COMPACT_TOOL_INPUTS=1). Replaces large historical tool-call
+    # arguments with CCR markers once their results have arrived.
+    compact_tool_inputs: bool = False
+
     # Mechanism B: activity-based read maturation (hold fresh Reads out of
     # the provider prefix cache; compress once their file quiesces).
     # Experimental — default off. CLI: --read-maturation;

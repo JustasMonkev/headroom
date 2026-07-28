@@ -57,6 +57,7 @@ from ..config import (
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
     RelevanceScorerConfig,
+    ToolInputCompactionConfig,
     TransformResult,
     is_tool_excluded,
 )
@@ -1740,6 +1741,13 @@ class ContentRouterConfig:
 
     # Read lifecycle management (stale/superseded detection)
     read_lifecycle: ReadLifecycleConfig = field(default_factory=ReadLifecycleConfig)
+
+    # Completed tool-call INPUT compaction (opt-in; see
+    # ToolInputCompactionConfig). Replaces large historical tool-call
+    # arguments with CCR markers once their results have arrived.
+    tool_input_compaction: ToolInputCompactionConfig = field(
+        default_factory=ToolInputCompactionConfig
+    )
 
     # Per-tool compression profiles (tool_name → CompressionProfile)
     # Set to None to use DEFAULT_TOOL_PROFILES from config
@@ -4462,20 +4470,23 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        # Shared CCR store for the pre-processing passes below. is None (not
+        # truthiness) so falsy test doubles are honored; guarded import keeps
+        # the passes running in stripped builds.
+        injected_store = kwargs.get("compression_store")
+        if injected_store is None and (
+            self.config.read_lifecycle.enabled or self.config.tool_input_compaction.enabled
+        ):
+            try:
+                from ..cache.compression_store import get_compression_store
+
+                injected_store = get_compression_store()
+            except ImportError:
+                pass
+
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
             from .read_lifecycle import ReadLifecycleManager
-
-            # is None (not truthiness) so falsy test doubles are honored;
-            # guarded import keeps read_lifecycle running in stripped builds.
-            injected_store = kwargs.get("compression_store")
-            if injected_store is None:
-                try:
-                    from ..cache.compression_store import get_compression_store
-
-                    injected_store = get_compression_store()
-                except ImportError:
-                    pass
 
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
@@ -4492,6 +4503,21 @@ class ContentRouter(Transform):
         else:
             lifecycle_transforms = []
             lifecycle_ccr_hashes = []
+
+        # Pre-process: completed tool-call INPUT compaction (opt-in).
+        if self.config.tool_input_compaction.enabled:
+            from .tool_input_compactor import ToolInputCompactor
+
+            tic_result = ToolInputCompactor(
+                self.config.tool_input_compaction,
+                compression_store=injected_store,
+            ).apply(
+                messages,
+                frozen_message_count=kwargs.get("frozen_message_count", 0),
+            )
+            messages = tic_result.messages
+            lifecycle_transforms.extend(tic_result.transforms_applied)
+            lifecycle_ccr_hashes.extend(tic_result.ccr_hashes)
 
         # Runtime overrides from CompressConfig (via kwargs from compress())
         # These override self.config defaults for this call only.

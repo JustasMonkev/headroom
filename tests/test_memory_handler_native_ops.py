@@ -597,12 +597,20 @@ async def test_execute_search_update_delete_and_handler_status(
     )
     assert search_payload["status"] == "found"
     assert search_payload["count"] == 1
+    # Scores are opt-in (include_scores); non-empty entities are included.
     assert search_payload["memories"][0] == {
         "id": "m1",
         "content": "pizza",
-        "score": 0.912,
         "entities": ["food", "italy"],
     }
+
+    scored_payload = json.loads(
+        await handler._execute_search(
+            {"query": "pizza", "include_scores": True},
+            "u1",
+        )
+    )
+    assert scored_payload["memories"][0]["score"] == 0.912
 
     assert json.loads(await handler._execute_update({}, "u1")) == {
         "status": "error",
@@ -761,7 +769,8 @@ async def test_execute_save_handles_search_failure(handler: MemoryHandler) -> No
 
     backend.raise_on = "search"
     saved = json.loads(await handler._execute_save({"content": "Useful fact"}, "u1"))
-    assert saved == {"status": "saved", "memory_id": "mem-1", "content": "Useful fact"}
+    # The saved content is not echoed back — the model just wrote it.
+    assert saved == {"status": "saved", "memory_id": "mem-1"}
 
 
 @pytest.mark.asyncio
