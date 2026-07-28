@@ -328,18 +328,53 @@ def test_braces_and_quotes_in_a_body_do_not_block_the_fold():
     assert search_tree_unheading(folded) == grep
 
 
-def test_context_row_prefers_the_longest_anchored_path():
-    # Both prefixes are real files here, so anchoring alone does not settle it;
-    # the longest match explains the whole row instead of leaving
-    # `backup-1-before` as a body under `report.log` at line 2026.
+# A row can fit more than one anchored path when one file's name is a prefix of
+# another's. Both readings are legitimate, so the row is resolved by where it
+# sits — grep emits a file's rows contiguously — and left alone when that does
+# not settle it. Preferring the longer path looked like a tie-break but was a
+# coin toss that landed the same way every time, tearing genuine context rows
+# out of their own block.
+
+
+def test_ambiguous_context_row_follows_the_block_it_sits_in():
+    rg = "report.log:2025:MATCH\nreport.log-2026-backup-1-before\nreport.log-2026-backup:2:OTHER\n"
+    folded = search_tree_heading(rg)
+    # Stays with report.log (as line 2026), rather than opening a new heading.
+    assert folded.startswith("report.log\n2025:MATCH\n-backup-1-before\n")
+    assert search_tree_unheading(folded) == rg
+
+
+def test_ambiguous_context_row_follows_the_other_block_just_as_readily():
     rg = (
         "report.log:1:MATCH one\n"
         "report.log-2026-backup:2:MATCH two\n"
         "report.log-2026-backup-1-before\n"
     )
     folded = search_tree_heading(rg)
-    assert "\n2026-backup-1-before" not in folded
-    assert folded.rstrip("\n").endswith("1-before")
+    assert folded.rstrip("\n").endswith("2:MATCH two\n1-before")
+    assert search_tree_unheading(folded) == rg
+
+
+def test_ambiguous_context_row_is_left_unparsed_without_block_context():
+    # The banner ends the block, so the row opens a new one with nothing to
+    # resolve it. Declining costs one row of folding; guessing files a line
+    # under a path it never came from.
+    rg = (
+        "report.log:1:a\n"
+        "report.log-2026-backup:2:b\n"
+        "== banner ==\n"
+        "report.log-2026-backup-1-before\n"
+    )
+    folded = search_tree_heading(rg)
+    assert folded.rstrip("\n").endswith("report.log-2026-backup-1-before")
+    assert search_tree_unheading(folded) == rg
+
+
+def test_unambiguous_context_rows_are_unaffected_by_the_block_rule():
+    # Only one anchored path fits, so no context is needed to resolve it.
+    rg = "src/app.py-40-before\nsrc/app.py:41:MATCH\nsrc/app.py-42-after\n"
+    folded = search_tree_heading(rg)
+    assert len(folded) < len(rg)
     assert search_tree_unheading(folded) == rg
 
 

@@ -469,7 +469,10 @@ def _tree_colon_row(line: str) -> tuple[str, str, str, str] | None:
 
 
 def _tree_dash_row(
-    line: str, known_paths: frozenset[str], known_lengths: frozenset[int]
+    line: str,
+    known_paths: frozenset[str],
+    known_lengths: frozenset[int],
+    block_path: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Parse a ``path-line-content`` context row, anchored on ``known_paths``.
 
@@ -487,13 +490,19 @@ def _tree_dash_row(
     recognised when its path is one the colon pass already established. Nothing
     anchors a JSON record or a stray prose line, so they stay passthrough.
 
-    The scan keeps going after a hit and takes the *longest* anchored path.
-    Both prefixes can be real files at once — a result set holding
-    ``report.log:1:…`` and ``report.log-2026-backup:2:…`` makes both members, and
-    stopping at the first marker files ``report.log-2026-backup-1-before`` under
-    ``report.log`` as line 2026. Nothing in the text settles that, but the longer
-    path explains the whole row rather than leaving ``backup-1-before`` as a
-    body, and it is the reading the surrounding block agrees with.
+    Anchoring narrows the field but does not always empty it: a result set
+    holding both ``report.log:1:…`` and ``report.log-2026-backup:2:…`` makes both
+    prefixes members, and ``report.log-2026-backup-1-before`` reads equally well
+    as either file. Preferring the longer path is not a tie-break, it is a coin
+    toss that happens to land the same way every time — it tears a genuine
+    ``report.log`` context row out of a run of ``report.log`` rows.
+
+    The one real signal is where the row sits: grep emits a file's rows
+    contiguously, so ``block_path`` — the file the rows around this one belong
+    to — settles it whenever it is one of the candidates. When it isn't (the row
+    opens a block, or the neighbours disagree) and more than one path still
+    fits, the row is left unparsed. Declining costs one row of folding; picking
+    wrong puts a line under a file it never came from.
 
     ``known_lengths`` lets the scan reject a candidate marker on an integer
     compare instead of slicing the prefix, keeping the walk linear.
@@ -501,7 +510,7 @@ def _tree_dash_row(
     if not known_paths:
         return None
     limit = min(len(line), _TREE_MAX_PATH)
-    best: tuple[str, str, str, str] | None = None
+    candidates: list[tuple[str, str, str, str]] = []
     pos = line.find("-")
     seen = 0
     while pos != -1 and pos < limit and seen < _TREE_MAX_MARKERS:
@@ -511,22 +520,27 @@ def _tree_dash_row(
             if end > pos + 1 and end < len(line) and line[end] == "-":
                 path = line[:pos]
                 if path in known_paths:
-                    best = (path, "-", line[pos + 1 : end], line[end + 1 :])
+                    if path == block_path:
+                        return path, "-", line[pos + 1 : end], line[end + 1 :]
+                    candidates.append((path, "-", line[pos + 1 : end], line[end + 1 :]))
         pos = line.find("-", pos + 1)
-    return best
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _tree_split_row(
     line: str,
     known_paths: frozenset[str] = frozenset(),
     known_lengths: frozenset[int] = frozenset(),
+    block_path: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Split a grep/ripgrep row into ``(path, sep, line_digits, content)``.
 
     Returns ``None`` for any line that isn't a data row. Context rows need the
-    ``known_*`` sets from the colon pass — see :func:`_tree_dash_row`.
+    ``known_*`` sets from the colon pass, and ``block_path`` (the file the
+    surrounding rows belong to) to resolve a row that fits more than one of
+    them — see :func:`_tree_dash_row`.
     """
-    return _tree_colon_row(line) or _tree_dash_row(line, known_paths, known_lengths)
+    return _tree_colon_row(line) or _tree_dash_row(line, known_paths, known_lengths, block_path)
 
 
 def _tree_is_data_row(line: str) -> bool:
@@ -580,7 +594,9 @@ def search_tree_heading(text: str) -> str:
         path = row[0]
         block: list[tuple[str, str, str, str]] = []
         while i < n:
-            nxt = _tree_split_row(lines[i], known_paths, known_lengths)
+            # `path` is the block context: a row that fits several anchored
+            # paths belongs to the one its neighbours already established.
+            nxt = _tree_split_row(lines[i], known_paths, known_lengths, path)
             if nxt is None or nxt[0] != path:
                 break
             block.append(nxt)
