@@ -182,6 +182,34 @@ async def test_maybe_poll_handles_inactive_and_none_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_offline_mode_disables_background_and_on_demand_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    tracker = SubscriptionTracker(enabled=True)
+    calls: list[str | None] = []
+
+    async def unexpected_fetch(token: str | None):
+        calls.append(token)
+        return None
+
+    tracker._client = SimpleNamespace(fetch=unexpected_fetch)
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token",
+        lambda: (_ for _ in ()).throw(AssertionError("offline mode read cached OAuth token")),
+    )
+
+    assert tracker.is_available() is False
+    await tracker.start()
+    await tracker.maybe_poll_on_demand()
+    await tracker._maybe_poll()
+
+    assert tracker._poll_task is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_maybe_poll_success_updates_state_and_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

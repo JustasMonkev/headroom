@@ -246,13 +246,14 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached.
+    """Get a bounded, offline-aware tiktoken encoding, cached.
 
     Routed through the shared bounded loader: tiktoken's vocab download has no
     network timeout, so a raw ``tiktoken.get_encoding`` here could hang a
     request indefinitely on a stalled connection (GH #956). The shared loader
-    bounds the load and, when the download is unreachable, falls back to the
-    exact BPE table bundled in ``headroom._core`` instead of failing.
+    bounds the load, honors HEADROOM_OFFLINE, and — when the download is
+    unreachable or forbidden — falls back to the exact BPE table bundled in
+    ``headroom._core`` instead of failing.
     """
     if not TIKTOKEN_AVAILABLE:
         from headroom.tokenizers.tiktoken_counter import _rust_bundled_encoding
@@ -458,7 +459,7 @@ class OpenAIProvider(Provider):
             self._context_limits.update(context_limits)
             self._custom_context_limits.update(context_limits)
 
-        self._token_counters: dict[str, OpenAITokenCounter] = {}
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -483,9 +484,17 @@ class OpenAIProvider(Provider):
     def get_token_counter(self, model: str) -> TokenCounter:
         """Get token counter for an OpenAI model."""
         if model not in self._token_counters:
-            self._token_counters[model] = OpenAITokenCounter(
-                model=model, custom_encodings=self._encodings
-            )
+            from headroom.tokenizers.tiktoken_counter import TiktokenLoadError
+
+            try:
+                self._token_counters[model] = OpenAITokenCounter(
+                    model=model, custom_encodings=self._encodings
+                )
+            except TiktokenLoadError as exc:
+                from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+                logger.info("tiktoken unavailable for %s (%s); using estimation", model, exc)
+                self._token_counters[model] = EstimatingTokenCounter()
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:

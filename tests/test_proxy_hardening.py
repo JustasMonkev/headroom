@@ -180,3 +180,23 @@ class TestOfflineSwitch:
 
         assert os.environ.get("HF_HUB_OFFLINE") == "1"
         assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+
+    def test_explicit_config_overrides_false_offline_env(self, monkeypatch):
+        import os
+
+        monkeypatch.setenv("HEADROOM_OFFLINE", "0")
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+
+        create_app(
+            ProxyConfig(
+                optimize=False,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                offline=True,
+            )
+        )
+
+        assert os.environ["HEADROOM_OFFLINE"] == "1"
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
