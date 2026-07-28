@@ -1026,6 +1026,70 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     return events
 
 
+# Terminal Responses SSE events, in preference order: a completed turn wins over
+# a truncated or failed one when an upstream emits more than one.
+_RESPONSES_SSE_TERMINAL_TYPES = (
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+)
+
+
+def _openai_responses_sse_to_response(raw: str | bytes) -> dict[str, Any] | None:
+    """Extract the terminal ``response`` object from a Responses SSE body.
+
+    The inverse of ``_openai_responses_to_sse``. Some OpenAI-compatible
+    upstreams answer a ``stream: false`` request with a ``200
+    text/event-stream`` body anyway (#8). The bytes are forwarded to the client
+    untouched, but Headroom still needs the final response object for usage and
+    telemetry accounting. Returns ``None`` when no terminal event is present, so
+    callers fall back to their pre-request token estimate.
+    """
+    buf = bytearray(raw.encode("utf-8", errors="replace") if isinstance(raw, str) else raw)
+    # The splitter only drains events ending in a blank line; a body whose last
+    # event has no trailing separator would otherwise be dropped. Events with no
+    # ``data:`` line are ignored, so the extra terminator is harmless.
+    if not buf.endswith(b"\n\n") and not buf.endswith(b"\r\n\r\n"):
+        buf.extend(b"\n\n")
+
+    try:
+        events = parse_sse_events_from_byte_buffer(buf)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+    best: dict[str, Any] | None = None
+    best_rank = len(_RESPONSES_SSE_TERMINAL_TYPES)
+    for event_name, data_str in events:
+        if data_str.strip() == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data_str)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = payload.get("type") or event_name
+        if event_type not in _RESPONSES_SSE_TERMINAL_TYPES:
+            continue
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            continue
+        rank = _RESPONSES_SSE_TERMINAL_TYPES.index(event_type)
+        # ``<=`` so the last event of the best-ranked type wins.
+        if rank <= best_rank:
+            best, best_rank = response, rank
+    return best
+
+
+def _is_event_stream_response(response: Any) -> bool:
+    """True when an upstream reply carries an SSE content type."""
+    try:
+        content_type = response.headers.get("content-type") or ""
+    except Exception:
+        return False
+    return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
+
+
 def _output_shaping_holdout_fraction() -> float:
     from headroom.proxy import runtime_env
 

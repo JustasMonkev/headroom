@@ -1286,8 +1286,9 @@ class HeadroomProxy(
                 )
 
         # Usage Reporter (license validation + phone-home for managed/enterprise).
-        # Suppressed entirely in offline mode — the air-gap switch must stop all
-        # egress, including license phone-home, even when a key is configured.
+        # Suppressed entirely in offline mode — the auxiliary-egress switch must
+        # stop Headroom's own phone-home, including license reporting, even when
+        # a key is configured. (It does not affect provider forwarding.)
         self.usage_reporter: UsageReporter | None = None
         if config.license_key and not (config.offline or is_offline()):
             from headroom.telemetry.reporter import UsageReporter
@@ -2374,17 +2375,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     except Exception:  # noqa: BLE001 — settings load must never break startup
         pass
 
-    # Air-gap master switch. Propagate config.offline to the env so the
+    # Auxiliary-egress master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
-    # it, force HF/transformers offline before any model code loads, and
-    # announce that every outbound path is disabled.
+    # it, and force HF/transformers offline before any model code loads.
+    #
+    # Scope note: this switch covers Headroom's *own* outbound calls only. It
+    # does NOT block provider forwarding — requests still go to the configured
+    # upstream unless that upstream is itself a local endpoint. See
+    # headroom/offline.py for the full statement of the guarantee.
     if config.offline:
         os.environ.setdefault("HEADROOM_OFFLINE", "1")
     if is_offline():
         apply_offline_env()
         logger.warning(
-            "event=proxy_offline_mode air-gap active — all outbound egress disabled "
-            "(telemetry, update check, license reporter, HuggingFace downloads)"
+            "event=proxy_offline_mode auxiliary egress disabled "
+            "(telemetry, update check, license reporter, HuggingFace downloads) — "
+            "provider requests are NOT blocked and still go to the configured "
+            "upstream unless it is a local endpoint"
         )
 
     proxy = HeadroomProxy(config)

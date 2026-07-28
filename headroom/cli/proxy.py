@@ -1440,7 +1440,9 @@ Memory (Multi-Provider):
 
     _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
     if config.offline:
-        _security_status = "OFFLINE (all egress disabled)" + (
+        # Scope: telemetry, update check, license reporting, model downloads.
+        # Provider forwarding is not affected — see headroom/offline.py.
+        _security_status = "OFFLINE (auxiliary egress disabled; provider traffic unaffected)" + (
             " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
         )
     elif _auth_on:
