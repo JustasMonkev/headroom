@@ -353,3 +353,36 @@ def test_deadline_fallback_is_retried_instead_of_skip_cached(monkeypatch):
     second = _apply(router, original)
 
     assert second.messages[1]["content"] == "compressed output"
+
+
+def test_deadline_cancels_queued_compression_work(monkeypatch):
+    """Queued work must not execute after its request has already failed open."""
+    router = _router()
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "2")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "30")
+    release = threading.Event()
+    lock = threading.Lock()
+    started: list[str] = []
+
+    def wedged_compress(content, *, context="", bias=1.0):
+        with lock:
+            started.append(content)
+        release.wait(timeout=2.0)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", wedged_compress)
+    try:
+        _apply(router, _messages(pending=8))
+        with lock:
+            assert len(started) == 2
+    finally:
+        release.set()
+
+    executor = router._stage_compression_executor
+    assert executor is not None
+    deadline = time.monotonic() + 1.0
+    while executor._queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    with lock:
+        assert len(started) == 2, "cancelled queued compression ran after the deadline"

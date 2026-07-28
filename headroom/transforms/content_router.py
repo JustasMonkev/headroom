@@ -148,6 +148,30 @@ class _DaemonBoundedExecutor:
             return None
         return future
 
+    def cancel_pending(self, futures: list[Future[Any]]) -> int:
+        """Cancel and remove queued work whose request can no longer use it."""
+        cancelled = {future for future in futures if future.cancel()}
+        if not cancelled:
+            return 0
+
+        # ``Future.cancel`` prevents execution but Queue entries would still
+        # occupy the one pending wave until a worker eventually dequeues them.
+        # Remove those entries under Queue's own mutex so a subsequent request
+        # can use the freed bounded capacity immediately. A worker that raced
+        # us and already dequeued an entry will observe the cancelled Future
+        # through ``set_running_or_notify_cancel`` and skip the callable.
+        with self._queue.mutex:
+            retained = [item for item in self._queue.queue if item[0] not in cancelled]
+            removed = len(self._queue.queue) - len(retained)
+            if removed:
+                self._queue.queue.clear()
+                self._queue.queue.extend(retained)
+                self._queue.unfinished_tasks -= removed
+                self._queue.not_full.notify_all()
+                if self._queue.unfinished_tasks == 0:
+                    self._queue.all_tasks_done.notify_all()
+        return len(cancelled)
+
 
 _STAGE_COMPRESSION_EXECUTORS_LOCK = threading.Lock()
 _STAGE_COMPRESSION_EXECUTORS: dict[int, _DaemonBoundedExecutor] = {}
@@ -5162,6 +5186,15 @@ class ContentRouter(Transform):
                     if future.done():
                         task_results_by_index[task_index] = future.result()
                         in_flight.pop(future)
+
+                # Results cannot be used once the shared deadline has elapsed.
+                # Cancel admitted work that is still queued so it does not run
+                # an obsolete second wave and starve later requests. Already
+                # running callables remain bounded by the shared worker count.
+                if in_flight:
+                    self._get_stage_compression_executor(configured_workers).cancel_pending(
+                        list(in_flight)
+                    )
 
                 unfinished = [
                     index

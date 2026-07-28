@@ -1801,22 +1801,27 @@ class HeadroomProxy(
         # (e.g. in tests that spin up multiple app instances in the same process).
         reset_quota_registry()
         registry = get_quota_registry()
+        subscription_tracking_active = self.config.subscription_tracking_enabled and not (
+            self.config.offline or is_offline()
+        )
         tracker = configure_subscription_tracker(
             poll_interval_s=self.config.subscription_poll_interval_s,
             active_window_s=self.config.subscription_active_window_s,
-            enabled=self.config.subscription_tracking_enabled,
+            enabled=subscription_tracking_active,
         )
         registry.register(tracker)
         registry.register(get_codex_rate_limit_state())
         registry.register(get_copilot_quota_tracker())
         await registry.start_all()
 
-        if self.config.subscription_tracking_enabled:
+        if subscription_tracking_active:
             logger.info(
                 "Subscription tracking: ENABLED "
                 f"(poll_interval={self.config.subscription_poll_interval_s}s, "
                 f"active_window={self.config.subscription_active_window_s}s)"
             )
+        elif self.config.subscription_tracking_enabled:
+            logger.info("Subscription tracking: DISABLED (offline mode)")
         else:
             logger.info("Subscription tracking: DISABLED")
 

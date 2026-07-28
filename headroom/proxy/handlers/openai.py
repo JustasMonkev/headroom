@@ -5709,13 +5709,21 @@ class OpenAIHandlerMixin:
                                         return
 
                                     # The upstream may ignore the forced
-                                    # ``stream:false`` and return raw SSE.  Once
+                                    # ``stream:false`` and return raw SSE. Once
                                     # the keepalive has started we cannot invoke
                                     # a plain Response (it would emit a second
-                                    # response-start), but its successful body is
+                                    # response-start), but an actual SSE body is
                                     # still safe to append to the open stream.
+                                    # A 200 HTML/text gateway response is not:
+                                    # appending it after a ping would corrupt the
+                                    # event stream, so let it take the structured
+                                    # SSE error path below.
                                     body_bytes = getattr(result, "body", None)
-                                    if result.status_code == 200 and body_bytes is not None:
+                                    if (
+                                        result.status_code == 200
+                                        and body_bytes is not None
+                                        and _is_event_stream_response(result)
+                                    ):
                                         await send(
                                             {
                                                 "type": "http.response.body",

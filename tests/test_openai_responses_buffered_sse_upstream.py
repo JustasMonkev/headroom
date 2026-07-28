@@ -283,6 +283,42 @@ def test_delayed_buffered_sse_is_appended_after_keepalive() -> None:
     assert "proxy_error" not in resp.text
 
 
+def test_delayed_non_sse_body_becomes_structured_stream_error() -> None:
+    """A keepalive-started SSE response must never append HTML/text bytes."""
+    from headroom.ccr import CCR_TOOL_NAME
+
+    app = _make_app()
+    server = app.state.proxy
+
+    async def delayed_retry(method, url, headers, body_, stream=False, **kwargs):
+        await asyncio.sleep(1.1)
+        return httpx.Response(
+            200,
+            content=b"<html>gateway failure</html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request(method, url),
+        )
+
+    server._retry_request = delayed_retry
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-5.4",
+                "stream": True,
+                "input": "hello",
+                "tools": [{"type": "function", "name": CCR_TOOL_NAME, "parameters": {}}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert '"type":"ping"' in resp.text
+    assert "event: error" in resp.text
+    assert "gateway failure" not in resp.text
+
+
 @pytest.mark.parametrize("client_stream", [True, False])
 def test_sse_terminal_response_is_used_for_ccr_interception(client_stream: bool) -> None:
     """A retrieval call inside upstream SSE must be handled for either client mode."""

@@ -28,12 +28,13 @@ from headroom.offline import apply_offline_env, is_offline
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# The four call sites that honour HEADROOM_OFFLINE today.
+# Auxiliary-egress call sites that honour HEADROOM_OFFLINE today.
 AUXILIARY_EGRESS_MODULES = (
     "headroom/telemetry/beacon.py",  # telemetry beacon
     "headroom/update_check.py",  # release / update check
     "headroom/proxy/server.py",  # license / usage reporter + HF env
     "headroom/offline.py",  # apply_offline_env -> HF_HUB_OFFLINE
+    "headroom/subscription/tracker.py",  # Anthropic subscription polling
 )
 
 # Provider forwarding paths. These are NOT gated by HEADROOM_OFFLINE: a request
@@ -107,6 +108,15 @@ class TestAuxiliaryEgressIsGated:
             r"if\s+config\.license_key\s+and\s+not\s+\(\s*config\.offline\s+or\s+is_offline\(\)\s*\)",
             source,
         ), "UsageReporter construction must stay gated by config.offline / is_offline()"
+
+    def test_subscription_tracking_startup_is_gated(self):
+        source = _read("headroom/proxy/server.py")
+        assert re.search(
+            r"subscription_tracking_active\s*=.*subscription_tracking_enabled\s+and\s+not\s+\("
+            r"\s*self\.config\.offline\s+or\s+is_offline\(\)\s*\)",
+            source,
+            re.DOTALL,
+        ), "Subscription tracker startup must stay gated by offline mode"
 
     @pytest.mark.parametrize("rel_path", AUXILIARY_EGRESS_MODULES)
     def test_auxiliary_module_references_the_switch(self, rel_path):
