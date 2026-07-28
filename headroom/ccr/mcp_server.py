@@ -37,6 +37,11 @@ from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
 
+# A4: the retrieve description is shared with the proxy-side tool injection so
+# the two can never drift again (they had). ``tool_injection`` has no heavy
+# dependencies and no import cycle back into this module.
+from headroom.ccr.tool_injection import CCR_RETRIEVE_DESCRIPTION
+
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
 fcntl: Any = None

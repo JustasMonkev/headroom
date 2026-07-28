@@ -21,6 +21,29 @@ from typing import Any
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
+# Single source of truth for the retrieval tool's description (A3/A4 of
+# docs/token-efficiency-review.md). The same 478-char paragraph used to be
+# duplicated across the OpenAI, Anthropic and Google branches below *and*
+# again in headroom/ccr/mcp_server.py, where the four copies had already
+# drifted apart. One terse constant is ~68 tokens cheaper per request and
+# makes drift impossible.
+#
+# These bytes are STICKY: once a session has done CCR the tool definition is
+# replayed verbatim on every subsequent request (PR-B7), so the string is part
+# of the provider prompt-cache key. Editing it is a one-time cache-busting
+# change — keep it byte-stable.
+CCR_RETRIEVE_DESCRIPTION = (
+    "Get the original uncompressed content for a hash shown in a compression marker."
+)
+
+# Same reasoning for the (opt-in) system-message instructions: one byte-stable
+# line. The previous block listed the live hashes, which mutate turn to turn and
+# therefore invalidated the system-prompt prefix cache on every request while
+# restating information already present in the inline markers.
+CCR_SYSTEM_INSTRUCTIONS = (
+    f"Compressed tool output carries a hash; call {CCR_TOOL_NAME}(hash) for the original."
+)
+
 
 def create_ccr_tool_definition(
     provider: str = "anthropic",
@@ -38,26 +61,24 @@ def create_ccr_tool_definition(
     Returns:
         Tool definition dict in the appropriate format.
     """
+    # Parameter schema shared by every provider. No param-level description:
+    # the tool description already says the value is the hash from a marker,
+    # and the schema key is literally named "hash".
+    hash_schema = {
+        "type": "object",
+        "properties": {
+            "hash": {"type": "string"},
+        },
+        "required": ["hash"],
+    }
+
     # Base tool definition (OpenAI format)
     openai_definition = {
         "type": "function",
         "function": {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "hash": {
-                        "type": "string",
-                        "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
-                    },
-                },
-                "required": ["hash"],
-            },
+            "description": CCR_RETRIEVE_DESCRIPTION,
+            "parameters": hash_schema,
         },
     }
 
@@ -65,44 +86,19 @@ def create_ccr_tool_definition(
         return openai_definition
 
     elif provider == "anthropic":
-        # Anthropic uses a slightly different format
+        # Anthropic uses a slightly different format (input_schema, not parameters)
         return {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "hash": {
-                        "type": "string",
-                        "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
-                    },
-                },
-                "required": ["hash"],
-            },
+            "description": CCR_RETRIEVE_DESCRIPTION,
+            "input_schema": hash_schema,
         }
 
     elif provider == "google":
         # Google/Gemini format
         return {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "hash": {
-                        "type": "string",
-                        "description": "Hash key from the compression marker",
-                    },
-                },
-                "required": ["hash"],
-            },
+            "description": CCR_RETRIEVE_DESCRIPTION,
+            "parameters": hash_schema,
         }
 
     else:
@@ -119,29 +115,29 @@ def create_system_instructions(
     This is an alternative to tool injection - adds instructions to the
     system message telling the LLM how to retrieve compressed data.
 
+    The returned text is a single byte-stable line and deliberately ignores
+    ``hashes``: the old block enumerated the live hashes, which change on every
+    turn. Mutating the system prompt per turn busts the provider's
+    system-prompt prefix cache — the exact hazard ``proxy/output_steering.py``
+    warns about — and the list was redundant with the inline markers that
+    already carry each hash.
+
     Args:
-        hashes: List of hash keys for compressed content in this context.
-        retrieval_endpoint: The endpoint path for retrieval.
+        hashes: Accepted for backwards compatibility; not rendered.
+        retrieval_endpoint: Accepted for backwards compatibility; not rendered.
 
     Returns:
         Instruction text to append to system message.
     """
-    hash_list = ", ".join(hashes) if len(hashes) <= 5 else f"{', '.join(hashes[:5])} ..."
+    return CCR_SYSTEM_INSTRUCTIONS
 
-    return f"""
-## Compressed Context Available
 
-Some tool outputs have been compressed to reduce context size. If you need
-the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
-
-**How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
-
-**Available hashes:** {hash_list}
-
-Look for markers like `[N items compressed to M. Retrieve more: hash=abc123]`
-in tool results to find the hash for each compressed output.
-"""
+def _structured_content_has_instructions(content: list[Any], instructions: str) -> bool:
+    """True when a structured system-content list already carries the CCR line."""
+    for block in content:
+        if isinstance(block, dict) and instructions in str(block.get("text") or ""):
+            return True
+    return False
 
 
 @dataclass
@@ -359,6 +355,11 @@ class CCRToolInjector:
     ) -> list[dict[str, Any]]:
         """Inject retrieval instructions into system message.
 
+        Handles both plain-string system content and STRUCTURED (list-of-blocks)
+        content. The structured branch used to append the message unchanged, so
+        Anthropic-style callers — the common case — silently got no instructions
+        at all.
+
         Args:
             messages: List of messages.
 
@@ -382,21 +383,28 @@ class CCRToolInjector:
                 system_found = True
                 content = message.get("content", "")
 
-                # Don't add if already present
-                if "Compressed Context Available" in content:
-                    updated_messages.append(message)
-                else:
-                    # Append instructions
-                    if isinstance(content, str):
+                if isinstance(content, str):
+                    # Don't add if already present (idempotent).
+                    if instructions in content:
+                        updated_messages.append(message)
+                    else:
+                        joiner = "\n\n" if content else ""
+                        updated_messages.append(
+                            {**message, "content": content + joiner + instructions}
+                        )
+                elif isinstance(content, list):
+                    if _structured_content_has_instructions(content, instructions):
+                        updated_messages.append(message)
+                    else:
                         updated_messages.append(
                             {
                                 **message,
-                                "content": content + instructions,
+                                "content": [*content, {"type": "text", "text": instructions}],
                             }
                         )
-                    else:
-                        # Handle structured content
-                        updated_messages.append(message)
+                else:
+                    # Unknown content shape (None, dict, ...) — leave untouched.
+                    updated_messages.append(message)
             else:
                 updated_messages.append(message)
 
@@ -406,7 +414,7 @@ class CCRToolInjector:
                 0,
                 {
                     "role": "system",
-                    "content": instructions.strip(),
+                    "content": instructions,
                 },
             )
 
