@@ -862,6 +862,13 @@ fn is_summary_line(line: &str) -> bool {
     if line.starts_with("===") || line.starts_with("---") {
         return true;
     }
+    // pytest's per-failure header (`____ test_invoice_totals ____`). It is the
+    // only place the failing test's name appears next to its assertion text,
+    // so dropping it leaves the surviving `E   assert 690 == 700` unattributed
+    // — the reader learns a number mismatched but not in which test.
+    if line.starts_with("___") {
+        return true;
+    }
     let bytes = line.as_bytes();
     let leading_digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
     if leading_digits > 0 && line[leading_digits..].starts_with(' ') {
@@ -1099,6 +1106,7 @@ impl LogCompressor {
         let mut fails: Vec<LogLine> = Vec::new();
         let mut warnings: Vec<LogLine> = Vec::new();
         let mut summaries: Vec<LogLine> = Vec::new();
+        let mut failure_details: Vec<LogLine> = Vec::new();
         let mut stack_traces: Vec<Vec<LogLine>> = Vec::new();
         let mut current_stack: Vec<LogLine> = Vec::new();
 
@@ -1107,6 +1115,10 @@ impl LogCompressor {
                 LogLevel::Error => errors.push(line.clone()),
                 LogLevel::Fail => fails.push(line.clone()),
                 LogLevel::Warn => warnings.push(line.clone()),
+                // Only lines the level classifier did *not* already claim can
+                // be failure detail — otherwise a line would be folded (and
+                // `×N`-annotated) twice, once in each bucket.
+                _ if is_failure_detail(&line.content) => failure_details.push(line.clone()),
                 _ => {}
             }
             if line.is_stack_trace {
@@ -1137,13 +1149,24 @@ impl LogCompressor {
         // survivor states the count.
         let (errors, mut suppressed) = dedupe_identical(errors);
         let (fails, fail_suppressed) = dedupe_identical(fails);
+        // Failure-detail lines fold on the same rule (a parametrized suite
+        // emits the same `E   assert 4 == 5` once per case).
+        let (failure_details, detail_suppressed) = dedupe_identical(failure_details);
         suppressed.extend(fail_suppressed);
+        suppressed.extend(detail_suppressed);
         stats.duplicate_errors_folded += suppressed.len();
 
         for line in self.select_with_first_last(&errors, self.config.max_errors) {
             selected.insert(line);
         }
         for line in self.select_with_first_last(&fails, self.config.max_errors) {
+            selected.insert(line);
+        }
+        // Failure detail gets its own budget rather than competing with real
+        // ERROR/FAIL lines for `max_errors`: the two answer different
+        // questions (*what* failed vs *why*) and a run with 10 failures would
+        // otherwise spend the whole error budget on names and keep no reason.
+        for line in self.select_with_first_last(&failure_details, self.config.max_errors) {
             selected.insert(line);
         }
 
@@ -1225,6 +1248,12 @@ impl LogCompressor {
         // just the last thing that went right. At the default
         // `error_context_lines = 3` that is 1 before / 2 after, and it still
         // scales for callers that deliberately widen the setting.
+        //
+        // The narrow window is only safe because failure detail no longer
+        // depends on it: assertion text and exception lines are selected
+        // directly (see `is_failure_detail`), however far they sit from the
+        // line that named the failing test. Widening the window back to buy
+        // that content would cost ~30 neighbours per error to keep one.
         let ctx_before = self.config.error_context_lines.div_ceil(3);
         let ctx_after = (2 * self.config.error_context_lines).div_ceil(3);
         let selected_indices: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
@@ -1485,6 +1514,82 @@ fn dedupe_identical_traces(
     (kept, suppressed)
 }
 
+/// Lines that say *why* something failed, as opposed to *that* it failed.
+///
+/// The level classifier is keyword + word-boundary based, so it sees `FAILED`
+/// and `ERROR` but not `AssertionError: expected True, got False` (no word
+/// boundary before `Error` inside `AssertionError`) and not pytest's `E   `
+/// assertion continuations. Those lines used to survive only as *context*
+/// around a nearby FAIL line; once the context window narrowed to 1-before /
+/// 2-after they were dropped, and on the single most common log an agent sees
+/// — a pytest run — the model learned that a test failed but not why.
+///
+/// So detect them directly and select them on their own merit. Three shapes,
+/// all cheap prefix/suffix checks (no regex, no allocation):
+///
+/// 1. pytest assertion continuations: `E` followed by 2+ spaces.
+/// 2. bare `assert ...` / `assertion failed` (pytest source echo, Rust panic).
+/// 3. an exception-type token adjacent to a colon, either leading
+///    (`ValueError: bad input`) or trailing (`tests/t.py:12: AssertionError`).
+///    The token must be a single identifier ending in `Error`/`Exception`/
+///    `Panic`, which keeps prose like `INFO: recovered from an Error` out.
+fn is_failure_detail(content: &str) -> bool {
+    let line = content.trim_start();
+    if line.is_empty() {
+        return false;
+    }
+
+    // 1. pytest assertion continuation: `E` + at least two spaces. The column
+    //    width tracks the source indent, so the exact count varies; two is the
+    //    tightest bound that still excludes prose starting with a capital E.
+    if let Some(rest) = line.strip_prefix('E') {
+        if rest.starts_with("  ") && !rest.trim_start().is_empty() {
+            return true;
+        }
+    }
+
+    // 2. Assertion statements echoed by pytest / Rust's panic message.
+    if line.starts_with("assert ") || line.starts_with("assert(") {
+        return true;
+    }
+    if line.contains("assertion failed") || line.contains("assertion `") {
+        return true;
+    }
+
+    // 3. Exception-type token next to a colon.
+    if let Some(head) = line.split(':').next() {
+        if is_exception_token(head) {
+            return true;
+        }
+    }
+    if let Some(tail) = line.rsplit(": ").next() {
+        if is_exception_token(tail.trim_end()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A single dotted identifier whose last segment ends in `Error`, `Exception`
+/// or `Panic` — `ValueError`, `AssertionError`, `django.db.IntegrityError`.
+fn is_exception_token(token: &str) -> bool {
+    if token.is_empty() || token.len() > 96 {
+        return false;
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        return false;
+    }
+    let last = token.rsplit('.').next().unwrap_or(token);
+    if last.len() <= 5 {
+        // `Error` alone is a word, not a type name; require a prefix.
+        return false;
+    }
+    last.ends_with("Error") || last.ends_with("Exception") || last.ends_with("Panic")
+}
+
 fn warnings_dropped(all: &[LogLine], deduped: &[LogLine]) -> usize {
     let original_warnings = all.iter().filter(|l| l.level == LogLevel::Warn).count();
     original_warnings.saturating_sub(deduped.len())
@@ -1514,6 +1619,14 @@ fn score_log_line(line: &LogLine) -> f32 {
     };
     let stack_boost: f32 = if line.is_stack_trace { 0.3 } else { 0.0 };
     let summary_boost: f32 = if line.is_summary { 0.4 } else { 0.0 };
+    // Failure detail (`E   assert 1 == 2`, `AssertionError: ...`) scores like
+    // an error: it is the payload the error line is a pointer to, and it must
+    // not be the thing the global `max_total_lines` cap evicts.
+    let level_score = if level_score < 1.0 && is_failure_detail(&line.content) {
+        1.0
+    } else {
+        level_score
+    };
     (level_score + stack_boost + summary_boost).min(1.0_f32)
 }
 
@@ -1733,6 +1846,113 @@ mod tests {
         assert!(result.compressed_line_count <= 12);
         assert_eq!(stats.format, Some(LogFormat::Generic));
         assert!(stats.lines_dropped_by_global_cap > 0 || result.compressed_line_count <= 12);
+    }
+
+    #[test]
+    fn pytest_assertion_detail_survives_compression() {
+        // The shape of the regression this guards: on a real pytest run the
+        // assertion text sits in the FAILURES block, several lines away from
+        // any line the level classifier recognises as a failure. Selecting it
+        // only as *context* around a FAIL line makes it a hostage of the
+        // context window; it must be selected on its own merit.
+        let c = cmp();
+        let mut content = String::new();
+        content.push_str(&format!(
+            "{} test session starts {}\n",
+            "=".repeat(20),
+            "=".repeat(20)
+        ));
+        content.push_str("collected 100 items\n");
+        for i in 0..95 {
+            content.push_str(&format!("tests/test_{i}.py::test_case_{i} PASSED\n"));
+        }
+        content.push_str("tests/test_fail.py::test_case_fail FAILED\n");
+        content.push_str(&format!("{} FAILURES {}\n", "=".repeat(20), "=".repeat(20)));
+        content.push_str(&format!(
+            "{} test_case_fail {}\n",
+            "_".repeat(20),
+            "_".repeat(20)
+        ));
+        content.push_str("    def test_case_fail():\n");
+        content.push_str(">       assert compute(2) == 5\n");
+        content.push_str("E       assert 4 == 5\n");
+        content.push_str("E        +  where 4 = compute(2)\n");
+        content.push('\n');
+        content.push_str("tests/test_fail.py:12: AssertionError\n");
+        content.push_str(&format!(
+            "{} short test summary {}\n",
+            "=".repeat(20),
+            "=".repeat(20)
+        ));
+        content.push_str("FAILED tests/test_fail.py::test_case_fail\n");
+        content.push_str("1 failed, 95 passed\n");
+
+        let (result, _) = c.compress(&content, 1.0);
+        assert!(
+            result.compressed.contains("assert 4 == 5"),
+            "assertion text dropped:\n{}",
+            result.compressed
+        );
+        assert!(
+            result.compressed.contains("AssertionError"),
+            "exception type dropped:\n{}",
+            result.compressed
+        );
+        assert!(
+            result.compressed.contains("FAILED"),
+            "failing test name dropped:\n{}",
+            result.compressed
+        );
+        // The `____ test_case_fail ____` header is the only place the failing
+        // test's name sits next to its assertion text.
+        assert!(
+            result.compressed.contains("test_case_fail"),
+            "assertion text left unattributed:\n{}",
+            result.compressed
+        );
+        // Still a real compression win, not a pass-through.
+        assert!(
+            result.compression_ratio < 0.5,
+            "ratio {}",
+            result.compression_ratio
+        );
+    }
+
+    #[test]
+    fn failure_detail_detector_does_not_overfire() {
+        // Every one of these must stay out: they are ordinary log prose that
+        // happens to contain a capital E, the word assert, or the word Error.
+        for line in [
+            "Everything is fine",
+            "E",
+            "E ok",
+            "INFO: recovered from an Error",
+            "Error",
+            "reassert the lock",
+            "https://example.com/Error",
+        ] {
+            assert!(!is_failure_detail(line), "over-fired on {line:?}");
+        }
+        for line in [
+            "E       assert 4 == 5",
+            "  assert result == 5",
+            "AssertionError: expected True, got False",
+            "tests/test_fail.py:12: AssertionError",
+            "django.db.IntegrityError: duplicate key",
+            "thread 'main' panicked at 'assertion failed: a == b'",
+        ] {
+            assert!(is_failure_detail(line), "missed {line:?}");
+        }
+    }
+
+    #[test]
+    fn failure_detail_scores_like_an_error() {
+        let mut plain = LogLine::new(0, "processing item 3");
+        plain.score = score_log_line(&plain);
+        let mut detail = LogLine::new(1, "AssertionError: expected True, got False");
+        detail.score = score_log_line(&detail);
+        assert!(detail.score > plain.score);
+        assert_eq!(detail.score, 1.0);
     }
 
     #[test]

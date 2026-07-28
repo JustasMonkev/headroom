@@ -885,3 +885,82 @@ class TestC2EmissionWaste:
         assert "line 31" in kept and "line 32" in kept  # 2 after
         assert "line 28" not in kept
         assert "line 33" not in kept
+
+
+class TestFailureDetailSurvives:
+    """The narrow context window must not cost the *reason* a test failed.
+
+    On a real pytest run the assertion text lives in the FAILURES block, many
+    lines away from anything the level classifier recognises as a failure.
+    Keeping it as *context* around a FAIL line made it a hostage of the window
+    width; it is now selected on its own merit (`_is_failure_detail`), so these
+    tests pin content, not window arithmetic.
+    """
+
+    PYTEST_RUN = "\n".join(
+        [
+            "=" * 30 + " test session starts " + "=" * 30,
+            "platform linux -- Python 3.12.3, pytest-8.2.0",
+            "collected 62 items",
+            "",
+        ]
+        + [f"tests/test_core.py::test_case_{i} PASSED" for i in range(58)]
+        + [
+            "",
+            "=" * 35 + " FAILURES " + "=" * 35,
+            "_" * 27 + " test_invoice_totals " + "_" * 27,
+            "",
+            "    def test_invoice_totals():",
+            "        inv = build_invoice(items=[Item('a', 3), Item('b', 4)])",
+            ">       assert inv.total == 700",
+            "E       assert 690 == 700",
+            "E        +  where 690 = Invoice(id='inv_31', total=690).total",
+            "",
+            "tests/test_billing.py:88: AssertionError",
+            "=" * 27 + " short test summary info " + "=" * 27,
+            "FAILED tests/test_billing.py::test_invoice_totals",
+            "1 failed, 58 passed in 2.31s",
+        ]
+    )
+
+    @staticmethod
+    def _compress(content, **cfg):
+        base = {"min_lines_for_ccr": 5, "enable_ccr": False}
+        base.update(cfg)
+        return LogCompressor(config=LogCompressorConfig(**base)).compress(content)
+
+    def test_assertion_detail_survives_a_pytest_run(self):
+        result = self._compress(self.PYTEST_RUN)
+
+        # *That* it failed …
+        assert "FAILED" in result.compressed
+        # … and *why*, which is the part a narrow context window used to drop.
+        assert "assert 690 == 700" in result.compressed
+        assert "AssertionError" in result.compressed
+        # … attributed to the test it belongs to.
+        assert "test_invoice_totals" in result.compressed
+        # Still a real win, not a pass-through.
+        assert result.compression_ratio < 0.5
+
+    def test_exception_line_survives_without_a_nearby_error_keyword(self):
+        """`ValueError: ...` has no word-boundary `Error`, so the level
+        classifier never sees it. It must survive anyway."""
+        lines = [f"processing record {i}" for i in range(80)]
+        lines[40] = "ValueError: unparseable timestamp in column 'created_at'"
+        result = self._compress("\n".join(lines))
+
+        assert "ValueError: unparseable timestamp" in result.compressed
+
+    def test_detector_does_not_over_fire_on_ordinary_prose(self):
+        """Cheap prefix checks must not turn a quiet log into a no-op."""
+        lines = [
+            "Everything is fine",
+            "E",
+            "E ok",
+            "INFO: recovered from an Error",
+            "reassert the lock",
+        ] * 20
+        result = self._compress("\n".join(lines))
+
+        body = [ln for ln in result.compressed.splitlines() if not ln.startswith("[")]
+        assert len(body) < len(lines), "nothing was compressed away"

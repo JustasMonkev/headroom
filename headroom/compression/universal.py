@@ -54,17 +54,30 @@ logger = logging.getLogger(__name__)
 # it anywhere. Costs ~4 tokens against the ~7 of ` ...[compressed]... `.
 _ELISION_MARKER = "…[c]…"
 
-# Minimum non-structural span worth compressing. Every compressed span pays
-# for one `_ELISION_MARKER`, so below this the framing dominates the saving:
-# at the previous floor of 50 the old 20-char banner was ~40% of the span.
+# Minimum non-structural span worth compressing.
 #
-# NOT 200. Measured against this repo's own representative fixtures
-# (`tests/test_compression/test_evals.py`), the longest non-structural span
-# after entropy preservation is 109 chars in the GitHub API response and 116
-# in the application log — a 200-char floor makes this compressor a no-op on
-# both. 100 is the largest floor that still compresses realistic payloads, and
-# at 100 chars the marker is ~6% of the span rather than ~40%.
-_MIN_SPAN_TO_COMPRESS = 100
+# 50, not 100 or 200. A floor this low is safe because the per-span net-win
+# guard below (`compressed if len(compressed) < len(span_content)`) already
+# refuses any span the marker would not pay for — a span cannot come back
+# bigger, so the floor no longer has to underwrite that risk and is free to
+# be as permissive as the measurements want.
+#
+# And the measurements want 50. Swept with the marker held constant and
+# Kompress off (with Kompress on, its 403 is swallowed internally and the
+# input is returned unchanged, which masks the threshold entirely), tokens
+# out of `cl100k_base` on this repo's own fixtures:
+#
+#     input (tokens in)              thr=50   thr=100   thr=200
+#     600-line log       (29,999)    20,415    29,999    29,999
+#     APPLICATION_LOGS      (994)       760       919       994
+#     PYTHON_FILE_CONTENT  (1,521)    1,162     1,240     1,343
+#     JAVASCRIPT_FILE     (1,787)     1,627     1,646     1,696
+#
+# 50 wins on every input, and on the 600-line log 100 is a total no-op: real
+# log spans after entropy preservation sit in the 50-100 char band, so a
+# 100-char floor does not "trade a small win for less framing", it turns the
+# compressor off exactly where it had the most to remove.
+_MIN_SPAN_TO_COMPRESS = 50
 
 
 @dataclass
@@ -357,16 +370,26 @@ class UniversalCompressor:
                 # Preserve structural content
                 result_parts.append(span_content)
             else:
-                # Compress non-structural content. The threshold is high
-                # because each compressed span pays for its own elision marker:
-                # at the old 51-char floor the marker was ~40% of the span, and
-                # 40 such spans were ~200 tokens of identical framing.
+                # Compress non-structural content. The floor is deliberately
+                # low; the net-win guard below is what makes that safe.
                 if len(span_content) > _MIN_SPAN_TO_COMPRESS:
                     compressed = self._compress_fn(span_content)
                     # Net-win guard: `_compress_fn` is pluggable (Kompress, or
                     # the truncating fallback), so nothing guarantees its
                     # output is smaller. Keeping the original when it isn't
                     # costs nothing and can only help.
+                    #
+                    # It is a CHARACTER guard, not a token one. A span of
+                    # dense filler (`"x" * 60`) shrinks in chars while growing
+                    # in tokens, because the marker costs ~4 tokens and the
+                    # filler it displaced cost ~2. Measured on real fixtures
+                    # this does not happen — 50 wins on tokens across all four
+                    # — and every cheap char-based proxy that suppresses the
+                    # synthetic case (e.g. "require a 40-char saving") costs
+                    # real tokens on them: APPLICATION_LOGS 760 -> 797,
+                    # PYTHON_FILE_CONTENT 1,162 -> 1,195. Closing it properly
+                    # needs a tokenizer per span, which this path cannot
+                    # afford; left open deliberately.
                     result_parts.append(
                         compressed if len(compressed) < len(span_content) else span_content
                     )

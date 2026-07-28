@@ -144,6 +144,50 @@ class LogCompressionResult:
 # ─── LogCompressor (Rust-backed) ────────────────────────────────────────────
 
 
+def _is_exception_token(token: str) -> bool:
+    """Mirror of Rust `is_exception_token`.
+
+    A single dotted identifier whose last segment ends in ``Error``,
+    ``Exception`` or ``Panic`` — ``ValueError``, ``AssertionError``,
+    ``django.db.IntegrityError``.
+    """
+    if not token or len(token) > 96:
+        return False
+    if not all(c.isascii() and (c.isalnum() or c in "_.") for c in token):
+        return False
+    last = token.rsplit(".", 1)[-1]
+    if len(last) <= 5:
+        # `Error` on its own is a word, not a type name; require a prefix.
+        return False
+    return last.endswith(("Error", "Exception", "Panic"))
+
+
+def _is_failure_detail(content: str) -> bool:
+    """Mirror of Rust `is_failure_detail`.
+
+    Lines that say *why* something failed, as opposed to *that* it failed.
+    The level classifier is keyword + word-boundary based, so it sees
+    ``FAILED``/``ERROR`` but never ``AssertionError: expected True`` (no word
+    boundary inside ``AssertionError``) nor pytest's ``E   `` assertion
+    continuations. Those used to survive only as *context* around a nearby
+    FAIL line; with the narrowed context window they are selected directly.
+    """
+    line = content.lstrip()
+    if not line:
+        return False
+    if line.startswith("E"):
+        rest = line[1:]
+        if rest.startswith("  ") and rest.strip():
+            return True
+    if line.startswith(("assert ", "assert(")):
+        return True
+    if "assertion failed" in line or "assertion `" in line:
+        return True
+    if _is_exception_token(line.split(":", 1)[0]):
+        return True
+    return _is_exception_token(line.rsplit(": ", 1)[-1].rstrip())
+
+
 def _format_from_str(name: str) -> LogFormat:
     return {
         "pytest": LogFormat.PYTEST,
@@ -280,6 +324,11 @@ class LogCompressor:
         summary_patterns = [
             re.compile(r"^={3,}"),
             re.compile(r"^-{3,}"),
+            # pytest's per-failure header (`____ test_invoice_totals ____`).
+            # It is the only place the failing test's name appears next to its
+            # assertion text, so without it the surviving `E   assert 690 ==
+            # 700` is unattributed. See Rust `is_summary_line`.
+            re.compile(r"^_{3,}"),
             re.compile(r"^\d+ (passed|failed|skipped|error|warning)"),
             re.compile(r"^(?:Tests?|Suites?):?\s+\d+"),
             re.compile(r"^(?:TOTAL|Total|Summary)"),
@@ -332,6 +381,11 @@ class LogCompressor:
             LogLevel.UNKNOWN: 0.1,
         }
         score = level_scores.get(log_line.level, 0.1)
+        # Mirrors Rust `score_log_line`: failure detail scores like an error,
+        # so the global `max_total_lines` cap never evicts the *reason* while
+        # keeping the line that merely names the failing test.
+        if score < 1.0 and _is_failure_detail(log_line.content):
+            score = 1.0
         if log_line.is_stack_trace:
             score += 0.3
         if log_line.is_summary:
@@ -350,6 +404,7 @@ class LogCompressor:
         errors: list[LogLine] = []
         fails: list[LogLine] = []
         warnings: list[LogLine] = []
+        failure_details: list[LogLine] = []
         stack_traces: list[list[LogLine]] = []
         summaries: list[LogLine] = []
         current_stack: list[LogLine] = []
@@ -361,6 +416,10 @@ class LogCompressor:
                 fails.append(log_line)
             elif log_line.level == LogLevel.WARN:
                 warnings.append(log_line)
+            elif _is_failure_detail(log_line.content):
+                # Only lines the level classifier did not already claim, so a
+                # line is never folded (and `×N`-annotated) in two buckets.
+                failure_details.append(log_line)
             if log_line.is_stack_trace:
                 current_stack.append(log_line)
             elif current_stack:
@@ -375,11 +434,20 @@ class LogCompressor:
         # Byte-identical dedup for errors/fails — see `_dedupe_identical`.
         errors, suppressed = self._dedupe_identical(errors)
         fails, fail_suppressed = self._dedupe_identical(fails)
+        failure_details, detail_suppressed = self._dedupe_identical(failure_details)
         suppressed |= fail_suppressed
+        suppressed |= detail_suppressed
         if errors:
             selected.extend(self._select_with_first_last(errors, self.config.max_errors))
         if fails:
             selected.extend(self._select_with_first_last(fails, self.config.max_errors))
+        if failure_details:
+            # Own budget, not shared with `max_errors` for ERROR/FAIL: *what*
+            # failed and *why* answer different questions, and a run with 10
+            # failures would otherwise keep 10 names and no reason.
+            selected.extend(
+                self._select_with_first_last(failure_details, self.config.max_errors)
+            )
         if warnings:
             if self.config.dedupe_warnings:
                 warnings = self._dedupe_similar(warnings)

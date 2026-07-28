@@ -53,6 +53,19 @@ logger = logging.getLogger(__name__)
 # this many kept matches, even with `group_by_file` off — from the second
 # match on, the flat shape only re-emits the same path. Mirrors the Rust
 # `AUTO_GROUP_MIN_MATCHES`.
+#
+# 2, not 3: at N kept matches grouping trades N-1 repetitions of the path for
+# one heading plus (when adjacent to another grouped section) one blank line,
+# so it is already ahead at N=2 and never behind. Swept on `o200k_base`:
+#
+#     case                  flat   auto=3   auto=2
+#     40 files x 1 match     175      175      175   (grouping correctly off)
+#     20 files x 2 matches   500      500      380
+#     10 files x 3 matches   150      102      102
+#     1 file  x 2 matches     16       16       12
+#
+# A floor of 3 buys nothing and gives up the 2-match case, which is the modal
+# shape of a `rg` result over a real codebase.
 AUTO_GROUP_MIN_MATCHES = 2
 
 

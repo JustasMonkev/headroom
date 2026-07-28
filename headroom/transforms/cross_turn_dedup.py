@@ -34,18 +34,30 @@ from dataclasses import dataclass
 __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
 
 # A run must be at least this many lines AND this many chars to be worth a
-# pointer. Small dups are left alone (fragmenting context is not worth it) —
-# and a larger floor keeps the pointer comfortably shorter than the span it
-# replaces, so a fold is always a net byte win.
+# pointer. Small dups are left alone: fragmenting context is not worth it.
 #
-# The char floor is a *heuristic* prefilter, not the guarantee: a 45-char span
-# used to become a 49-char pointer, and `chars_removed` went negative while
-# still being reported as savings. The guarantee is the explicit
-# `len(ptr) < len(span_text)` check in :func:`dedup_blocks`; this floor exists
-# so the common case never reaches it, and so a fold is worth the context
-# fragmentation, not just worth one byte.
+# The char floor is a *heuristic* prefilter, not the growth guarantee. A
+# 45-char span could become a 49-char pointer and `chars_removed` would go
+# negative while still being reported as savings; the fix for that is the
+# explicit `len(ptr) < len(span_text)` check in :func:`dedup_blocks`, which
+# holds at any floor. (Probe: floor lowered to 1 over 11-char 3-line spans —
+# 0 folds, worst per-block delta +0 chars. The guard refuses them all.)
+#
+# So the floor is free to be set on value rather than on safety, and 40 is
+# where the value is. Raising it to 120 was measured as a loss on both axes:
+#
+#     min_chars   chars removed   folds   usec/run (600 blocks)
+#            40    11,329 (9.0%)    427     10,900
+#            80     4,796 (3.8%)    109     28,152
+#           120         0 (0.0%)      0     37,097
+#
+# The CPU column runs the *wrong* way from the intuition that a higher floor
+# does less work: a folded span is dropped from the verbatim corpus, so every
+# fold shrinks the anchor index the remaining blocks are matched against. A
+# floor that folds nothing pays full matching cost on every block and buys
+# nothing with it.
 DEFAULT_MIN_LINES = 3
-DEFAULT_MIN_CHARS = 120
+DEFAULT_MIN_CHARS = 40
 # Cap anchor candidates examined per line so a hot line (e.g. ``    return``)
 # can't blow up matching. Deterministic: candidates are kept in first-seen order.
 MAX_ANCHOR_CANDIDATES = 16

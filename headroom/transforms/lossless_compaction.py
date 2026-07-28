@@ -355,6 +355,40 @@ def search_dir_heading(text: str) -> str:
     return _join(out, had_trailing)
 
 
+def _search_repetition_axes(text: str) -> tuple[bool, bool]:
+    """``(file_axis, dir_axis)`` — which repetitions the folds could exploit.
+
+    Both single-axis folds factor *consecutive* runs only, so a path that
+    repeats but never adjacently is not a repetition either fold can use;
+    this scan applies the same adjacency rule. One pass, no allocation beyond
+    the regex match, and it short-circuits as soon as both axes are seen.
+    """
+    file_axis = False
+    dir_axis = False
+    prev_path: str | None = None
+    for line in text.split("\n"):
+        m = _GREP_ROW_RE.match(line)
+        if m is None:
+            # Any non-row line ends the run, exactly as the folds treat it.
+            prev_path = None
+            continue
+        path = m.group("path")
+        if prev_path is None:
+            pass
+        elif path == prev_path:
+            file_axis = True
+        else:
+            # Same dir-part test `search_dir_heading` uses: everything up to
+            # and including the last `/`, and only for paths that have one.
+            cut, prev_cut = path.rfind("/"), prev_path.rfind("/")
+            if cut >= 0 and prev_cut >= 0 and path[: cut + 1] == prev_path[: prev_cut + 1]:
+                dir_axis = True
+        if file_axis and dir_axis:
+            return True, True
+        prev_path = path
+    return file_axis, dir_axis
+
+
 def search_dir_unheading(text: str) -> str:
     """Exact inverse of :func:`search_dir_heading`.
 
@@ -987,19 +1021,30 @@ def compact_lossless(content: str, kind: str) -> str:
             # the opposite order) captures both on the inputs where the tree
             # fold declines. The round-trip check below makes it safe: a
             # composition that doesn't invert exactly simply doesn't win.
+            #
+            # It is GATED on the content actually having both axes. Composing
+            # costs two folds (and, when it wins, two inverses) but can only
+            # beat the single-axis folds when there is something on each axis
+            # to fold; on one-axis or non-search content it was pure overhead
+            # paid on every block that reaches here — and `_has_lossless_fold`
+            # brings *every* block here. `_search_repetition_axes` answers the
+            # question in one allocation-free pass.
             def _search_dir_then_file(text: str) -> str:
                 return search_heading(search_dir_heading(text))
 
             def _search_file_then_dir(text: str) -> str:
                 return search_dir_unheading(search_unheading(text))
 
-            best = content
-            for fold, inverse in (
+            candidates = [
                 (search_tree_heading, search_tree_unheading),
-                (_search_dir_then_file, _search_file_then_dir),
                 (search_heading, search_unheading),
                 (search_dir_heading, search_dir_unheading),
-            ):
+            ]
+            if all(_search_repetition_axes(content)):
+                candidates.insert(1, (_search_dir_then_file, _search_file_then_dir))
+
+            best = content
+            for fold, inverse in candidates:
                 # Size first: verifying costs about as much as folding, and a
                 # candidate that isn't smaller than the incumbent can't win no
                 # matter how it verifies. The tree fold leads because it is the
