@@ -1114,6 +1114,42 @@ def _openai_responses_json_or_terminal_sse(response: Any) -> dict[str, Any]:
     return payload
 
 
+def _openai_responses_upstream_error_sse(response: httpx.Response) -> bytes:
+    """Represent a late continuation HTTP failure on an already-started SSE stream.
+
+    Once a keepalive has started the HTTP status and headers are immutable, so
+    preserve the upstream retry signal in the terminal error event instead.
+    """
+    error: dict[str, Any] = {
+        "message": f"Upstream continuation failed with HTTP {response.status_code}.",
+        "type": "upstream_error",
+        "code": "upstream_http_error",
+        "status": response.status_code,
+    }
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        upstream_error = payload.get("error")
+        if isinstance(upstream_error, dict):
+            for key in ("message", "type", "code"):
+                value = upstream_error.get(key)
+                if value is not None:
+                    error[key] = value
+
+    retry_headers = {
+        key.lower(): value
+        for key, value in response.headers.items()
+        if key.lower() == "retry-after" or "ratelimit" in key.lower()
+    }
+    if retry_headers:
+        error["headers"] = retry_headers
+
+    event = {"type": "error", "error": error}
+    return f"event: error\ndata: {json.dumps(event)}\n\n".encode()
+
+
 def _output_shaping_holdout_fraction() -> float:
     from headroom.proxy import runtime_env
 
@@ -5312,6 +5348,7 @@ class OpenAIHandlerMixin:
                             ccr_response_source, "openai_responses"
                         )
                     ):
+                        ccr_continuation_error: httpx.HTTPStatusError | None = None
                         logger.info(
                             f"[{request_id}] CCR: Detected retrieval tool call (responses), handling..."
                         )
@@ -5320,6 +5357,7 @@ class OpenAIHandlerMixin:
                             items: list[dict[str, Any]],
                             tls: list[dict[str, Any]] | None,
                         ) -> dict[str, Any]:
+                            nonlocal ccr_continuation_error
                             continuation_body = {**body, "input": items}
                             if tls is not None:
                                 continuation_body["tools"] = tls
@@ -5359,7 +5397,16 @@ class OpenAIHandlerMixin:
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
                             )
-                            return _openai_responses_json_or_terminal_sse(cont_response)
+                            try:
+                                return _openai_responses_json_or_terminal_sse(cont_response)
+                            except httpx.HTTPStatusError as e:
+                                # CCRResponseHandler deliberately converts
+                                # continuation exceptions into a residual tool
+                                # call for provider-generic callers. Preserve
+                                # the concrete upstream failure here so this
+                                # HTTP proxy can return its status and headers.
+                                ccr_continuation_error = e
+                                raise
 
                         try:
                             final_resp_json = await _ccr_response_handler.handle_response(
@@ -5369,6 +5416,8 @@ class OpenAIHandlerMixin:
                                 api_call_fn,
                                 provider="openai_responses",
                             )
+                            if ccr_continuation_error is not None:
+                                raise ccr_continuation_error
                             if _ccr_response_handler.has_ccr_tool_calls(
                                 final_resp_json, "openai_responses"
                             ):
@@ -5649,6 +5698,34 @@ class OpenAIHandlerMixin:
                                 if done:
                                     try:
                                         result = operation.result()
+                                    except httpx.HTTPStatusError as e:
+                                        await record_failed(provider="openai")
+                                        upstream_response = e.response
+                                        logger.warning(
+                                            f"[{request_id}] OpenAI responses continuation "
+                                            f"failed with upstream HTTP "
+                                            f"{upstream_response.status_code}"
+                                        )
+                                        if not started:
+                                            error_response = Response(
+                                                content=upstream_response.content,
+                                                status_code=upstream_response.status_code,
+                                                headers=_sanitize_forwarded_response_headers(
+                                                    upstream_response.headers
+                                                ),
+                                            )
+                                            await error_response(scope, receive, send)
+                                            return
+                                        await send(
+                                            {
+                                                "type": "http.response.body",
+                                                "body": _openai_responses_upstream_error_sse(
+                                                    upstream_response
+                                                ),
+                                                "more_body": False,
+                                            }
+                                        )
+                                        return
                                     except Exception as e:
                                         await record_failed(provider="openai")
                                         logger.error(
@@ -5776,6 +5853,18 @@ class OpenAIHandlerMixin:
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
+        except httpx.HTTPStatusError as e:
+            await self.metrics.record_failed(provider="openai")
+            upstream_response = e.response
+            logger.warning(
+                f"[{request_id}] OpenAI responses continuation failed with upstream "
+                f"HTTP {upstream_response.status_code}"
+            )
+            return Response(
+                content=upstream_response.content,
+                status_code=upstream_response.status_code,
+                headers=_sanitize_forwarded_response_headers(upstream_response.headers),
+            )
         except Exception as e:
             await self.metrics.record_failed(provider="openai")
             logger.error(f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}")

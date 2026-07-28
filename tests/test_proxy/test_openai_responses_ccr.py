@@ -213,6 +213,46 @@ def test_ccr_parses_sse_initial_and_continuation_responses(client_stream: bool):
     assert resp.headers["content-type"].startswith(expected_type)
 
 
+@pytest.mark.parametrize("client_stream", [False, True])
+def test_ccr_continuation_preserves_upstream_429(client_stream: bool):
+    """A private continuation failure remains a client-actionable 429."""
+    app = _make_app()
+    calls: list[dict] = []
+
+    async def fake_retry(method, url, headers, body, stream=False, **kwargs):
+        calls.append(body)
+        if len(calls) == 1:
+            return _tool_call_response(url)
+        return httpx.Response(
+            429,
+            json={"error": {"message": "slow down", "code": "rate_limit_exceeded"}},
+            headers={
+                "retry-after": "7",
+                "x-ratelimit-remaining-requests": "0",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    with TestClient(app) as client:
+        app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "please look this up",
+                "tools": [_RETRIEVE_TOOL],
+                "stream": client_stream,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert len(calls) == 2
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "7"
+    assert resp.headers["x-ratelimit-remaining-requests"] == "0"
+    assert resp.json()["error"]["code"] == "rate_limit_exceeded"
+
+
 def test_ccr_intercept_exception_is_reraised_not_swallowed():
     """CCR resolution failure -> 502, NOT a silent fallback to the unresolved tool_call body."""
     app = _make_app()
@@ -501,6 +541,79 @@ async def test_buffered_responses_ccr_late_failure_emits_sanitized_error_event()
         record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
         for record in error_records
     )
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_late_429_preserves_retry_metadata():
+    app = _make_app()
+    body = {
+        "model": "gpt-5-codex",
+        "input": "please wait",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+    release = asyncio.Event()
+    calls = 0
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+
+        async def delayed_continuation(method, url, headers, request_body, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _tool_call_response(url)
+            await release.wait()
+            return httpx.Response(
+                429,
+                json={"error": {"message": "slow down", "code": "rate_limit_exceeded"}},
+                headers={
+                    "retry-after": "11",
+                    "x-ratelimit-remaining-requests": "0",
+                },
+                request=httpx.Request("POST", url),
+            )
+
+        server._retry_request = delayed_continuation
+        response = await server.handle_openai_responses(Request(scope, receive))
+        events: list[dict] = []
+        first_body = asyncio.Event()
+
+        async def send(message):  # noqa: ANN001
+            events.append(message)
+            if message["type"] == "http.response.body" and message["body"]:
+                first_body.set()
+
+        response_task = asyncio.create_task(response(scope, receive, send))
+        await asyncio.wait_for(first_body.wait(), 2)
+        release.set()
+        await response_task
+
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
+    terminal = bodies[-1].decode()
+    assert '"status": 429' in terminal
+    assert '"retry-after": "11"' in terminal
+    assert '"x-ratelimit-remaining-requests": "0"' in terminal
+    assert "rate_limit_exceeded" in terminal
+    assert events[-1]["more_body"] is False
 
 
 @pytest.mark.asyncio
