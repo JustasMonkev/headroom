@@ -68,8 +68,12 @@ _COMPACT_SIZE_BYTES = 1 * 1024 * 1024
 # once the file has grown this much past the post-compaction size.
 _COMPACT_REGROWTH_BYTES = 256 * 1024
 
-# Per-path size observed right after the last compaction in this process.
-_last_compact_sizes: dict[str, int] = {}
+# Per-path (device, inode, size) observed right after the last compaction in
+# this process. The identity fields let us detect that the pathname now refers
+# to a DIFFERENT file (rotation/replacement) even when the replacement is the
+# same size or larger — a size-only floor would suppress retention enforcement
+# on a file that was never compacted.
+_last_compact_sizes: dict[str, tuple[int, int, int]] = {}
 
 
 def _utc_now() -> datetime:
@@ -371,27 +375,31 @@ def aggregate_savings(
     )
 
 
-def _should_compact(path_key: str, size: int) -> bool:
-    """Whether a ledger of ``size`` bytes needs a compaction rewrite.
+def _should_compact(path_key: str, st: os.stat_result) -> bool:
+    """Whether the ledger described by ``st`` needs a compaction rewrite.
 
     Central so the decision can be re-evaluated both before AND after taking
     the exclusive lock: concurrent writers all race past a single pre-lock
     check, then each rewrites the whole retained file in turn.
     """
-    if size <= _COMPACT_SIZE_BYTES:
+    if st.st_size <= _COMPACT_SIZE_BYTES:
         return False
     # If a previous compaction couldn't get below the threshold (the 30-day
     # working set is simply that big), don't rewrite the whole file again on
     # every append — wait until it has regrown meaningfully.
-    floor = _last_compact_sizes.get(path_key, 0)
-    if floor and size < floor:
-        # The file shrank below our recorded floor: another process compacted
-        # it, or it was rotated/recreated. The cached floor is stale — keeping
-        # it would suppress retention enforcement until the new file regrew
-        # past the OLD working-set size. Forget it and re-evaluate fresh.
+    cached = _last_compact_sizes.get(path_key)
+    if cached is None:
+        return True
+    dev, ino, floor = cached
+    if (st.st_dev, st.st_ino) != (dev, ino) or st.st_size < floor:
+        # The pathname now refers to a different file (rotation/replacement),
+        # or the file shrank below our recorded floor (another process
+        # compacted it). Either way the cached floor describes a file that no
+        # longer exists in that form — keeping it would suppress retention
+        # enforcement on the new content. Forget it and re-evaluate fresh.
         _last_compact_sizes.pop(path_key, None)
         return True
-    if floor and size <= floor + _COMPACT_REGROWTH_BYTES:
+    if st.st_size <= floor + _COMPACT_REGROWTH_BYTES:
         return False
     return True
 
@@ -400,10 +408,10 @@ def _maybe_compact(target: Path) -> None:
     """Rewrite the ledger dropping out-of-retention events once it grows large."""
 
     try:
-        size = target.stat().st_size
+        st = target.stat()
     except OSError:
         return
-    if not _should_compact(str(target), size):
+    if not _should_compact(str(target), st):
         return
 
     now = _utc_now()
@@ -418,10 +426,10 @@ def _maybe_compact(target: Path) -> None:
                 # retained file again. fstat the locked handle (not the path)
                 # so a concurrent rotation can't redirect the check.
                 try:
-                    locked_size = os.fstat(handle.fileno()).st_size
+                    locked_st = os.fstat(handle.fileno())
                 except OSError:
                     return
-                if not _should_compact(str(target), locked_size):
+                if not _should_compact(str(target), locked_st):
                     return
                 kept: list[str] = []
                 handle.seek(0)
@@ -445,15 +453,24 @@ def _maybe_compact(target: Path) -> None:
                 # An unflushed rewrite tail draining at close() (after LOCK_UN)
                 # could overwrite a line another process appended in between.
                 handle.flush()
+                # Record the floor from the locked handle (post-flush), not a
+                # fresh path stat: the path may already point at a different
+                # file, and a floor recorded against THAT inode would suppress
+                # compaction of a file this process never compacted.
+                try:
+                    final = os.fstat(handle.fileno())
+                    _last_compact_sizes[str(target)] = (
+                        final.st_dev,
+                        final.st_ino,
+                        final.st_size,
+                    )
+                except OSError:
+                    pass
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
     except Exception:
         return
-    try:
-        _last_compact_sizes[str(target)] = target.stat().st_size
-    except OSError:
-        pass
 
 
 __all__ = [

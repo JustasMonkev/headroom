@@ -42,6 +42,24 @@ class TestContextLimitPrefix:
         assert provider._get_context_limit_manual("gpt-4-32k-0613") == 32768
 
 
+class TestCustomOverridePrecedence:
+    def test_family_override_beats_longer_builtin_prefix(self) -> None:
+        """A caller-supplied family override like {"o1": 64000} must apply to
+        dated snapshots even though the built-in "o1-mini" key is a longer
+        prefix — the constructor documents that explicit overrides take
+        precedence."""
+        provider = OpenAIProvider(context_limits={"o1": 64000})
+        assert provider._get_context_limit_manual("o1-mini-2024-09-12") == 64000
+        assert provider._get_context_limit_manual("o1-2024-12-17") == 64000
+        # Unrelated families still resolve from the built-in table.
+        assert provider._get_context_limit_manual("gpt-4-32k-0613") == 32768
+
+    def test_more_specific_custom_override_wins_within_custom(self) -> None:
+        provider = OpenAIProvider(context_limits={"o1": 64000, "o1-mini": 32000})
+        assert provider._get_context_limit_manual("o1-mini-2024-09-12") == 32000
+        assert provider._get_context_limit_manual("o1-2024-12-17") == 64000
+
+
 class TestEncodingPrefix:
     def test_known_families_resolve(self) -> None:
         assert _get_encoding_name_for_model("gpt-4o-2024-11-20") == "o200k_base"

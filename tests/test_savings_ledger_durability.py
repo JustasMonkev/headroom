@@ -109,23 +109,35 @@ def test_compaction_not_rerun_until_regrowth(tmp_path: Path, monkeypatch) -> Non
     assert calls == []
 
 
+def _stat(size: int, dev: int = 1, ino: int = 1):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(st_size=size, st_dev=dev, st_ino=ino)
+
+
 def test_should_compact_decision_logic(monkeypatch) -> None:
     monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 1000)
     monkeypatch.setattr(sl, "_COMPACT_REGROWTH_BYTES", 100)
     sl._last_compact_sizes.clear()
 
     # Below threshold: never compact.
-    assert not sl._should_compact("p", 1000)
+    assert not sl._should_compact("p", _stat(1000))
     # Above threshold, no floor recorded: compact.
-    assert sl._should_compact("p", 1001)
+    assert sl._should_compact("p", _stat(1001))
     # Floor recorded, within the regrowth window: skip.
-    sl._last_compact_sizes["p"] = 1500
-    assert not sl._should_compact("p", 1550)
+    sl._last_compact_sizes["p"] = (1, 1, 1500)
+    assert not sl._should_compact("p", _stat(1550))
     # Regrown past the window: compact.
-    assert sl._should_compact("p", 1601)
-    # Shrank below the floor (external compaction/rotation): stale floor is
-    # dropped and compaction proceeds.
-    assert sl._should_compact("p", 1200)
+    assert sl._should_compact("p", _stat(1601))
+    # Shrank below the floor (external compaction): stale floor is dropped
+    # and compaction proceeds.
+    sl._last_compact_sizes["p"] = (1, 1, 1500)
+    assert sl._should_compact("p", _stat(1200))
+    assert "p" not in sl._last_compact_sizes
+    # Same size but a different inode (rotation/replacement): the pathname
+    # refers to a never-compacted file — the floor must not suppress it.
+    sl._last_compact_sizes["p"] = (1, 1, 1500)
+    assert sl._should_compact("p", _stat(1550, ino=2))
     assert "p" not in sl._last_compact_sizes
 
 
@@ -185,11 +197,42 @@ def test_stale_floor_is_reset_after_external_shrink(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 128)
     sl._last_compact_sizes.clear()
     # Simulate a floor left over from when this process saw a much larger
-    # working set (before another process compacted / the file was rotated).
-    sl._last_compact_sizes[str(target)] = 100 * 1024 * 1024
+    # working set (before another process compacted the same inode).
+    st = target.stat()
+    sl._last_compact_sizes[str(target)] = (st.st_dev, st.st_ino, 100 * 1024 * 1024)
 
     sl._maybe_compact(target)
 
     lines = [ln for ln in target.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 1  # expired events pruned despite the stale floor
-    assert sl._last_compact_sizes[str(target)] < 100 * 1024 * 1024
+    assert sl._last_compact_sizes[str(target)][2] < 100 * 1024 * 1024
+
+
+def test_floor_invalidated_when_inode_changes(tmp_path: Path, monkeypatch) -> None:
+    """Replacing the ledger with a same-or-larger never-compacted file must
+    not inherit the old file's floor: the identity check detects the inode
+    change and retention runs on the replacement."""
+    target = tmp_path / "events.jsonl"
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=sl.DEFAULT_RETENTION_DAYS + 5)
+    for _ in range(50):
+        _write_event_line(target, ts=old)
+    _write_event_line(target, ts=now, saved=42)
+
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 128)
+    monkeypatch.setattr(sl, "_COMPACT_REGROWTH_BYTES", 64 * 1024)
+    sl._last_compact_sizes.clear()
+    # Floor recorded against a DIFFERENT inode, with a size equal to the
+    # current file's (the case a size-only check cannot detect).
+    st = target.stat()
+    sl._last_compact_sizes[str(target)] = (st.st_dev, st.st_ino + 1, st.st_size)
+
+    sl._maybe_compact(target)
+
+    lines = [ln for ln in target.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1  # expired events pruned despite the same-size floor
+    assert json.loads(lines[0])["saved"] == 42
+    # The re-recorded floor now describes the real inode.
+    dev, ino, _size = sl._last_compact_sizes[str(target)]
+    fresh = target.stat()
+    assert (dev, ino) == (fresh.st_dev, fresh.st_ino)

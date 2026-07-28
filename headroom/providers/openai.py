@@ -433,19 +433,30 @@ class OpenAIProvider(Provider):
         self._pricing = {**_PRICING}
         self._encodings: dict[str, str] = {**_MODEL_ENCODINGS}
 
+        # Caller-supplied entries are also kept separately: prefix matching
+        # consults them BEFORE the built-in table, so a family override like
+        # {"o1": 64000} applies to "o1-mini-2024-09-12" even though the
+        # built-in "o1-mini" key is a longer prefix. Merged-table matching
+        # alone would silently out-rank the caller's configuration.
+        self._custom_context_limits: dict[str, int] = {}
+        self._custom_pricing: dict[str, tuple[float, float]] = {}
+
         # Load from config file and env var
         custom_config = _load_custom_model_config()
         self._context_limits.update(custom_config["context_limits"])
+        self._custom_context_limits.update(custom_config["context_limits"])
         self._encodings.update(custom_config["encodings"])
 
         # Handle pricing (can be tuple or list from JSON)
         for model, pricing in custom_config["pricing"].items():
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
+                self._custom_pricing[model] = self._pricing[model]
 
         # Explicit overrides take precedence
         if context_limits:
             self._context_limits.update(context_limits)
+            self._custom_context_limits.update(context_limits)
 
         self._token_counters: dict[str, OpenAITokenCounter] = {}
 
@@ -521,7 +532,12 @@ class OpenAIProvider(Provider):
         if model in self._context_limits:
             return self._context_limits[model]
 
-        # Prefix match (longest wins — see _longest_prefix_match)
+        # Prefix match (longest wins — see _longest_prefix_match). Custom
+        # overrides are consulted first so caller configuration beats a
+        # longer built-in key (see __init__).
+        prefix = _longest_prefix_match(model, self._custom_context_limits)
+        if prefix is not None:
+            return self._custom_context_limits[prefix]
         prefix = _longest_prefix_match(model, self._context_limits)
         if prefix is not None:
             return self._context_limits[prefix]
@@ -626,7 +642,12 @@ class OpenAIProvider(Provider):
         if model in self._pricing:
             return self._pricing[model]
 
-        # Prefix match (longest wins — see _longest_prefix_match)
+        # Prefix match (longest wins — see _longest_prefix_match). Custom
+        # overrides are consulted first so caller configuration beats a
+        # longer built-in key (see __init__).
+        model_prefix = _longest_prefix_match(model, self._custom_pricing)
+        if model_prefix is not None:
+            return self._custom_pricing[model_prefix]
         model_prefix = _longest_prefix_match(model, self._pricing)
         if model_prefix is not None:
             return self._pricing[model_prefix]
