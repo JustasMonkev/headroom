@@ -227,6 +227,13 @@ def compress(
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
 
+    # Captured before any hook runs: the fail-open handler below promises
+    # "returning original messages", but `messages` gets rebound by
+    # hooks.pre_compress / pipeline extensions — a hook that forgets to
+    # return the list would otherwise make the fail-open path hand None
+    # (or a hook-mangled list) to the provider.
+    original_messages = messages
+
     try:
         # Compute biases from hooks if provided
         biases = None
@@ -354,7 +361,7 @@ def compress(
         )
         logger.warning("Compression failed, returning original messages: %s", e)
         return CompressResult(
-            messages=messages,
+            messages=original_messages,
             tokens_before=0,
             tokens_after=0,
             tokens_saved=0,

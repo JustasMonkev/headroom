@@ -215,7 +215,10 @@ class UniversalCompressor:
         keep_start = target_len * 2 // 3
         keep_end = target_len // 3
 
-        return text[:keep_start] + " ...[compressed]... " + text[-keep_end:]
+        # text[-0:] is the WHOLE string, so a target under 3 chars would emit
+        # the full input plus the banner — "compression" that grows the span.
+        tail = text[len(text) - keep_end :] if keep_end > 0 else ""
+        return text[:keep_start] + " ...[compressed]... " + tail
 
     def compress(
         self,
