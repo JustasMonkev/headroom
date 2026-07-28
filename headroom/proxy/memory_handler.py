@@ -197,6 +197,14 @@ class MemoryHandler:
         # on its own because that flag isn't atomic across await points.
         self._init_lock: asyncio.Lock | None = None
         self._memory_tools: list[dict[str, Any]] | None = None
+        # Session-local memory aliases (F4 token reduction). Passive recall
+        # renders short row IDs (m1, m2, ...) instead of full backend UUIDs;
+        # memory_update / memory_delete resolve them back server-side. Keyed
+        # by effective user id so aliases can never cross scope boundaries.
+        # Alias assignment is first-seen order, so re-renders of the same
+        # memory are byte-stable across turns within a session.
+        self._alias_by_memory_id: dict[str, dict[str, str]] = {}
+        self._memory_id_by_alias: dict[str, dict[str, str]] = {}
         # Native memory tool directory
         self._native_memory_dir: Path | None = None
         if config.use_native_tool:
@@ -819,8 +827,10 @@ class MemoryHandler:
             # memory_delete without round-tripping through memory_search.
             # Both branches below render the same `i. [id] content` shape
             # so the format is stable regardless of whether a ranker is
-            # in play.
-            selected_memory_ids: list[str] = []
+            # in play. Row IDs are session-local aliases (m1, m2, ...);
+            # `selected_pairs` keeps (alias, real backend id) so access
+            # tracking below can map surviving rows back to real IDs.
+            selected_pairs: list[tuple[str, str]] = []
             if ranker is not None:
                 from headroom.proxy.memory_ranker import MemoryCandidate
 
@@ -838,10 +848,12 @@ class MemoryHandler:
                 ranked = ranked[: effective_budget.max_entries]
                 memory_lines = []
                 for i, candidate in enumerate(ranked, 1):
-                    memory_id = candidate.id or "?"
                     if candidate.id:
-                        selected_memory_ids.append(candidate.id)
-                    memory_lines.append(f"{i}. [{memory_id}] {candidate.content}")
+                        row_id = self._alias_for_memory(effective_user_id, candidate.id)
+                        selected_pairs.append((row_id, candidate.id))
+                    else:
+                        row_id = "?"
+                    memory_lines.append(f"{i}. [{row_id}] {candidate.content}")
                     if candidate.related_entities:
                         entities_str = ", ".join(candidate.related_entities[:3])
                         memory_lines.append(f"   (Related: {entities_str})")
@@ -867,8 +879,11 @@ class MemoryHandler:
                 for i, result in enumerate(filtered_results, 1):
                     memory_id = getattr(result.memory, "id", None) or "?"
                     if memory_id != "?":
-                        selected_memory_ids.append(memory_id)
-                    memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
+                        row_id = self._alias_for_memory(effective_user_id, memory_id)
+                        selected_pairs.append((row_id, memory_id))
+                    else:
+                        row_id = "?"
+                    memory_lines.append(f"{i}. [{row_id}] {result.memory.content}")
                     if hasattr(result, "related_entities") and result.related_entities:
                         entities_str = ", ".join(result.related_entities[:3])
                         memory_lines.append(f"   (Related: {entities_str})")
@@ -918,7 +933,7 @@ your responses, not to drive new actions."""
         # and an audit write failure must never block the upstream request.
         accessed_memory_ids = list(
             dict.fromkeys(
-                memory_id for memory_id in selected_memory_ids if f"[{memory_id}]" in context
+                real_id for row_id, real_id in selected_pairs if f"[{row_id}]" in context
             )
         )
         record_access = getattr(backend, "record_access", None)
@@ -941,6 +956,36 @@ your responses, not to drive new actions."""
             effective_budget.max_tokens,
         )
         return context
+
+    def _alias_for_memory(self, user_key: str, memory_id: str) -> str:
+        """Return the stable session-local alias (m1, m2, ...) for a memory ID.
+
+        Full backend UUIDs cost ~10-18 tokens per recalled row; a two-to-four
+        character alias costs ~2. Aliases are assigned in first-seen order and
+        never reassigned within a session, so a memory that appears in several
+        recall blocks renders identically each time (prefix-cache friendly).
+        """
+        by_id = self._alias_by_memory_id.setdefault(user_key, {})
+        alias = by_id.get(memory_id)
+        if alias is None:
+            alias = f"m{len(by_id) + 1}"
+            by_id[memory_id] = alias
+            self._memory_id_by_alias.setdefault(user_key, {})[alias] = memory_id
+        return alias
+
+    def _resolve_memory_alias(self, user_key: str, memory_id: str) -> str:
+        """Translate a recall alias back to the real backend memory ID.
+
+        Unknown values pass through unchanged, so full IDs obtained from
+        memory_search / memory_list keep working verbatim.
+        """
+        # A known real backend ID always wins over the alias map — guards
+        # against backends whose native IDs happen to look like aliases
+        # (an "m2" that is simultaneously a real ID and another memory's
+        # alias must resolve to itself).
+        if memory_id in self._alias_by_memory_id.get(user_key, {}):
+            return memory_id
+        return self._memory_id_by_alias.get(user_key, {}).get(memory_id, memory_id)
 
     @staticmethod
     def _append_to_latest_user_tail(
@@ -1260,13 +1305,12 @@ your responses, not to drive new actions."""
         except Exception as e:
             logger.debug(f"Memory: Similar search failed during save: {e}")
 
-        # Build response with dedup hints for the LLM
+        # Build response with dedup hints for the LLM. The saved content is
+        # NOT echoed back — the model just wrote it, so returning a preview
+        # only re-bills the same bytes (F4 token reduction).
         result: dict[str, Any] = {
             "status": "saved",
             "memory_id": memory.id,
-            "content": memory.content[:100] + "..."
-            if len(memory.content) > 100
-            else memory.content,
         }
 
         # Enriched hint: if similar memory exists, suggest merge to the LLM
@@ -1320,23 +1364,27 @@ your responses, not to drive new actions."""
             entities=entities_filter,
         )
 
+        # Scores and entities are opt-in (F4 token reduction): results are
+        # already relevance-ordered, so per-row scores rarely change model
+        # behavior, and empty entity lists were pure ballast.
+        include_scores = bool(input_data.get("include_scores", False))
+        memories: list[dict[str, Any]] = []
+        for r in results:
+            entry: dict[str, Any] = {
+                "id": r.memory.id,
+                "content": r.memory.content,
+            }
+            if include_scores:
+                entry["score"] = round(r.score, 3)
+            if hasattr(r, "related_entities") and r.related_entities:
+                entry["entities"] = r.related_entities[:5]
+            memories.append(entry)
+
         return json.dumps(
             {
                 "status": "found",
-                "count": len(results),
-                "memories": [
-                    {
-                        "id": r.memory.id,
-                        "content": r.memory.content,
-                        "score": round(r.score, 3),
-                        "entities": (
-                            r.related_entities[:5]
-                            if hasattr(r, "related_entities") and r.related_entities
-                            else []
-                        ),
-                    }
-                    for r in results
-                ],
+                "count": len(memories),
+                "memories": memories,
             }
         )
 
@@ -1367,6 +1415,9 @@ your responses, not to drive new actions."""
         }
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        # Recall blocks render session-local aliases (m1, m2, ...); translate
+        # back to the real backend ID. Full IDs pass through unchanged.
+        memory_id = self._resolve_memory_alias(effective_user_id, memory_id)
 
         # Check if backend has update_memory method
         if hasattr(backend, "update_memory"):
@@ -1426,7 +1477,9 @@ your responses, not to drive new actions."""
         if not memory_id:
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
-        backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        # Translate a recall alias (m1, m2, ...) back to the real backend ID.
+        memory_id = self._resolve_memory_alias(effective_user_id, memory_id)
         deleted = await backend.delete_memory(memory_id)
 
         return json.dumps(

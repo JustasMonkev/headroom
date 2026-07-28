@@ -90,14 +90,16 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
 
     assert response.status_code == 200
     sent = captured["body"]
-    assert "<headroom_output_shaping>" in sent["instructions"]
+    # gpt-5 has native output controls, so the steering paragraph is NOT
+    # appended (F5) — text.verbosity carries the output shaping instead.
+    assert "instructions" not in sent
     assert sent["reasoning"]["effort"] == "low"
     assert sent["text"]["verbosity"] == "low"
     assert captured["retry_kwargs"]["body_mutated"] is True
     assert captured["retry_kwargs"]["original_body_bytes"] is not None
     transforms = outcomes[-1].transforms_applied
     assert any(t.startswith("output_shaper:stratum:") for t in transforms)
-    assert "output_shaper:verbosity:L2" in transforms
+    assert "output_shaper:verbosity:L2" not in transforms
     assert "output_shaper:reasoning_effort:xhigh->low" in transforms
     assert "output_shaper:text_verbosity:medium->low" in transforms
 

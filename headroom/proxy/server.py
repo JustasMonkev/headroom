@@ -83,6 +83,7 @@ from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
     CacheAlignerConfig,
     ReadLifecycleConfig,
+    ToolInputCompactionConfig,
 )
 from headroom.dashboard import get_dashboard_html
 from headroom.observability import (
@@ -828,6 +829,10 @@ class HeadroomProxy(
             prefer_code_aware_for_code=_get_env_bool("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", True),
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
+            tool_input_compaction=ToolInputCompactionConfig(
+                enabled=config.compact_tool_inputs
+                or _get_env_bool("HEADROOM_COMPACT_TOOL_INPUTS", False),
+            ),
             smart_crusher_max_items_after_crush=cast(
                 int | None,
                 profile_kwargs.get("max_items_after_crush"),
