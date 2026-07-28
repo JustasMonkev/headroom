@@ -61,6 +61,8 @@ MAX_ROWS = 4000
 # A grep match row: ``path:<digits>:content``. The digit run is what separates
 # it from a context row whose body merely contains a colon.
 _MATCH_ROW_RE = re.compile(r"^(?P<path>[^:]*):[0-9]+:")
+# ripgrep's separator between non-contiguous context groups.
+_RG_GROUP_SEP = "--"
 
 
 def collect(pattern: str, flags: list[str]) -> str:
@@ -111,8 +113,16 @@ def _row_file(row: str) -> str | None:
 
 
 def _belongs(row: str, file: str) -> bool:
-    """Whether ``row`` is part of ``file``'s block — its match row or context."""
-    return _row_file(row) == file or row.startswith(f"{file}-")
+    """Whether ``row`` is part of ``file``'s block — its match row or context.
+
+    The prefix test is the *fallback*, reached only when the row is not a match
+    row. A match row already names its file exactly, and `a/file.py-backup:1:x`
+    starts with `a/file.py-` — so applying the prefix test to it made a boundary
+    between two sibling files look like the inside of the first one, and the
+    trim deleted that file whole.
+    """
+    parsed = _row_file(row)
+    return parsed == file if parsed is not None else row.startswith(f"{file}-")
 
 
 def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
@@ -143,8 +153,17 @@ def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
 
     first_dropped = rows[cut] if cut < len(rows) else None
     if first_dropped is not None and _belongs(first_dropped, target):
-        while cut > 0 and _belongs(rows[cut - 1], target):
-            cut -= 1
+        while cut > 0:
+            if _belongs(rows[cut - 1], target):
+                cut -= 1
+            # One file can hold several non-contiguous match groups, and `--`
+            # divides them. Stopping at the separator left the file's earlier
+            # groups in the corpus while its later ones were dropped — still a
+            # cut inside a file, which is the thing being prevented.
+            elif rows[cut - 1] == _RG_GROUP_SEP and cut >= 2 and _belongs(rows[cut - 2], target):
+                cut -= 1
+            else:
+                break
 
     kept = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
     kept_prefix = f"{kept}-" if kept is not None else None
@@ -152,7 +171,10 @@ def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
         if kept_prefix is not None and rows[cut - 1].startswith(kept_prefix):
             break
         cut -= 1
-    return cut if cut > 1 else requested
+    # Only an *emptied* corpus falls back. A single surviving row is a correct
+    # answer when that row is itself a whole file, and treating it as failure
+    # put back a cut that split a file across it.
+    return cut if cut > 0 else requested
 
 
 def previous_best(content: str) -> str:

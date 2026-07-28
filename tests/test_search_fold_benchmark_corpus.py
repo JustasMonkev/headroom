@@ -112,6 +112,37 @@ def test_trim_keeps_a_partial_file_when_one_file_fills_the_budget():
     assert _trim_to_file_boundary(rows, 10) == 10
 
 
+def test_trim_does_not_treat_a_sibling_file_as_the_target_file():
+    # `a/file.py-backup:1:x` starts with `a/file.py-`, so a prefix test applied
+    # to match rows made a boundary between two sibling files look like the
+    # inside of the first — and the trim deleted that file whole.
+    rows = (
+        [f"x/other.py:{n}:b" for n in range(1, 4)]
+        + [f"a/file.py:{n}:b" for n in range(1, 4)]
+        + [f"a/file.py-backup:{n}:b" for n in range(1, 4)]
+    )
+    assert _trim_to_file_boundary(rows, 6) == 6  # already a boundary
+    assert _trim_to_file_boundary(rows, 8) == 6  # inside the sibling
+
+
+def test_trim_crosses_group_separators_within_one_file():
+    # `-C` splits one file into non-contiguous groups divided by `--`. Stopping
+    # at the separator left the file's earlier groups in while its later ones
+    # were dropped — still a cut inside a file.
+    rows = (
+        ["z/pre.py:1:M"]
+        + [f"a/f.py-{n}-ctx" for n in (8, 9)]
+        + ["a/f.py:10:MATCH"]
+        + [f"a/f.py-{n}-ctx" for n in (11, 12)]
+        + ["--"]
+        + [f"a/f.py-{n}-ctx" for n in (98, 99)]
+        + ["a/f.py:100:MATCH"]
+    )
+    cut = _trim_to_file_boundary(rows, 9)  # inside the second group
+    assert not any(r.startswith("a/f.py") for r in rows[:cut])
+    assert rows[:cut] == ["z/pre.py:1:M"]
+
+
 def test_trim_never_returns_an_empty_corpus():
     rows = [f"only/one.py:{n}:body" for n in range(1, 6)]
     assert _trim_to_file_boundary(rows, 3) > 0
