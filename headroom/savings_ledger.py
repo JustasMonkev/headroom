@@ -61,6 +61,16 @@ DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 # Small because retention is only 30 days — the file should never be large.
 _COMPACT_SIZE_BYTES = 1 * 1024 * 1024
 
+# When the 30-day working set itself exceeds _COMPACT_SIZE_BYTES, compaction
+# cannot shrink the file below the threshold. Without a regrowth gate, every
+# subsequent append would re-read and rewrite the whole ledger under LOCK_EX
+# (O(n) per event, O(n²) growth) — so after a compaction we only compact again
+# once the file has grown this much past the post-compaction size.
+_COMPACT_REGROWTH_BYTES = 256 * 1024
+
+# Per-path size observed right after the last compaction in this process.
+_last_compact_sizes: dict[str, int] = {}
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -175,6 +185,10 @@ def record_savings_event(
                 fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 handle.write(line)
+                # Flush before releasing the lock: the TextIOWrapper buffer
+                # otherwise drains at close(), i.e. AFTER LOCK_UN, letting
+                # another writer's bytes interleave with ours.
+                handle.flush()
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
@@ -198,7 +212,11 @@ def _read_events(
     cutoff = now - timedelta(days=retention_days) if retention_days else None
     events: list[dict[str, Any]] = []
     try:
-        with open(target, encoding="utf-8") as handle:
+        # errors="replace": one undecodable byte (a torn write from a crashed
+        # process) must degrade to skipping that line via the json.loads guard
+        # below, not raise UnicodeDecodeError mid-iteration and zero out the
+        # whole report through the outer except.
+        with open(target, encoding="utf-8", errors="replace") as handle:
             if _HAS_FCNTL and fcntl is not None:
                 fcntl.flock(handle, fcntl.LOCK_SH)
             try:
@@ -357,15 +375,22 @@ def _maybe_compact(target: Path) -> None:
     """Rewrite the ledger dropping out-of-retention events once it grows large."""
 
     try:
-        if target.stat().st_size <= _COMPACT_SIZE_BYTES:
-            return
+        size = target.stat().st_size
     except OSError:
+        return
+    if size <= _COMPACT_SIZE_BYTES:
+        return
+    # If a previous compaction couldn't get below the threshold (the 30-day
+    # working set is simply that big), don't rewrite the whole file again on
+    # every append — wait until it has regrown meaningfully.
+    floor = _last_compact_sizes.get(str(target), 0)
+    if floor and size <= floor + _COMPACT_REGROWTH_BYTES:
         return
 
     now = _utc_now()
     cutoff = now - timedelta(days=DEFAULT_RETENTION_DAYS)
     try:
-        with open(target, "r+", encoding="utf-8") as handle:
+        with open(target, "r+", encoding="utf-8", errors="replace") as handle:
             if _HAS_FCNTL and fcntl is not None:
                 fcntl.flock(handle, fcntl.LOCK_EX)
             try:
@@ -387,11 +412,19 @@ def _maybe_compact(target: Path) -> None:
                 handle.truncate()
                 if kept:
                     handle.write("\n".join(kept) + "\n")
+                # Flush before releasing the lock — see record_savings_event.
+                # An unflushed rewrite tail draining at close() (after LOCK_UN)
+                # could overwrite a line another process appended in between.
+                handle.flush()
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
     except Exception:
         return
+    try:
+        _last_compact_sizes[str(target)] = target.stat().st_size
+    except OSError:
+        pass
 
 
 __all__ = [
