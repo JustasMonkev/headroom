@@ -129,6 +129,21 @@ def test_bare_basename_rows_roundtrip():
     assert roundtrips(grep)
 
 
+def test_a_file_named_like_the_group_separator_is_left_unfolded():
+    # A file really can be named `--`. Heading with it would be
+    # indistinguishable from ripgrep's separator between non-contiguous context
+    # groups, so the rows beneath would read as orphans belonging to nothing.
+    grep = "a/--:1:x\na/--:2:y\n"
+    assert search_tree_heading(grep) == grep
+    assert search_tree_unheading(search_tree_heading(grep)) == grep
+    # The rest of a payload still folds around it.
+    mixed = grep + "b/f.py:3:z\nb/f.py:4:w\n"
+    folded = search_tree_heading(mixed)
+    assert "\n--\n" not in folded
+    assert len(folded) < len(mixed)
+    assert search_tree_unheading(folded) == mixed
+
+
 def test_directory_only_path_is_left_unfolded():
     # `src/:1:x` has no basename to head with — must not emit an empty header.
     grep = "src/:1:x\nsrc/:2:y\n"

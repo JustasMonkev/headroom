@@ -8,7 +8,7 @@ after ratio without failing anything.
 
 from __future__ import annotations
 
-from benchmarks.search_fold_benchmark import _row_file, _trim_to_file_boundary
+from benchmarks.search_fold_benchmark import _belongs, _row_file, _trim_to_file_boundary
 
 
 def test_row_file_returns_the_complete_hyphenated_path():
@@ -141,6 +141,29 @@ def test_trim_crosses_group_separators_within_one_file():
     cut = _trim_to_file_boundary(rows, 9)  # inside the second group
     assert not any(r.startswith("a/f.py") for r in rows[:cut])
     assert rows[:cut] == ["z/pre.py:1:M"]
+
+
+def test_trim_does_not_attribute_a_siblings_leading_context_to_this_file():
+    # `a/file.py-backup-20-leading` starts with `a/file.py-`, but a context row
+    # of `a/file.py` would carry the line-number marker there —
+    # `a/file.py-<digits>-`. Without that the sibling's orphan leading context
+    # stays in the corpus with its match row beyond the cut.
+    rows = (
+        [f"z/pre.py:{n}:M" for n in (1, 2)]
+        + [f"a/file.py:{n}:M" for n in (10, 11)]
+        + ["--"]
+        + ["a/file.py-backup-20-leading", "a/file.py-backup-21-leading"]
+        + ["a/file.py-backup:22:MATCH"]
+    )
+    cut = _trim_to_file_boundary(rows, 7)
+    assert not any("backup" in r for r in rows[:cut])
+    assert rows[:cut] == rows[:4]
+
+
+def test_belongs_still_accepts_this_files_own_context():
+    assert _belongs("a/file.py-40-before", "a/file.py")
+    assert not _belongs("a/file.py-backup-20-leading", "a/file.py")
+    assert not _belongs("a/file.py-backup:1:x", "a/file.py")
 
 
 def test_trim_never_returns_an_empty_corpus():

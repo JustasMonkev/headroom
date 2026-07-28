@@ -115,14 +115,23 @@ def _row_file(row: str) -> str | None:
 def _belongs(row: str, file: str) -> bool:
     """Whether ``row`` is part of ``file``'s block — its match row or context.
 
-    The prefix test is the *fallback*, reached only when the row is not a match
-    row. A match row already names its file exactly, and `a/file.py-backup:1:x`
-    starts with `a/file.py-` — so applying the prefix test to it made a boundary
-    between two sibling files look like the inside of the first one, and the
-    trim deleted that file whole.
+    A match row names its file exactly, so it decides on its own. Applying the
+    prefix test to it made a boundary between two sibling files
+    (``a/file.py`` / ``a/file.py-backup:1:x``) look like the inside of the
+    first, and the trim deleted that file whole.
+
+    For a context row the prefix has to carry the line-number marker too:
+    ``file-<digits>-``. A bare ``file-`` prefix also matches
+    ``a/file.py-backup-20-leading``, which is the *sibling's* leading context,
+    not this file's — and attributing it here leaves that sibling's orphan rows
+    in the corpus with its match row beyond the cut.
     """
     parsed = _row_file(row)
-    return parsed == file if parsed is not None else row.startswith(f"{file}-")
+    if parsed is not None:
+        return parsed == file
+    rest = row[len(file) + 1 :] if row.startswith(f"{file}-") else ""
+    digits = rest[: len(rest) - len(rest.lstrip("0123456789"))]
+    return bool(digits) and rest[len(digits) : len(digits) + 1] == "-"
 
 
 def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
@@ -166,9 +175,8 @@ def _trim_to_file_boundary(rows: list[str], cut: int) -> int:
                 break
 
     kept = next((f for i in range(cut - 1, -1, -1) if (f := _row_file(rows[i]))), None)
-    kept_prefix = f"{kept}-" if kept is not None else None
     while cut > 0 and _row_file(rows[cut - 1]) is None:
-        if kept_prefix is not None and rows[cut - 1].startswith(kept_prefix):
+        if kept is not None and _belongs(rows[cut - 1], kept):
             break
         cut -= 1
     # Only an *emptied* corpus falls back. A single surviving row is a correct

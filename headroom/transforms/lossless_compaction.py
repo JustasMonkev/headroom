@@ -637,17 +637,25 @@ def search_tree_heading(text: str) -> str:
 
         cut = path.rfind("/") + 1
         dir_part, base = path[:cut], path[cut:]
-        # Three shapes can't be headed, and all three are decided BEFORE any
+        # Four shapes can't be headed, and all four are decided BEFORE any
         # header is written — a dir header emitted above an unfoldable block
         # would be consumed by the inverse and never re-emitted:
         #   * no basename (``src/:1:x``) — the header line would be empty;
         #   * a basename that itself parses as a data row
         #     (``20240101-002-add_users.sql``) — the inverse would read the
         #     header as content;
+        #   * a basename of ``--`` (a file really can be named that) — the
+        #     header would be indistinguishable from ripgrep's group separator,
+        #     so the rows beneath it read as orphans belonging to nothing;
         #   * a path with no directory while a directory header is still in
         #     effect — there is no way to spell "back to no directory", so the
         #     inverse would keep prefixing the stale one.
-        if not base or _tree_is_data_row(base) or (not dir_part and current_dir):
+        if (
+            not base
+            or base == _RG_GROUP_SEP
+            or _tree_is_data_row(base)
+            or (not dir_part and current_dir)
+        ):
             out.extend(f"{p}{s}{d}{s}{c}" for p, s, d, c in block)
             current_dir = ""
             continue
@@ -764,6 +772,7 @@ def search_tree_unheading(text: str) -> str:
             continue
         if (
             line
+            and line != _RG_GROUP_SEP  # the fold never heads with it; see above
             and "/" not in line
             and not _tree_is_data_row(line)
             and i + 1 < n
