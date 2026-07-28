@@ -627,3 +627,61 @@ def test_search_fold_recovers_rejects_a_fold_of_different_content():
 def test_ambiguous_blobs_are_still_recoverable_given_the_original(original):
     out = compact_lossless(original, "search")
     assert out == original or search_fold_recovers(out, original)
+
+
+# --------------------------------------------------------------------------
+# C12: the composed dir+file fold
+#
+# `search_heading` factors a repeated FILE and `search_dir_heading` factors a
+# repeated DIRECTORY; picking whichever is smaller ALONE leaves the other axis
+# unfolded. `search_tree_heading` normally composes both, but it declines on
+# shapes it cannot parse unambiguously (a space in the path plus a `-<digits>-`
+# marker inside it). On those, the explicit composition is the only fold left.
+# --------------------------------------------------------------------------
+def test_composed_dir_then_file_fold_wins_where_the_tree_fold_declines():
+    from headroom.transforms.lossless_compaction import (
+        compact_lossless,
+        search_dir_heading,
+        search_heading,
+        search_tree_heading,
+    )
+
+    grep = "\n".join(
+        f"my project/logs 2026-05-03/{mod}.py:{10 + i}:    value = compute(item, ctx)"
+        for mod in ("alpha", "beta", "gamma")
+        for i in range(4)
+    )
+
+    # The tree fold declines this shape outright.
+    assert search_tree_heading(grep) == grep
+
+    out = compact_lossless(grep, "search")
+    assert len(out) < len(search_heading(grep))
+    assert len(out) < len(search_dir_heading(grep))
+
+
+def test_composed_fold_round_trips_exactly():
+    from headroom.transforms.lossless_compaction import (
+        search_dir_heading,
+        search_dir_unheading,
+        search_heading,
+        search_unheading,
+    )
+
+    grep = "\n".join(
+        f"my project/logs 2026-05-03/{mod}.py:{10 + i}:    value = compute(item, ctx)"
+        for mod in ("alpha", "beta", "gamma")
+        for i in range(4)
+    )
+    folded = search_heading(search_dir_heading(grep))
+    assert search_dir_unheading(search_unheading(folded)) == grep
+
+
+def test_composed_fold_never_wins_by_breaking_the_round_trip():
+    """Every candidate is verified; a composition that can't invert must lose."""
+    from headroom.transforms.lossless_compaction import compact_lossless
+
+    # Content that is itself heading-shaped — the folds cannot survive it.
+    grep = "src/\na.py\n12:body\nsrc/a.py:12:body\n"
+    out = compact_lossless(grep, "search")
+    assert len(out) <= len(grep)

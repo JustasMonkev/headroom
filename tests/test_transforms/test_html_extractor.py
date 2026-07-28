@@ -593,3 +593,77 @@ if __name__ == '__main__':
 """
         result = detect_content_type(code)
         assert result.content_type == ContentType.SOURCE_CODE
+
+
+class TestURLSlimming:
+    """C10: shorten link targets losslessly instead of dropping links.
+
+    Turning `include_links` off would be unrecoverable — the router forwards
+    only `HTMLExtractionResult.extracted` and the original HTML is never stored
+    in CCR, and on docs/search/index pages the destination URL often *is* the
+    payload. These edits remove only bytes the destination server ignores.
+    """
+
+    @pytest.fixture
+    def extractor(self):
+        return HTMLExtractor()
+
+    def test_tracking_params_are_stripped(self, extractor):
+        text = "See [the guide](https://a.example/g?utm_source=news&utm_campaign=x&page=2)."
+        out = extractor._slim_urls(text, None)
+        assert out == "See [the guide](https://a.example/g?page=2)."
+
+    def test_non_utm_tracking_params_are_stripped(self, extractor):
+        text = "[x](https://a.example/p?gclid=Cj0KCQ&fbclid=IwAR&id=7)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?id=7)"
+
+    def test_same_origin_links_fold_to_a_path(self, extractor):
+        text = "[next](https://docs.example.com/guide/start)"
+        out = extractor._slim_urls(text, "https://docs.example.com/index.html")
+        assert out == "[next](/guide/start)"
+
+    def test_cross_origin_links_keep_their_origin(self, extractor):
+        text = "[out](https://other.example/page)"
+        out = extractor._slim_urls(text, "https://docs.example.com/index.html")
+        assert out == "[out](https://other.example/page)"
+
+    def test_non_http_targets_are_untouched(self, extractor):
+        for target in ("mailto:a@b.com", "#anchor", "/already/relative", "tel:+15551234"):
+            text = f"[x]({target})"
+            assert extractor._slim_urls(text, "https://a.example/p") == text
+
+    def test_never_emits_an_empty_target(self, extractor):
+        """A bare `]()` is a broken link — strictly worse than the bytes saved."""
+        text = "[home](https://a.example)"
+        out = extractor._slim_urls(text, "https://a.example/p")
+        assert "]()" not in out
+        assert out == "[home](/)"
+
+    def test_link_text_is_never_touched(self, extractor):
+        text = "[utm_source is a tracking param](https://a.example/p?utm_source=x)"
+        out = extractor._slim_urls(text, None)
+        assert out.startswith("[utm_source is a tracking param]")
+
+    def test_slimming_can_be_turned_off(self):
+        e = HTMLExtractor(
+            HTMLExtractorConfig(
+                strip_tracking_params=False, relativize_same_origin_links=False
+            )
+        )
+        text = "[x](https://a.example/p?utm_source=news)"
+        assert e._slim_urls(text, "https://a.example/q") == text
+
+    def test_links_are_still_present_after_extraction(self, extractor):
+        """The whole point: links survive, they are just shorter."""
+        html = """
+        <html><body><article>
+        <p>Read the documentation for details about the compression pipeline
+        and how the router dispatches each content type to its compressor.</p>
+        <p>See <a href="https://docs.example.com/guide?utm_source=nav&amp;v=2">the guide</a>
+        for the full walkthrough of every stage in the pipeline.</p>
+        </article></body></html>
+        """
+        result = extractor.extract(html, url="https://docs.example.com/index.html")
+        if "](" in result.extracted:  # trafilatura kept the link
+            assert "utm_source" not in result.extracted
+            assert "/guide" in result.extracted

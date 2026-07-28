@@ -2096,3 +2096,147 @@ class TestCSharpSupport:
         lang, confidence = detect_language(code)
         assert lang == CodeLanguage.CSHARP
         assert confidence > 0.0
+
+
+# =============================================================================
+# C4 / B4: emission waste in the code compressor
+# =============================================================================
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter not installed")
+class TestOmittedBodyEmission:
+    """A truncated body should not pay for filler it doesn't need."""
+
+    def _compress(self, code, **cfg):
+        base = {"min_tokens_for_compression": 10, "enable_ccr": False, "max_body_lines": 1}
+        base.update(cfg)
+        return CodeAwareCompressor(CodeCompressorConfig(**base)).compress(code)
+
+    def test_no_dead_pass_when_a_docstring_survives(self):
+        code = textwrap.dedent(
+            '''
+            def authenticate(user, secret):
+                """Check the user's credentials."""
+                a = 1
+                b = 2
+                c = 3
+                d = 4
+                e = 5
+                return a + b + c + d + e
+            '''
+        )
+        out = self._compress(code, docstring_mode=DocstringMode.FULL).compressed
+
+        assert "lines omitted" in out
+        assert not any(line.strip() == "pass" for line in out.splitlines())
+
+    def test_no_dead_pass_when_a_statement_survives(self):
+        code = textwrap.dedent(
+            """
+            def authenticate(user, secret):
+                first = lookup(user)
+                b = 2
+                c = 3
+                d = 4
+                e = 5
+                return first
+            """
+        )
+        out = self._compress(code, docstring_mode=DocstringMode.NONE).compressed
+
+        assert "lines omitted" in out
+        assert not any(line.strip() == "pass" for line in out.splitlines())
+
+    def test_output_stays_syntactically_valid_without_the_filler(self):
+        """`pass` existed so a truncated block still parses — that must hold.
+
+        The compressor always keeps at least the first statement, so with a
+        docstring or a kept line present the block already has a body and the
+        filler was pure waste. This pins the property the filler protected.
+        """
+        code = "\n\n".join(
+            textwrap.dedent(
+                f'''
+                def handler_{i}(request, context):
+                    """Handle request {i}."""
+                    value = compute_{i}(request)
+                    other = derive_{i}(context, value)
+                    total = value + other
+                    return total
+                '''
+            )
+            for i in range(6)
+        )
+        out = self._compress(code, docstring_mode=DocstringMode.FULL).compressed
+
+        assert "lines omitted" in out
+        assert not any(line.strip() == "pass" for line in out.splitlines())
+        compile(out, "<compressed>", "exec")  # must still parse
+
+    def test_no_expires_clause_in_the_ccr_marker(self):
+        """B4: the model has no clock, and the printed TTL was wrong anyway."""
+        code = "\n\n".join(
+            textwrap.dedent(
+                f"""
+                def handler_{i}(request, context):
+                    value = compute_{i}(request)
+                    other = derive_{i}(context, value)
+                    total = value + other
+                    logged = record_{i}(total)
+                    return logged
+                """
+            )
+            for i in range(12)
+        )
+        result = CodeAwareCompressor(
+            CodeCompressorConfig(min_tokens_for_compression=10, enable_ccr=True, max_body_lines=1)
+        ).compress(code)
+
+        if "Retrieve more: hash=" in result.compressed:
+            assert "Expires in" not in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter not installed")
+class TestCallsListFiltering:
+    """C4: the `calls:` hint replaces the body, so it has to carry signal."""
+
+    def _analysis(self, calls):
+        return cc._SymbolAnalysis(calls={k: set(v) for k, v in calls.items()})
+
+    def test_builtins_and_logging_are_dropped(self):
+        analysis = self._analysis({"f": ["len", "isinstance", "logger.debug", "reconcile_ledger"]})
+        out = cc._make_omitted_comment("f", 9, "    ", "#", analysis)
+
+        assert "reconcile_ledger" in out
+        for noise in ("len", "isinstance", "logger.debug"):
+            assert noise not in out
+
+    def test_ubiquitous_callees_are_dropped(self):
+        # `_trace` is called by 5 of 6 functions — background noise for this file.
+        calls = {f"f{i}": ["_trace", f"unique_{i}"] for i in range(5)}
+        calls["f5"] = ["only_here"]
+        analysis = self._analysis(calls)
+        out = cc._make_omitted_comment("f0", 9, "", "#", analysis)
+
+        assert "unique_0" in out
+        assert "_trace" not in out
+
+    def test_capped_at_three_with_no_more_suffix(self):
+        analysis = self._analysis({"f": [f"helper_{i}" for i in range(9)]})
+        out = cc._make_omitted_comment("f", 9, "", "#", analysis)
+
+        assert out.count(",") == 2  # exactly 3 names listed
+        assert "more" not in out
+
+    def test_no_calls_clause_when_everything_was_noise(self):
+        analysis = self._analysis({"f": ["len", "str", "print"]})
+        out = cc._make_omitted_comment("f", 9, "", "#", analysis)
+
+        assert out == "# [9 lines omitted]"
+
+    def test_ubiquity_needs_enough_functions_to_mean_anything(self):
+        """With 2 functions, "more than half" is one — not evidence of noise."""
+        analysis = self._analysis({"f": ["shared", "own"], "g": ["shared"]})
+        out = cc._make_omitted_comment("f", 9, "", "#", analysis)
+
+        assert "shared" in out

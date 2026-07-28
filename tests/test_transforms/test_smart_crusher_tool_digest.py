@@ -99,7 +99,6 @@ def test_digest_removal_shows_up_as_fewer_tokens():
     from headroom.utils import compute_short_hash, create_tool_digest_marker
 
     tok = _tokenizer()
-    result = _crusher().apply(_openai_messages(), _tokenizer())
     marker = create_tool_digest_marker(compute_short_hash(_PAYLOAD))
 
     # The marker is not free: this is exactly what every crushed message used

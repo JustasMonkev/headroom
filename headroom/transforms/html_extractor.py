@@ -17,11 +17,45 @@ Uses trafilatura for robust extraction - it handles:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import trafilatura
 from trafilatura.settings import use_config
+
+# Markdown link target: the `](...)` part of `[text](target)`. Targets never
+# contain an unescaped `)`, which is what makes the non-greedy class safe.
+_MD_LINK_TARGET_RE = re.compile(r"\]\((?P<target>[^()\s]*)\)")
+
+# Query parameters that exist for the *referrer's* analytics and are ignored by
+# the resource itself. `utm_*` is handled by prefix, not by listing every one.
+_TRACKING_PARAMS = frozenset(
+    {
+        "gclid",
+        "dclid",
+        "fbclid",
+        "msclkid",
+        "mc_cid",
+        "mc_eid",
+        "igshid",
+        "twclid",
+        "ttclid",
+        "yclid",
+        "_ga",
+        "_gl",
+        "ref_src",
+        "ref_url",
+        "s_kwcid",
+        "spm",
+        "trk",
+        "trkcampaign",
+        "vero_conv",
+        "vero_id",
+        "wickedid",
+    }
+)
 
 # Suppress trafilatura's internal parse-error noise (e.g. "parsed tree length: 0")
 # which appears at WARNING level on every document that fails to extract content.
@@ -71,6 +105,19 @@ class HTMLExtractorConfig:
 
     # Metadata extraction
     extract_metadata: bool = True
+
+    # URL slimming. URLs are the densest text on a page, and most of their
+    # length is tracking cruft the destination ignores.
+    #
+    # This is the LOSSLESS middle ground, deliberately chosen over turning
+    # `include_links` off: the router forwards only `HTMLExtractionResult
+    # .extracted` and never stores the original HTML in CCR, so a dropped
+    # link is unrecoverable — and on docs/search/index pages the destination
+    # URL often *is* the payload. Stripping tracking parameters and folding a
+    # same-origin absolute URL to its path removes only bytes the destination
+    # does not use.
+    strip_tracking_params: bool = True
+    relativize_same_origin_links: bool = True
 
 
 class HTMLExtractor:
@@ -145,6 +192,8 @@ class HTMLExtractor:
             logger.debug("trafilatura extraction returned None, returning empty")
             extracted = ""
 
+        extracted = self._slim_urls(extracted, url)
+
         extracted_length = len(extracted)
         compression_ratio = extracted_length / max(original_length, 1)
 
@@ -181,6 +230,68 @@ class HTMLExtractor:
             date=date,
             metadata=metadata,
         )
+
+    def _slim_urls(self, text: str, page_url: str | None) -> str:
+        """Shorten markdown link targets without dropping any of them.
+
+        Two edits, both of which the destination server ignores:
+
+        * Tracking parameters (`utm_*`, `gclid`, `fbclid`, …) are removed. They
+          exist for the *referrer's* analytics, never for the resource.
+        * A link to the same origin as ``page_url`` is folded to its path, so
+          `https://docs.example.com/a/b` under `https://docs.example.com/x`
+          becomes `/a/b`. The origin is still recoverable from the page URL.
+
+        A URL that would end up empty, or that has no query and no matching
+        origin, is left exactly as it was. Non-HTTP schemes (`mailto:`,
+        `#anchor`, relative paths) are never touched.
+        """
+        if not text or not (
+            self.config.strip_tracking_params or self.config.relativize_same_origin_links
+        ):
+            return text
+
+        origin = ""
+        if self.config.relativize_same_origin_links and page_url:
+            try:
+                parsed_page = urlsplit(page_url)
+                if parsed_page.scheme in ("http", "https") and parsed_page.netloc:
+                    origin = f"{parsed_page.scheme}://{parsed_page.netloc}"
+            except ValueError:
+                origin = ""
+
+        def _rewrite(match: re.Match[str]) -> str:
+            target = match.group("target")
+            slimmed = self._slim_one_url(target, origin)
+            return match.group(0) if slimmed == target else f"]({slimmed})"
+
+        return _MD_LINK_TARGET_RE.sub(_rewrite, text)
+
+    def _slim_one_url(self, target: str, origin: str) -> str:
+        if not target.startswith(("http://", "https://")):
+            return target
+        try:
+            parts = urlsplit(target)
+        except ValueError:
+            return target
+
+        query = parts.query
+        if self.config.strip_tracking_params and query:
+            kept = [
+                (k, v)
+                for k, v in parse_qsl(query, keep_blank_values=True)
+                if k.lower() not in _TRACKING_PARAMS and not k.lower().startswith("utm_")
+            ]
+            query = urlencode(kept)
+
+        rebuilt = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+        if origin and rebuilt.startswith(origin + "/"):
+            rebuilt = rebuilt[len(origin) :]
+        elif origin and rebuilt == origin:
+            rebuilt = "/"
+        # Never emit an empty target: a bare `]()` is a broken link, which is
+        # strictly worse than the bytes it saves.
+        return rebuilt or target
 
     def extract_batch(
         self, html_contents: list[tuple[str, str | None]]

@@ -64,6 +64,7 @@ def _run_marker(count: int) -> str:
 def _block_marker(length: int, distance: int) -> str:
     return f"…{length}@-{distance}"
 
+
 # fold_repeated_blocks search bounds: minimum/maximum block length worth a
 # marker, candidate anchors per line, and an input size cap so the scan stays
 # negligible on huge payloads.
@@ -978,9 +979,24 @@ def compact_lossless(content: str, kind: str) -> str:
             # most real result sets. The first two stay as candidates because
             # they are strictly more permissive about what counts as a data row,
             # and so still round-trip on inputs the tree fold declines.
+            # A fourth candidate COMPOSES the two single-axis folds: real
+            # `grep -rn` output repeats a directory across files AND a file
+            # across its own matches, and picking whichever single fold is
+            # smaller alone leaves the other axis unfolded. Folding by
+            # directory first and by file second (with the inverses applied in
+            # the opposite order) captures both on the inputs where the tree
+            # fold declines. The round-trip check below makes it safe: a
+            # composition that doesn't invert exactly simply doesn't win.
+            def _search_dir_then_file(text: str) -> str:
+                return search_heading(search_dir_heading(text))
+
+            def _search_file_then_dir(text: str) -> str:
+                return search_dir_unheading(search_unheading(text))
+
             best = content
             for fold, inverse in (
                 (search_tree_heading, search_tree_unheading),
+                (_search_dir_then_file, _search_file_then_dir),
                 (search_heading, search_unheading),
                 (search_dir_heading, search_dir_unheading),
             ):
