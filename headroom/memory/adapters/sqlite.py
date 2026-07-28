@@ -26,6 +26,12 @@ if TYPE_CHECKING:
 # This prevents JSON path injection attacks via malicious key names
 _SAFE_METADATA_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_\-]*$")
 
+# Container filters above this many entries fall back from per-entry SQL
+# predicates to minified-text equality: each entry emits 1-2 AND predicates,
+# and a ~500-element array would exceed SQLite's MAX_EXPR_DEPTH (default
+# 1000), failing the whole query with "Expression tree is too large".
+_MAX_STRUCTURAL_ITEMS = 64
+
 
 def _validate_metadata_key(key: str) -> bool:
     """Validate that a metadata key is safe for use in JSON path expressions.
@@ -603,14 +609,27 @@ class SQLiteMemoryStore:
             # STORED key order while json.dumps preserves the FILTER's — raw
             # minified-text equality would miss logically equal objects.
             # Compare structurally instead: object type, entry count, and
-            # each entry recursively (invalid sub-keys are skipped, matching
-            # the top-level policy).
+            # each entry recursively.
             conditions.append(f"json_type(metadata, '{json_path}') = 'object'")
             conditions.append(f"(SELECT COUNT(*) FROM json_each(metadata, '{json_path}')) = ?")
             params.append(len(value))
+            if len(value) > _MAX_STRUCTURAL_ITEMS:
+                # Bounded fallback — see the array branch below.
+                conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+                params.append(json.dumps(value, separators=(",", ":")))
+                return
             for sub_key, sub_value in value.items():
                 if not _validate_metadata_key(sub_key):
-                    continue
+                    # An unsupported nested key can't be expressed as a JSON
+                    # path. Silently dropping it would leave only the entry
+                    # count enforced — the filter would match ANY object of
+                    # that size — so make the whole filter non-matching
+                    # instead. (Top-level keys keep their documented
+                    # skip-silently policy; a nested key is part of an
+                    # equality VALUE, where dropping a piece changes what
+                    # the caller asked for.)
+                    conditions.append("1 = 0")
+                    return
                 self._append_metadata_condition(
                     f"{json_path}.{sub_key}", sub_value, conditions, params
                 )
@@ -622,6 +641,16 @@ class SQLiteMemoryStore:
         conditions.append(f"json_type(metadata, '{json_path}') = 'array'")
         conditions.append(f"json_array_length(metadata, '{json_path}') = ?")
         params.append(len(value))
+        if len(value) > _MAX_STRUCTURAL_ITEMS:
+            # Per-element predicates grow the SQL expression tree linearly;
+            # a ~500-element array would blow SQLite's MAX_EXPR_DEPTH (1000)
+            # and fail the whole query. Past this bound, fall back to
+            # minified-text equality: bounded and exact for scalars, at the
+            # cost of key-order sensitivity for objects nested inside huge
+            # arrays — an acceptable trade for filters this large.
+            conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+            params.append(json.dumps(value, separators=(",", ":")))
+            return
         for index, item in enumerate(value):
             self._append_metadata_condition(f"{json_path}[{index}]", item, conditions, params)
 

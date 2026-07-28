@@ -434,30 +434,42 @@ class OpenAIProvider(Provider):
         self._pricing = {**_PRICING}
         self._encodings: dict[str, str] = {**_MODEL_ENCODINGS}
 
-        # Caller-supplied entries are also kept separately: prefix matching
-        # consults them BEFORE the built-in table, so a family override like
-        # {"o1": 64000} applies to "o1-mini-2024-09-12" even though the
-        # built-in "o1-mini" key is a longer prefix. Merged-table matching
-        # alone would silently out-rank the caller's configuration.
-        self._custom_context_limits: dict[str, int] = {}
-        self._custom_pricing: dict[str, tuple[float, float]] = {}
+        # Caller-supplied entries are also kept in separate LAYERS, ordered
+        # by precedence (explicit constructor arg first, then env/config
+        # file): prefix matching consults each layer before the built-in
+        # table, so a family override like {"o1": 64000} applies to
+        # "o1-mini-2024-09-12" even though the built-in "o1-mini" key is a
+        # longer prefix — and a longer key in a LOWER-priority source (a
+        # config-file "o1-mini") cannot out-rank a shorter explicit override
+        # either. Merged-table matching alone would let prefix length trump
+        # configuration precedence in both directions.
+        config_limit_layer: dict[str, int] = {}
+        config_pricing_layer: dict[str, tuple[float, float]] = {}
 
         # Load from config file and env var
         custom_config = _load_custom_model_config()
         self._context_limits.update(custom_config["context_limits"])
-        self._custom_context_limits.update(custom_config["context_limits"])
+        config_limit_layer.update(custom_config["context_limits"])
         self._encodings.update(custom_config["encodings"])
 
         # Handle pricing (can be tuple or list from JSON)
         for model, pricing in custom_config["pricing"].items():
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
-                self._custom_pricing[model] = self._pricing[model]
+                config_pricing_layer[model] = self._pricing[model]
 
         # Explicit overrides take precedence
+        explicit_limit_layer: dict[str, int] = {}
         if context_limits:
             self._context_limits.update(context_limits)
-            self._custom_context_limits.update(context_limits)
+            explicit_limit_layer.update(context_limits)
+
+        self._custom_limit_layers: list[dict[str, int]] = [
+            layer for layer in (explicit_limit_layer, config_limit_layer) if layer
+        ]
+        self._custom_pricing_layers: list[dict[str, tuple[float, float]]] = [
+            layer for layer in (config_pricing_layer,) if layer
+        ]
 
         self._token_counters: dict[str, TokenCounter] = {}
 
@@ -542,11 +554,13 @@ class OpenAIProvider(Provider):
             return self._context_limits[model]
 
         # Prefix match (longest wins — see _longest_prefix_match). Custom
-        # overrides are consulted first so caller configuration beats a
-        # longer built-in key (see __init__).
-        prefix = _longest_prefix_match(model, self._custom_context_limits)
-        if prefix is not None:
-            return self._custom_context_limits[prefix]
+        # layers are consulted in precedence order before the built-in table
+        # so caller configuration beats a longer lower-priority key (see
+        # __init__).
+        for layer in self._custom_limit_layers:
+            prefix = _longest_prefix_match(model, layer)
+            if prefix is not None:
+                return layer[prefix]
         prefix = _longest_prefix_match(model, self._context_limits)
         if prefix is not None:
             return self._context_limits[prefix]
@@ -652,11 +666,13 @@ class OpenAIProvider(Provider):
             return self._pricing[model]
 
         # Prefix match (longest wins — see _longest_prefix_match). Custom
-        # overrides are consulted first so caller configuration beats a
-        # longer built-in key (see __init__).
-        model_prefix = _longest_prefix_match(model, self._custom_pricing)
-        if model_prefix is not None:
-            return self._custom_pricing[model_prefix]
+        # layers are consulted in precedence order before the built-in table
+        # so caller configuration beats a longer lower-priority key (see
+        # __init__).
+        for layer in self._custom_pricing_layers:
+            model_prefix = _longest_prefix_match(model, layer)
+            if model_prefix is not None:
+                return layer[model_prefix]
         model_prefix = _longest_prefix_match(model, self._pricing)
         if model_prefix is not None:
             return self._pricing[model_prefix]

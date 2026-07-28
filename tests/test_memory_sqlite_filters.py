@@ -187,3 +187,37 @@ async def test_objects_inside_arrays_match_regardless_of_key_order(
     # Array ORDER still matters; wrong length still fails.
     assert await ids(steps=["x", {"a": 1, "b": 2}]) == []
     assert await ids(steps=[{"a": 1, "b": 2}]) == []
+
+
+async def test_invalid_nested_key_makes_filter_non_matching(store: SQLiteMemoryStore) -> None:
+    """A nested key that can't be expressed as a safe JSON path must make the
+    whole filter match nothing — silently dropping it would leave only the
+    entry count enforced, matching ANY one-entry object."""
+    await store.save(
+        Memory(id="other", content="unrelated", user_id="u1", metadata={"prefs": {"other": "v"}})
+    )
+
+    found = await store.query(
+        MemoryFilter(user_id="u1", metadata_filters={"prefs": {"display.name": "alice"}})
+    )
+    assert found == []
+
+
+async def test_large_array_filter_does_not_blow_expression_depth(
+    store: SQLiteMemoryStore,
+) -> None:
+    """A ~500-element array filter must not exceed SQLite's MAX_EXPR_DEPTH;
+    past the structural bound it falls back to bounded text equality and
+    still matches exactly."""
+    big = list(range(500))
+    await store.save(Memory(id="big", content="big array", user_id="u1", metadata={"ids": big}))
+    await store.save(
+        Memory(id="near", content="almost", user_id="u1", metadata={"ids": big[:-1] + [999]})
+    )
+
+    async def ids(**metadata_filters):
+        found = await store.query(MemoryFilter(user_id="u1", metadata_filters=metadata_filters))
+        return sorted(m.id for m in found)
+
+    assert await ids(ids=big) == ["big"]
+    assert await ids(ids=big[:-1] + [998]) == []

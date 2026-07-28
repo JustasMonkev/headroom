@@ -70,3 +70,25 @@ class TestEncodingPrefix:
             _get_encoding_name_for_model("gpt-4o", custom_encodings={"gpt-4o": "cl100k_base"})
             == "cl100k_base"
         )
+
+
+class TestCustomLayerPrecedence:
+    def test_explicit_override_beats_longer_config_file_key(self, monkeypatch) -> None:
+        """A longer prefix in a LOWER-priority source (config file) must not
+        out-rank a shorter explicit constructor override."""
+        import headroom.providers.openai as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_load_custom_model_config",
+            lambda: {
+                "context_limits": {"o1-mini": 128000},
+                "pricing": {},
+                "encodings": {},
+            },
+        )
+        provider = OpenAIProvider(context_limits={"o1": 64000})
+        assert provider._get_context_limit_manual("o1-mini-2024-09-12") == 64000
+        # Without an explicit override, the config-file entry applies.
+        provider2 = OpenAIProvider()
+        assert provider2._get_context_limit_manual("o1-mini-2024-09-12") == 128000
