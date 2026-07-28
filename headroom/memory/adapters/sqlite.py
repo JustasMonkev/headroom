@@ -502,8 +502,11 @@ class SQLiteMemoryStore:
             conditions.append("(valid_until IS NULL OR valid_until > ?)")
             params.append(valid_at_str)
 
-        # Superseded filtering
-        if not filter.include_superseded:
+        # Superseded filtering. Skipped for point-in-time queries: valid_at
+        # already constrains to versions valid at that instant, and ANDing
+        # "valid_until IS NULL" on top would contradict it for any superseded
+        # row — "what did we know at time t?" would always return nothing.
+        if not filter.include_superseded and filter.valid_at is None:
             # Default: only return current memories (not superseded)
             conditions.append("valid_until IS NULL")
 
@@ -546,9 +549,24 @@ class SQLiteMemoryStore:
                 # while blocking malicious attempts like "'] OR 1=1--"
                 if not _validate_metadata_key(key):
                     continue
-                # Use JSON extraction for metadata filtering
+                # Use JSON extraction for metadata filtering.
+                # json_extract() returns typed SQL values (INTEGER for ints and
+                # booleans, REAL for floats), so bind comparable types: JSON
+                # text like 'true' or '3' never equals integer 1 or 3 and made
+                # every non-string filter silently match nothing.
+                if value is None:
+                    # `= NULL` never matches in SQL; JSON null (and a missing
+                    # key) extract to SQL NULL, so use IS NULL.
+                    conditions.append(f"json_extract(metadata, '$.{key}') IS NULL")
+                    continue
                 conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                params.append(json.dumps(value) if not isinstance(value, str) else value)
+                if isinstance(value, bool):
+                    params.append(int(value))
+                elif isinstance(value, (int, float, str)):
+                    params.append(value)
+                else:
+                    # Lists/dicts: json_extract returns their minified JSON text.
+                    params.append(json.dumps(value, separators=(",", ":")))
 
         return conditions, params
 
