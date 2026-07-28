@@ -4,12 +4,24 @@ from __future__ import annotations
 
 # Sentinel prefix marks the steering block so application is idempotent and
 # the block is recognizable in logs/diffs.
-STEERING_SENTINEL = "<headroom_output_shaping>"
-STEERING_SUFFIX = "</headroom_output_shaping>"
+#
+# D4 (docs/token-efficiency-review.md): the sentinel pair is pure framing that
+# the model pays for on every request. `<headroom_output_shaping>` +
+# `</headroom_output_shaping>` cost ~16 tokens of a ~75-token level-2 block;
+# `<hr_shape>` / `</hr_shape>` carry the same delimiting role for ~6. This was a
+# deliberate ONE-TIME cache-busting edit — do not churn these strings again.
+STEERING_SENTINEL = "<hr_shape>"
+STEERING_SUFFIX = "</hr_shape>"
 
-# Levels are cumulative: each includes everything above it. Text must stay
-# byte-stable across releases for prefix-cache friendliness; edits to these
-# strings are cache-busting changes.
+# Pre-D4 sentinels. Only used to recognize (and replace) a block emitted by an
+# older Headroom build that a client echoed back to us; never emitted.
+_LEGACY_SENTINEL = "<headroom_output_shaping>"
+_LEGACY_SUFFIX = "</headroom_output_shaping>"
+
+# Each level is a self-contained, independent instruction string — NOT a
+# cumulative delta on the level above it (the wording overlaps by design so any
+# single level reads standalone). Text must stay byte-stable across releases for
+# prefix-cache friendliness; edits to these strings are cache-busting changes.
 VERBOSITY_LEVELS = {
     1: (
         "Skip preamble and postamble. Do not announce what you are about to "
@@ -46,10 +58,18 @@ def steering_text(level: int) -> str | None:
 
 def replace_or_append_steering_block(existing: str, block: str) -> tuple[str, bool]:
     """Replace an existing steering block in text, or append one at the tail."""
-    start = existing.find(STEERING_SENTINEL)
+    sentinel, suffix = STEERING_SENTINEL, STEERING_SUFFIX
+    start = existing.find(sentinel)
+    if start < 0:
+        # A block written by a pre-D4 build (echoed back by the client) is
+        # replaced rather than duplicated.
+        legacy_start = existing.find(_LEGACY_SENTINEL)
+        if legacy_start >= 0:
+            sentinel, suffix = _LEGACY_SENTINEL, _LEGACY_SUFFIX
+            start = legacy_start
     if start >= 0:
-        end = existing.find(STEERING_SUFFIX, start)
-        end = len(existing) if end < 0 else end + len(STEERING_SUFFIX)
+        end = existing.find(suffix, start)
+        end = len(existing) if end < 0 else end + len(suffix)
         prefix = existing[:start].rstrip()
         suffix = existing[end:].lstrip("\n")
         parts = [part for part in (prefix, block, suffix) if part]

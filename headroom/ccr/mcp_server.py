@@ -76,6 +76,12 @@ except ImportError:
 
 CCR_TOOL_NAME = "headroom_retrieve"
 COMPRESS_TOOL_NAME = "headroom_compress"
+# D3: single, short, actionable message for every retrieval miss (missing hash
+# or expired entry). The model cannot act on TTL policy — only on regenerating
+# the content — so the diagnostics live in the log, not in the context window.
+RETRIEVAL_MISS_MESSAGE = (
+    "Not found or expired — re-read the file / re-run the command that produced it."
+)
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
 
@@ -207,6 +213,18 @@ MCP_SESSION_TTL = 3600
 SHARED_STATS_DIR = _paths.workspace_dir()
 SHARED_STATS_FILE = _paths.session_stats_path()
 SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
+
+
+def _model_json(payload: Any) -> str:
+    """Serialize a model-facing MCP tool result as compactly as possible.
+
+    D2 (``docs/token-efficiency-review.md``): these payloads land in the agent's
+    context and stay there for the rest of the session. ``indent=2`` added
+    20-30% on nested results (``headroom_stats`` worst) purely for human
+    readability nobody consumes. The module already used compact separators for
+    its internal stats file — this makes the model-facing path match.
+    """
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
@@ -458,7 +476,9 @@ class HeadroomMCPServer:
             "tokens_saved": max(0, input_tokens - output_tokens),
             "savings_percent": savings_pct,
             "transforms": result.transforms_applied,
-            "note": f"Original stored with hash={hash_key}. Use mcp__headroom__{CCR_TOOL_NAME} to get full content later.",
+            # D2: no `note` field. It restated the `hash` field immediately
+            # above it plus the retrieve tool's own description (~28 tokens of
+            # pure redundancy, resident in context forever).
         }
 
     async def _retrieve_content(
@@ -476,13 +496,20 @@ class HeadroomMCPServer:
         expired_entry_status = None
         if entry:
             self._stats.record_retrieval(hash_key)
+            # D2: item counts and retrieval_count are telemetry, not content —
+            # log them instead of billing the model for them on every retrieve.
+            logger.info(
+                "event=mcp_retrieve_hit hash=%s source=local original_items=%s "
+                "compressed_items=%s retrieval_count=%s",
+                hash_key,
+                entry.original_item_count,
+                entry.compressed_item_count,
+                entry.retrieval_count,
+            )
             return {
                 "hash": hash_key,
                 "source": "local",
                 "original_content": entry.original_content,
-                "original_item_count": entry.original_item_count,
-                "compressed_item_count": entry.compressed_item_count,
-                "retrieval_count": entry.retrieval_count,
             }
         if entry_status.get("status") == "expired":
             expired_entry_status = entry_status
@@ -509,34 +536,32 @@ class HeadroomMCPServer:
             except Exception:
                 pass  # Proxy unavailable, that's fine
 
+        # D3: both miss branches return the same one-line, actionable message.
+        # The old text spent ~103 tokens restating internal TTL policy three
+        # times over `error` + `hint` + the expired branch — none of it
+        # actionable by the model, whose only recourse is to regenerate the
+        # content. TTL/age detail goes to the log line instead.
         if expired_entry_status:
             ttl_seconds = expired_entry_status.get(
                 "ttl_seconds",
                 expired_entry_status["default_ttl_seconds"],
             )
+            logger.info(
+                "event=mcp_retrieve_expired hash=%s ttl_seconds=%s age_seconds=%s detail=%s",
+                hash_key,
+                ttl_seconds,
+                expired_entry_status.get("age_seconds"),
+                format_retrieval_miss_detail(expired_entry_status),
+            )
             return {
-                "error": (
-                    f"{format_retrieval_miss_detail(expired_entry_status)}. "
-                    "Do not retry the same hash. Re-run the source command or re-read the source file."
-                ),
+                "error": RETRIEVAL_MISS_MESSAGE,
                 "hash": hash_key,
                 "status": "expired",
-                "ttl_seconds": ttl_seconds,
-                "age_seconds": expired_entry_status.get("age_seconds"),
-                "hint": (
-                    "Use the source of truth to regenerate fresh content. "
-                    "Re-run the command or re-read the file."
-                ),
             }
 
         return {
-            "error": "Content not found. It may have expired or the hash may be incorrect.",
+            "error": RETRIEVAL_MISS_MESSAGE,
             "hash": hash_key,
-            "hint": "To recover: if the compression marker references a file Read, "
-            "re-read that file (the path is in the marker; disk is the source of "
-            "truth). If it was command output, re-run the command. Content "
-            "compressed via headroom_compress is stored for the session; content "
-            "compressed by the proxy uses the configured CCR TTL.",
         }
 
     async def _retrieve_via_proxy(
@@ -620,52 +645,31 @@ class HeadroomMCPServer:
                 Tool(
                     name=COMPRESS_TOOL_NAME,
                     description=(
-                        "Compress content to save context window space. "
-                        "Use this on large tool outputs, file contents, search results, "
-                        "or any content you want to shrink before reasoning over it. "
-                        f"The original is stored and can be retrieved later via mcp__headroom__{CCR_TOOL_NAME}. "
-                        "Returns compressed text + a hash for retrieval."
+                        "Compress large text (tool output, files, logs) to save context. "
+                        "Returns compressed text + a retrieval hash."
                     ),
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": (
-                                    "The content to compress. Can be any text: file contents, "
-                                    "JSON, search results, logs, code, etc."
-                                ),
-                            },
+                            "content": {"type": "string"},
                         },
                         "required": ["content"],
                     },
                 ),
                 Tool(
                     name=CCR_TOOL_NAME,
-                    description=(
-                        "Retrieve original uncompressed content by hash. "
-                        "Use this when you need full details from previously compressed content. "
-                        "The hash comes from headroom_compress results or from compression "
-                        "markers like [N items compressed... hash=abc123]."
-                    ),
+                    description=CCR_RETRIEVE_DESCRIPTION,
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "hash": {
-                                "type": "string",
-                                "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
-                            },
+                            "hash": {"type": "string"},
                         },
                         "required": ["hash"],
                     },
                 ),
                 Tool(
                     name=STATS_TOOL_NAME,
-                    description=(
-                        "Show compression statistics for this session: "
-                        "total compressions, tokens saved, estimated cost savings, "
-                        "and recent compression events."
-                    ),
+                    description="Session compression stats: counts, tokens saved, cost.",
                     inputSchema={
                         "type": "object",
                         "properties": {},
@@ -680,26 +684,20 @@ class HeadroomMCPServer:
                     Tool(
                         name=READ_TOOL_NAME,
                         description=(
-                            "Read a file with smart caching. First read returns full content "
-                            "and caches it. Subsequent reads of the same unchanged file return "
-                            "a lightweight cache marker (~20 tokens instead of thousands). "
-                            f"Use mcp__headroom__{CCR_TOOL_NAME} with the hash to get full content if needed. "
-                            "Use this INSTEAD of the built-in Read tool for significant token savings."
+                            "Read a file, caching it. Re-reads of an unchanged file return a "
+                            "small marker plus a retrieval hash. Use instead of the built-in "
+                            "Read tool."
                         ),
                         inputSchema={
                             "type": "object",
                             "properties": {
                                 "file_path": {
                                     "type": "string",
-                                    "description": "Absolute path to the file to read.",
+                                    "description": "Absolute path.",
                                 },
                                 "fresh": {
                                     "type": "boolean",
-                                    "description": (
-                                        "Force a fresh read, bypassing cache. Use after context "
-                                        "compaction, in subagents, or when you need guaranteed "
-                                        "current content."
-                                    ),
+                                    "description": "Bypass the cache (e.g. after compaction).",
                                 },
                             },
                             "required": ["file_path"],
@@ -730,7 +728,7 @@ class HeadroomMCPServer:
                     result = [
                         TextContent(
                             type="text",
-                            text=json.dumps({"error": f"Unknown tool: {name}"}),
+                            text=_model_json({"error": f"Unknown tool: {name}"}),
                         )
                     ]
                 logger.info(
@@ -749,7 +747,7 @@ class HeadroomMCPServer:
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps({"error": str(e)}),
+                        text=_model_json({"error": str(e)}),
                     )
                 ]
 
@@ -760,7 +758,7 @@ class HeadroomMCPServer:
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"error": "content parameter is required"}),
+                    text=_model_json({"error": "content parameter is required"}),
                 )
             ]
 
@@ -780,7 +778,7 @@ class HeadroomMCPServer:
             result["proxy"] = proxy_status
             result["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=_model_json(result))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -823,7 +821,7 @@ class HeadroomMCPServer:
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"error": "hash parameter is required"}),
+                    text=_model_json({"error": "hash parameter is required"}),
                 )
             ]
 
@@ -835,7 +833,7 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=_model_json(result))]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""
@@ -900,7 +898,7 @@ class HeadroomMCPServer:
                     stats["proxy"] = proxy_status
                     stats["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return [TextContent(type="text", text=_model_json(stats))]
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""
@@ -946,7 +944,7 @@ class HeadroomMCPServer:
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"error": "file_path parameter is required"}),
+                    text=_model_json({"error": "file_path parameter is required"}),
                 )
             ]
 
@@ -955,14 +953,14 @@ class HeadroomMCPServer:
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"error": f"File not found: {file_path}"}),
+                    text=_model_json({"error": f"File not found: {file_path}"}),
                 )
             ]
         if not path.is_file():
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"error": f"Not a file: {file_path}"}),
+                    text=_model_json({"error": f"Not a file: {file_path}"}),
                 )
             ]
 
@@ -979,7 +977,7 @@ class HeadroomMCPServer:
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"error": f"Cannot read file: {e}"}),
+                    text=_model_json({"error": f"Cannot read file: {e}"}),
                 )
             ]
 
@@ -999,21 +997,16 @@ class HeadroomMCPServer:
                     return [
                         TextContent(
                             type="text",
-                            text=json.dumps(
+                            # D2: compact, and no `note` — `status: "cached"` +
+                            # `hash` already say everything the prose said, and
+                            # the retrieve tool's description covers the rest.
+                            text=_model_json(
                                 {
                                     "status": "cached",
                                     "file": file_path,
                                     "lines": cached_lines,
-                                    "unchanged": True,
                                     "hash": ccr_hash,
-                                    "note": (
-                                        f"File unchanged since first read ({cached_lines} lines, "
-                                        f"~{cached_tokens} tokens). Content already in your context "
-                                        f"from the first read. Call mcp__headroom__{CCR_TOOL_NAME}(hash='{ccr_hash}') "
-                                        f"if you need the full content again."
-                                    ),
-                                },
-                                indent=2,
+                                }
                             ),
                         )
                     ]

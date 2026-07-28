@@ -213,11 +213,12 @@ def test_mcp_retrieve_expired_hash_returns_terminal_guidance(
     result = asyncio.run(server._retrieve_content(hash_key))
 
     assert result["status"] == "expired"
-    assert result["ttl_seconds"] == 1
-    assert result["age_seconds"] == pytest.approx(2.0)
-    assert "Entry expired" in result["error"]
-    assert "do not retry the same hash" in result["error"].lower()
-    assert "re-run the command" in result["hint"].lower()
+    # D3: TTL/age detail moved to the log line — the model can only act on
+    # "regenerate it", so that is all the payload says, once.
+    assert result["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
+    assert "hint" not in result
+    assert "ttl_seconds" not in result
+    assert "age_seconds" not in result
 
 
 def test_mcp_retrieve_hash_expiring_during_lookup_returns_terminal_guidance(
@@ -255,10 +256,7 @@ def test_mcp_retrieve_hash_expiring_during_lookup_returns_terminal_guidance(
     result = asyncio.run(server._retrieve_content(hash_key))
 
     assert result["status"] == "expired"
-    assert result["ttl_seconds"] == 1
-    assert result["age_seconds"] == pytest.approx(1.1)
-    assert "Entry expired" in result["error"]
-    assert "do not retry the same hash" in result["error"].lower()
+    assert result["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
 
 
 def test_mcp_retrieve_missing_local_hash_can_still_hit_proxy(
@@ -316,8 +314,8 @@ def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     result = asyncio.run(server._retrieve_content("nonexistent_hash"))
     assert result.get("status") is None
-    assert result["error"] == "Content not found. It may have expired or the hash may be incorrect."
-    assert "do not retry the same hash" not in result.get("hint", "").lower()
+    assert result["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
+    assert "hint" not in result
 
 
 def test_handle_stats_session_output_is_window_scoped() -> None:
@@ -492,3 +490,90 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
 
     assert excinfo.value.args[0] == 0
     assert cleaned["done"] is True
+
+
+# --- A4 / D2: model-facing payload hygiene ----------------------------------
+
+
+def test_model_json_is_compact() -> None:
+    """D2: every model-facing MCP result is serialized compactly.
+
+    These payloads live in the agent's context for the rest of the session;
+    `indent=2` added 20-30% on nested results for readability nobody consumes.
+    """
+    payload = {"a": 1, "b": {"c": [1, 2]}, "d": "é"}
+    text = mcp_server._model_json(payload)
+
+    assert text == '{"a":1,"b":{"c":[1,2]},"d":"é"}'
+    assert "\n" not in text
+    assert json.loads(text) == payload
+
+
+def test_compress_result_has_no_note_field(fresh_store) -> None:
+    """D2: the `note` restated the `hash` field and the retrieve tool doc."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = server._compress_content("the the the the the\n" * 200)
+
+    assert "note" not in result
+    assert result["hash"]
+
+
+def test_retrieve_payload_carries_content_not_telemetry(fresh_store) -> None:
+    """D2: item counts / retrieval_count are telemetry — they go to the log."""
+    original = "row\n" * 500
+    hash_key = get_compression_store().store(original, "<<small>>", original_item_count=500)
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result == {"hash": hash_key, "source": "local", "original_content": original}
+
+
+def test_retrieve_handler_emits_compact_json(fresh_store) -> None:
+    hash_key = get_compression_store().store("hello", "<<small>>")
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    (content,) = asyncio.run(server._handle_retrieve({"hash": hash_key}))
+
+    assert "\n  " not in content.text
+    assert json.loads(content.text)["original_content"] == "hello"
+
+
+def test_retrieval_miss_message_is_one_short_line() -> None:
+    """D3: ~103 tokens of TTL policy collapsed to one actionable sentence."""
+    message = mcp_server.RETRIEVAL_MISS_MESSAGE
+
+    assert message == (
+        "Not found or expired — re-read the file / re-run the command that produced it."
+    )
+    assert len(message) < 110
+
+
+def test_tool_descriptions_are_terse_and_share_the_retrieve_constant(monkeypatch) -> None:
+    """A4: ~300 tokens of resident tool descriptions cut roughly in half, and
+    the retrieve wording is the same object the proxy injects (no drift)."""
+    monkeypatch.setattr(mcp_server, "_READ_ENABLED", True)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    tools = {t.name: t for t in asyncio.run(server.server.list_tools_handler())}
+
+    assert set(tools) == {
+        "headroom_compress",
+        "headroom_retrieve",
+        "headroom_stats",
+        "headroom_read",
+    }
+    assert tools["headroom_retrieve"].description == mcp_server.CCR_RETRIEVE_DESCRIPTION
+    assert tools["headroom_compress"].description == (
+        "Compress large text (tool output, files, logs) to save context. "
+        "Returns compressed text + a retrieval hash."
+    )
+    assert tools["headroom_stats"].description == (
+        "Session compression stats: counts, tokens saved, cost."
+    )
+    # No param-level prose where the key name already says it.
+    assert tools["headroom_compress"].inputSchema["properties"]["content"] == {"type": "string"}
+    assert tools["headroom_retrieve"].inputSchema["properties"]["hash"] == {"type": "string"}
+
+    total = sum(len(t.description) for t in tools.values())
+    assert total < 500, f"tool descriptions grew back to {total} chars"

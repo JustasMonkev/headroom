@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from headroom.learn.analyzer import (
+    _SYSTEM_PROMPT,
+    SECTION_VOCABULARY,
     SessionAnalyzer,
     _build_digest,
     _call_cli_llm,
@@ -1111,3 +1113,75 @@ class TestFailureAnalyzerCompat:
         analyzer = FailureAnalyzer()
         result = analyzer.analyze(_project(), [])
         assert isinstance(result, AnalysisResult)
+
+
+# =============================================================================
+# E2: closed section-heading vocabulary
+# =============================================================================
+
+
+class TestSectionVocabulary:
+    def test_prompt_lists_the_closed_vocabulary_verbatim(self):
+        for heading in SECTION_VOCABULARY:
+            assert f'"{heading}"' in _SYSTEM_PROMPT
+        assert "__SECTION_VOCABULARY__" not in _SYSTEM_PROMPT
+        assert "do NOT invent a new heading" in _SYSTEM_PROMPT
+
+    def test_vocabulary_entries_are_pairwise_distinct_after_normalization(self):
+        from headroom.learn.writer import _normalize_heading
+
+        keys = [_normalize_heading(h) for h in SECTION_VOCABULARY]
+        assert len(set(keys)) == len(keys)
+
+    def test_equivalent_headings_in_one_response_are_merged(self):
+        raw = {
+            "context_file_rules": [
+                {
+                    "section": "Environment",
+                    "content": "- use uv",
+                    "estimated_tokens_saved": 100,
+                    "evidence_count": 2,
+                },
+                {
+                    "section": "Environment Rules",
+                    "content": "- never use python3",
+                    "estimated_tokens_saved": 50,
+                    "evidence_count": 3,
+                },
+            ],
+            "memory_file_rules": [],
+        }
+
+        recs = _parse_llm_response(raw)
+
+        assert len(recs) == 1
+        assert recs[0].section == "Environment"
+        assert "- use uv" in recs[0].content
+        assert "- never use python3" in recs[0].content
+        assert recs[0].estimated_tokens_saved == 150
+        assert recs[0].evidence_count == 5
+
+    def test_context_and_memory_targets_are_merged_independently(self):
+        raw = {
+            "context_file_rules": [{"section": "Workflow", "content": "- ctx"}],
+            "memory_file_rules": [{"section": "Workflow Rules", "content": "- mem"}],
+        }
+
+        recs = _parse_llm_response(raw)
+
+        assert len(recs) == 2
+        assert {r.target for r in recs} == {
+            RecommendationTarget.CONTEXT_FILE,
+            RecommendationTarget.MEMORY_FILE,
+        }
+
+    def test_distinct_sections_are_not_merged(self):
+        raw = {
+            "context_file_rules": [
+                {"section": "Environment", "content": "- a"},
+                {"section": "File Paths", "content": "- b"},
+            ],
+            "memory_file_rules": [],
+        }
+
+        assert len(_parse_llm_response(raw)) == 2

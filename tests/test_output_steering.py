@@ -8,6 +8,7 @@ from headroom.proxy.output_steering import (
     replace_or_append_steering_block,
     steering_text,
 )
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
 
 
 def test_replace_or_append_steering_block_replaces_existing_block() -> None:
@@ -92,7 +93,7 @@ def test_openai_chat_steering_is_idempotent_and_swaps_level() -> None:
     assert apply_openai_chat_verbosity_steering(body, 4) is True
     swapped = body["messages"][0]["content"]
     assert steering_text(4) in swapped
-    assert swapped.count("<headroom_output_shaping>") == 1
+    assert swapped.count(STEERING_SENTINEL) == 1
 
 
 def test_openai_chat_steering_inserts_system_when_absent() -> None:

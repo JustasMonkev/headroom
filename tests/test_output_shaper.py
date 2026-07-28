@@ -25,6 +25,7 @@ from headroom.proxy.output_shaper import (
     shape_request,
     steering_text,
 )
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
 
 ENABLED = OutputShaperSettings(enabled=True)
 
@@ -147,7 +148,7 @@ class TestVerbositySteering:
         apply_verbosity_steering(body, 2)
         assert apply_verbosity_steering(body, 4) is True
         steering_blocks = [
-            b for b in body["system"] if b["text"].startswith("<headroom_output_shaping>")
+            b for b in body["system"] if b["text"].startswith(STEERING_SENTINEL)
         ]
         assert len(steering_blocks) == 1
         assert steering_blocks[0]["text"] == steering_text(4)
@@ -325,7 +326,7 @@ class TestOpenAIResponsesSteering:
         body = {"instructions": f"System.\n\n{steering_text(1)}"}
 
         assert apply_openai_responses_verbosity_steering(body, 2) is True
-        assert body["instructions"].count("<headroom_output_shaping>") == 1
+        assert body["instructions"].count(STEERING_SENTINEL) == 1
         assert steering_text(1) not in body["instructions"]
         assert steering_text(2) in body["instructions"]
 

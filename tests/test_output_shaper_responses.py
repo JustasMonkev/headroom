@@ -23,6 +23,7 @@ from headroom.proxy.output_shaper import (
     shape_responses_request,
     steering_text,
 )
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
 
 ENABLED = OutputShaperSettings(enabled=True)
 
@@ -158,7 +159,7 @@ class TestResponsesVerbositySteering:
         body = {"instructions": "You are Codex."}
         apply_responses_verbosity_steering(body, 2)
         assert apply_responses_verbosity_steering(body, 3) is True
-        assert body["instructions"].count("<headroom_output_shaping>") == 1
+        assert body["instructions"].count(STEERING_SENTINEL) == 1
         assert steering_text(3) in body["instructions"]
         assert body["instructions"].startswith("You are Codex.")
 
