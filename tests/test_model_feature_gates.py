@@ -59,6 +59,14 @@ GATE_TABLE: list[tuple[object, bool]] = [
     ("us.anthropic.claude-sonnet-4-20250514-v1:0", False),
     ("claude-opus-4-1-20250805", False),
     ("claude-3-haiku-20240307", False),
+    # --- Split `YYYY-MM-DD` snapshot stamps are dates too. OpenAI spells them
+    # with separators, so `gpt-5-2025-08-07` tokenizes to 5/2025/08/07 and the
+    # 8-digit rule alone read `2025` as the minor, clearing the 5.5 cutoff for
+    # an old GPT-5 snapshot.
+    ("gpt-5-2025-08-07", False),
+    ("openai/gpt-5-2025-08-07", False),
+    ("gpt-5.4-2026-02-01", False),
+    ("claude-sonnet-4-2025-05-14", False),
     # --- Claude: at/above the cutoff.
     ("claude-opus-4-8", True),
     ("claude-opus-4-8-20260210", True),
@@ -134,6 +142,15 @@ def test_model_supports_gated_features(model: object, expected: bool) -> None:
         ("gpt-5", ("gpt", (5, 0))),
         ("gpt-5.5-codex", ("gpt", (5, 5))),
         ("gpt-5.4-2026-02-01", ("gpt", (5, 4))),
+        # A split YYYY-MM-DD stamp is a date, not a minor: an OpenAI snapshot
+        # id is the base model plus a release date.
+        ("gpt-5-2025-08-07", ("gpt", (5, 0))),
+        ("openai/gpt-5-2025-08-07", ("gpt", (5, 0))),
+        ("gpt-5.5-2026-01-15", ("gpt", (5, 5))),
+        ("gpt-6-2026-03-01", ("gpt", (6, 0))),
+        ("claude-sonnet-4-2025-05-14", ("claude", (4, 0))),
+        # ... but a non-date digit run keeps its version meaning.
+        ("gpt-5-12345678", ("gpt", (5, 12345678))),
         ("openai/gpt-6.2", ("gpt", (6, 2))),
         # Not a plausible calendar date -> still a version component, so the
         # date rule stays narrow and can't silently swallow real minors.

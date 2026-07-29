@@ -85,6 +85,29 @@ def _is_release_date_token(token: str) -> bool:
     )
 
 
+def _is_split_release_date(tokens: list[str], index: int) -> bool:
+    """True when ``tokens[index:index + 3]`` is a ``YYYY``/``MM``/``DD`` stamp.
+
+    OpenAI spells snapshot dates with separators (``gpt-5-2025-08-07``), which
+    tokenizes to ``5``, ``2025``, ``08``, ``07`` — so the 8-digit check alone
+    would read ``2025`` as the minor version and let a GPT-5 snapshot clear the
+    5.5 cutoff. Month and day must be exactly two digits, matching the canonical
+    ISO form, so an ordinary version run is never mistaken for a date.
+    """
+    if index + 2 >= len(tokens):
+        return False
+    year_tok, month_tok, day_tok = tokens[index : index + 3]
+    if not (year_tok.isdigit() and month_tok.isdigit() and day_tok.isdigit()):
+        return False
+    if len(year_tok) != 4 or len(month_tok) != 2 or len(day_tok) != 2:
+        return False
+    return (
+        _RELEASE_DATE_MIN_YEAR <= int(year_tok) <= _RELEASE_DATE_MAX_YEAR
+        and 1 <= int(month_tok) <= 12
+        and 1 <= int(day_tok) <= 31
+    )
+
+
 def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | None:
     """Parse a model id into ``(family, (major, minor))``; ``None`` if unknown.
 
@@ -123,7 +146,10 @@ def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | N
     if family is None:
         return None
     digits: list[int] = []
-    for token in tokens[start:]:
+    for offset, token in enumerate(tokens[start:], start=start):
+        if _is_split_release_date(tokens, offset):
+            # `gpt-5-2025-08-07`: the date starts here, so the version ended.
+            break
         if token.isdigit() and not _is_release_date_token(token):
             digits.append(int(token))
         elif digits:
