@@ -41,17 +41,47 @@ def clamp_legacy_thinking_budget(
     return floor
 
 
-def can_create_openai_text_verbosity(model: object) -> bool:
+def can_create_openai_text_verbosity(
+    model: object,
+    *,
+    first_party_target: bool = False,
+) -> bool:
     """Whether it is safe to CREATE a new OpenAI ``text.verbosity`` block.
 
-    Native output controls are a model-specific optimization, so they engage
-    only at or above the shared cutoff (``MIN_GPT_FEATURE_VERSION``, gpt >=
-    5.5). Fail-closed on anything unparseable: injecting ``text.verbosity``
-    where the model does not support it 400s the request. Models below the
-    cutoff are not broken by this — they simply fall back to the portable
-    instruction-steering lever, and an *existing* client-sent verbosity is
-    still lowered for them by :func:`lower_text_verbosity_value`.
+    Two independent conditions, both required:
+
+    * **Model** — native output controls are a model-specific optimization, so
+      they engage only at or above the shared cutoff
+      (``MIN_GPT_FEATURE_VERSION``, gpt >= 5.5).
+    * **Upstream** — ``text.verbosity`` is an OpenAI-Responses-specific field.
+      A ``/v1/responses`` request routed through ``x-headroom-base-url`` still
+      *looks* like an OpenAI request (the client speaks the Responses wire
+      format) while the upstream is an arbitrary compatible gateway that may
+      reject the field. That gap widened when the shared model parser started
+      accepting vendor-prefixed ids such as ``openai/gpt-5.5`` — exactly the
+      ids gateways use — where the old anchored ``gpt-…`` regex rejected them.
+      So ``first_party_target`` must carry the *verified upstream identity*
+      (:func:`headroom.proxy.helpers.is_first_party_openai_target` applied to
+      the already-resolved destination), never the request dialect.
+
+    Fail-closed on both axes, and ``first_party_target`` defaults to ``False``
+    so a call site that never learned the upstream cannot silently create the
+    field. This deliberately differs from
+    :func:`~headroom.proxy.helpers.openai_tool_search_enabled`, whose flag
+    defaults to ``True``: that gate ships explicit operator opt-ins
+    (``HEADROOM_TOOL_SEARCH=1``, ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS``) that
+    can re-enable a gateway, whereas this one has no escape hatch — so here the
+    default *is* the policy, and it must be the safe one.
+
+    Nothing is broken by failing closed: the request keeps flowing, it just
+    falls back to the portable instruction-steering lever (which is
+    upstream-agnostic), and an *existing* client-sent verbosity is still
+    lowered — for every model and every upstream — by
+    :func:`lower_text_verbosity_value`. The client having sent the field is
+    itself proof that the target accepts it.
     """
+    if not first_party_target:
+        return False
     return model_supports_gated_features(model, family="gpt")
 
 

@@ -192,4 +192,8 @@ def test_every_gate_agrees_with_the_shared_predicate() -> None:
         assert bills_prior_thinking(model) is bool(claude), model
         assert _model_supports_anthropic_tool_search(model) is bool(claude), model
         assert _model_supports_openai_tool_search(model) is bool(gpt), model
-        assert can_create_openai_text_verbosity(model) is bool(gpt), model
+        # first_party_target isolates the MODEL axis; the upstream axis is
+        # ANDed on top and is covered in tests/test_output_effort_policy.py.
+        assert (
+            can_create_openai_text_verbosity(model, first_party_target=True) is bool(gpt)
+        ), model

@@ -1165,8 +1165,21 @@ def _shape_openai_responses_for_output(
     input_tokens: int,
     model: str,
     conversation_key: str | None = None,
+    upstream_base_url: str | None = None,
 ) -> Any:
-    """Apply OpenAI Responses output shaping and attach holdout labels."""
+    """Apply OpenAI Responses output shaping and attach holdout labels.
+
+    ``upstream_base_url`` is the *effective upstream* this payload will be
+    forwarded to (per-request ``x-headroom-base-url`` override, ChatGPT/Codex
+    backend, Copilot, or the configured OpenAI target). Only the
+    OpenAI-native ``text.verbosity`` lever consults it — creating that field
+    against a compatible gateway that does not implement it would 400 a
+    request that previously got only portable steering. Unknown/unresolvable
+    upstream fails closed (no field creation); the portable
+    instruction-steering lever still applies, and an already client-supplied
+    verbosity is still lowered.
+    """
+    from headroom.proxy.helpers import is_first_party_openai_target
     from headroom.proxy.output_savings import (
         assign_arm,
         conversation_key_from_body,
@@ -1205,6 +1218,7 @@ def _shape_openai_responses_for_output(
         payload,
         settings=settings,
         level_override=level,
+        first_party_target=is_first_party_openai_target(upstream_base_url),
     )
     shaped.labels = [*result.labels, *(shaped.labels or [])]
     return shaped
@@ -1248,7 +1262,16 @@ def _shape_openai_response_create_frame(
     *,
     input_tokens: int,
     conversation_key: str | None = None,
+    upstream_base_url: str | None = None,
 ) -> tuple[str, bool, list[str], str | None]:
+    """Shape a Codex WebSocket ``response.create`` frame in place.
+
+    ``upstream_base_url`` is the already-resolved upstream WebSocket URL for
+    this session (``wss://chatgpt.com/…`` for ChatGPT session auth, otherwise
+    the configured/overridden OpenAI base rewritten to ``wss://``); it is the
+    same value the compression path receives, and it is what scopes native
+    ``text.verbosity`` creation to a verified first-party target.
+    """
     try:
         parsed = json.loads(raw_msg)
     except json.JSONDecodeError:
@@ -1266,6 +1289,7 @@ def _shape_openai_response_create_frame(
         input_tokens=input_tokens,
         model=str(payload.get("model") or ""),
         conversation_key=conversation_key,
+        upstream_base_url=upstream_base_url,
     )
     labels = list(result.labels or [])
     if not result.changed:
@@ -5241,6 +5265,12 @@ class OpenAIHandlerMixin:
                     if _http_conversation_key
                     else None
                 ),
+                # Already-resolved destination for THIS request (ChatGPT
+                # backend, x-headroom-base-url override, Copilot, or the
+                # configured OpenAI target) — same value the compression call
+                # above receives. Native text.verbosity creation needs the
+                # real upstream, not the request dialect.
+                upstream_base_url=url,
             )
             _append_unique_transforms(transforms_applied, _shape_result.labels)
             if _shape_result.changed:
@@ -7126,6 +7156,10 @@ class OpenAIHandlerMixin:
                         self.openai_provider,
                     ),
                     conversation_key=f"ws:{session_id}",
+                    # Same resolved destination the compression path gets —
+                    # native text.verbosity is scoped to a verified OpenAI
+                    # upstream, not to the Responses wire format.
+                    upstream_base_url=upstream_url,
                 )
                 _append_unique_transforms(transforms_applied, _shape_labels)
                 if _shape_modified:
@@ -7549,6 +7583,7 @@ class OpenAIHandlerMixin:
                                             self.openai_provider,
                                         ),
                                         conversation_key=f"ws:{session_id}",
+                                        upstream_base_url=upstream_url,
                                     )
                                     _append_unique_transforms(
                                         transforms_applied,
