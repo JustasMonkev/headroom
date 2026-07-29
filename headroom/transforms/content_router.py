@@ -1858,7 +1858,7 @@ class _RequestScoped:
             # id() this object happens to have reused) must not be inherited.
             if entry is not None and entry[0]() is obj:
                 return entry[1]
-        fallback = obj.__dict__.get(_SCOPE_FALLBACK_ATTR)
+        fallback: dict[str, Any] | None = obj.__dict__.get(_SCOPE_FALLBACK_ATTR)
         if fallback is None:
             fallback = {}
             obj.__dict__[_SCOPE_FALLBACK_ATTR] = fallback

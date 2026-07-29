@@ -1,6 +1,6 @@
 """A2: sticky memory tool injection must dedupe Headroom-owned mcp__ aliases."""
-from headroom.proxy.helpers import apply_session_sticky_memory_tools
 from headroom.memory.tools import MEMORY_TOOLS_OPTIMIZED
+from headroom.proxy.helpers import apply_session_sticky_memory_tools
 
 
 def _names(tools):
