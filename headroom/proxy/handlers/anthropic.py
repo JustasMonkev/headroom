@@ -1907,6 +1907,11 @@ class AnthropicHandlerMixin:
                         *ccr_hashes_in_tool_arguments(optimized_messages),
                     ],
                 )
+                # Feed the merged list back into the injector: system-instruction
+                # injection keys off `has_compressed_content`, which reads the
+                # injector's own list, so a tool-input-only marker would leave it
+                # empty and silently skip the guidance.
+                injector.adopt_hashes(_detected_hashes)
                 if inject_system_instructions and injector.has_compressed_content:
                     optimized_messages = injector.inject_into_system_message(optimized_messages)
 

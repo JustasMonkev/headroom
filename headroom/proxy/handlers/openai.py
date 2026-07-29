@@ -3513,6 +3513,10 @@ class OpenAIHandlerMixin:
                 injector.detected_hashes,
                 [*pipeline_ccr_hashes, *ccr_hashes_in_tool_arguments(optimized_messages)],
             )
+            # Same split as the Anthropic path: `has_compressed_content` reads
+            # the injector's own list, so a marker that only ever lived in a
+            # tool-call input would skip system-instruction injection entirely.
+            injector.adopt_hashes(_detected_hashes)
             if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
 

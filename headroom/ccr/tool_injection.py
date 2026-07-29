@@ -226,6 +226,22 @@ class CCRToolInjector:
         """Get list of detected compression hashes."""
         return self._detected_hashes.copy()
 
+    def adopt_hashes(self, hashes: list[str]) -> None:
+        """Record hashes discovered outside :meth:`scan_for_markers`.
+
+        The scanner only reads message text and tool-result content, so a
+        marker living in a tool-call *input* is invisible to it. Handlers merge
+        those in separately — but every consumer that keys off
+        :attr:`has_compressed_content` (notably system-instruction injection)
+        would still see an empty list and no-op, leaving deployments that use
+        system instructions as their retrieval guidance with no way to redeem
+        the marker. Feeding the merged list back in keeps the injector the
+        single source of truth. Order-preserving and idempotent.
+        """
+        for value in hashes:
+            if value and value not in self._detected_hashes:
+                self._detected_hashes.append(value)
+
     def scan_for_markers(self, messages: list[dict[str, Any]]) -> list[str]:
         """Scan messages for compression markers and extract hashes.
 
