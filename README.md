@@ -55,9 +55,9 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, Grok, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `GROK.md`
 - **Output token reduction** — trims what the model *writes back* (not just what you send): drops ceremony/restated code and skips deep "thinking" on routine steps. See [Output token reduction](#output-token-reduction-cut-what-the-model-writes-back).
-- **Lossless search folding** — grep/ripgrep results are folded along all four repeating axes (directory, file, line runs, repeated bodies) before they reach the model: 37% of raw tokens removed, byte-exactly recoverable
-- **Exact offline token counting** — BPE vocabularies are bundled in the Rust core, so token counts stay exact on air-gapped hosts instead of degrading to character estimates
-- **Low fixed overhead** — the memory + CCR tool injection Headroom adds to each request costs 1,064 tokens (down 58%), most of it prefix-cacheable
+- **Lossless search folding** — grep/ripgrep results are folded along all four repeating axes (directory, file, line runs, repeated bodies) before they reach the model: an estimated 37% of raw tokens removed, byte-exactly recoverable
+- **Exact offline token counting** — tiktoken's BPE vocabularies are bundled in the Rust core, so counts for the bundled encodings (OpenAI-family models) stay exact on air-gapped hosts instead of degrading to character estimates
+- **Low fixed overhead** — the memory + CCR tool injection costs 1,064 tokens per request (down 58%; measured on the Anthropic path with both features enabled), most of it prefix-cacheable
 - **Reversible (CCR)** — originals are cached for retrieval on demand
 
 ## How it works (30 seconds)
@@ -171,20 +171,28 @@ Headroom can trim that too, from the proxy, without you changing any code:
   (a file read, a passing test), it dials the model's thinking effort down. New
   questions and errors keep full effort.
 - **Thinking compaction** (`HEADROOM_THINKING_COMPACT=1`, off by default) — on
-  recent Claude models, prior-turn extended thinking is re-sent as input and
-  billed. This converts aged-out thinking blocks to Kompressed text blocks,
+  Claude ≥ 4.6, prior-turn extended thinking is re-sent as input and billed.
+  This converts aged-out thinking blocks to Kompressed text blocks,
   deterministically (memoized by content hash) so the forwarded prefix stays
   byte-stable and the prompt cache still hits. The last
   `HEADROOM_THINKING_COMPACT_KEEP_LAST` assistant turns keep their thinking
-  intact. Lossy, hence opt-in; fail-open on any Kompress error.
+  intact. On OpenAI-compatible upstreams the same flag compacts the plain-text
+  reasoning that Kimi / GLM / DeepSeek-R1 resend (`reasoning_content`,
+  `<think>…</think>`) and no-ops on models with encrypted reasoning handles.
+  Lossy, hence opt-in; fail-open on any Kompress error.
 
-> **Model gating.** Model-specific optimizations — thinking compaction,
-> server-side tool-search deferral, and native `text.verbosity` — engage only on
-> **Claude ≥ 4.8 / GPT ≥ 5.5** (tool-search deferral on the OpenAI Responses API
-> engages from GPT 5.4). The cutoffs are defined once in `headroom/config.py`
-> behind a shared, fail-closed model-version predicate. Older models still proxy
-> and still get ordinary compression — they just skip features their provider
-> would reject or re-bill.
+> **Model gating.** Model-specific optimizations engage only on models verified
+> to support (and benefit from) them, behind fail-closed version predicates.
+> The shared cutoff — **Claude ≥ 4.8 / GPT ≥ 5.5**, defined in
+> `headroom/config.py` — gates server-side tool-search deferral and native
+> `text.verbosity`. Features with verified earlier or different support keep
+> their own gate: tool-search deferral on the OpenAI Responses API engages from
+> GPT 5.4, thinking compaction on Anthropic engages from Claude 4.6 (the
+> generation that starts re-billing prior thinking), and the OpenAI-compatible
+> reasoning compactor is shape-driven rather than version-gated (it only
+> touches plain-text reasoning fields). Older models still proxy and still get
+> ordinary compression — they just skip features their provider would reject or
+> re-bill.
 
 Applies to Anthropic `/v1/messages` **and** OpenAI-compatible endpoints
 (`/v1/chat/completions`, `/v1/responses`). Effort routing uses
@@ -337,9 +345,9 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
 - **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, Perl.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
-- **Lossless search folding** — `Grep` is an excluded tool (never lossily compressed), so search results are folded losslessly instead: the `search_tree_heading` fold factors repeated directories *and* files, collapses consecutive line numbers, and de-duplicates repeated match bodies, while parsing ripgrep `-C` context rows. 37.3% of raw tokens removed across real ripgrep workloads (up from 24.9%), every fold byte-exactly recoverable; the parser declines rather than guessing on any ambiguous row. Reproduce with `python -m benchmarks.search_fold_benchmark`.
-- **Exact offline tokenization** — tiktoken normally downloads its BPE vocab on first use, silently degrading air-gapped hosts to character estimation. The same BPE tables are now vendored inside `headroom._core` (via tiktoken-rs), so counts stay exact with no network access and token IDs are byte-identical to Python tiktoken.
-- **Server-side tool-search deferral** — on first-party Anthropic (Claude ≥ 4.8) and OpenAI Responses (GPT ≥ 5.4) upstreams, non-core tool schemas are marked `defer_loading` behind a provider `tool_search` tool instead of being sent in full every request. Default-on where supported; `HEADROOM_TOOL_SEARCH=0` opts out, `=1` forces it for upstreams/models newer than the built-in gate (`HEADROOM_TOOL_SEARCH_MODELS` / `HEADROOM_OPENAI_TOOL_SEARCH_MODELS` override the model match).
+- **Lossless search folding** — `Grep` is an excluded tool, so in the default cache mode its results are never lossily compressed and the lossless fold is all that stands between a large result set and the context window (in token mode, excluded-tool output that ages out of the recent-reads protection window can still fall through to lossy compression). The `search_tree_heading` fold factors repeated directories *and* files, collapses consecutive line numbers, and de-duplicates repeated match bodies, while parsing ripgrep `-C` context rows. An estimated 37.3% of raw tokens removed across real ripgrep workloads (up from 24.9%; the benchmark counts with the router's calibrated token estimator, not a raw tokenizer), every fold byte-exactly recoverable; the parser declines rather than guessing on any ambiguous row. Reproduce with `python -m benchmarks.search_fold_benchmark`.
+- **Exact offline tokenization** — tiktoken normally downloads its BPE vocab on first use, silently degrading air-gapped hosts to character estimation. The same BPE tables are now vendored inside `headroom._core` (via tiktoken-rs), so counts for the bundled tiktoken encodings stay exact with no network access and token IDs are byte-identical to Python tiktoken. This covers OpenAI-family models; providers without a public tokenizer are counted the same way on- or offline — Claude against `o200k_base` as a stable proxy (within ~10–20%), Gemini / Cohere / Kimi with calibrated estimators.
+- **Server-side tool-search deferral** — on first-party Anthropic (Claude ≥ 4.8) and OpenAI Responses (GPT ≥ 5.4) upstreams, non-core tool schemas are marked `defer_loading` behind a provider `tool_search` tool. The full schemas still travel in every request — the provider just keeps them out of the model's context until the model searches for them — so this cuts billed context tokens, not request size or provider data exposure. Default-on where supported; `HEADROOM_TOOL_SEARCH=0` opts out. `HEADROOM_TOOL_SEARCH=1` forces injection past both the upstream and model gates on Anthropic, but on OpenAI it overrides only the upstream gate — the model gate always applies there, with `HEADROOM_OPENAI_TOOL_SEARCH_MODELS` (Anthropic: `HEADROOM_TOOL_SEARCH_MODELS`) as the regex escape hatch for model IDs newer than the built-in cutoff.
 - **Image compression** — 40–90% reduction via trained ML router.
 - **CacheAligner** - detects and warns about volatile content that can bust provider KV cache prefixes; never rewrites prompts.
 - **Live-zone compression** — compresses only new bytes (fresh tool output, latest turn); frozen prefix stays byte-identical so provider cache is not busted. History is never dropped.
@@ -392,10 +400,13 @@ What it does **not** mean is that requests stop at your machine:
 Local telemetry (`--telemetry`) is local-only: it feeds your own `/stats` and `/metrics` and
 is not transmitted anywhere.
 
-One thing that *does* work fully offline: **exact token counting**. The BPE vocabularies
-tiktoken would otherwise download on first use are bundled inside the Rust core, so
-compression ratios and context-pressure gates stay exact — not character-estimated — on
-air-gapped or firewalled hosts.
+One thing that *does* keep working offline: **token counting for the bundled tiktoken
+encodings**. The BPE vocabularies tiktoken would otherwise download on first use are
+bundled inside the Rust core, so for OpenAI-family models compression ratios and
+context-pressure gates stay exact — not character-estimated — on air-gapped or firewalled
+hosts. Providers without a public tokenizer are counted the same way regardless of network
+access: Claude is priced against `o200k_base` as a stable proxy (within ~10–20% of real
+counts), and Gemini / Cohere / Kimi use calibrated estimators.
 
 ## Headroom for teams
 
@@ -569,10 +580,10 @@ This fork carries the following merged changes on top of upstream:
 
 | PR | Change |
 |----|--------|
-| [#16](https://github.com/JustasMonkev/headroom/pull/16) | **58% lower fixed per-request overhead.** Memory tool schemas 2,134 → 799 tok, CCR system instructions 155 → 18 tok, the turn-mutating "Available hashes" list removed so the system prefix stops busting the provider cache, and duplicate tool injection under `headroom wrap` fixed. Fixed injection cost drops 2,535 → 1,064 tok per request; overall ratio saved on a 120-turn transcript rises 27.3% → 33.1%. Also introduces the Claude ≥ 4.8 / GPT ≥ 5.5 model gating, default-on tool-search deferral, thinking compaction wiring, per-request routing scope (fixing cross-request state bleed in the shared `ContentRouter`), and stage-wise savings accounting. |
+| [#16](https://github.com/JustasMonkev/headroom/pull/16) | **58% lower fixed per-request overhead.** Memory tool schemas 2,134 → 799 tok, CCR system instructions 155 → 18 tok, the turn-mutating "Available hashes" list removed so the system prefix stops busting the provider cache, and duplicate tool injection under `headroom wrap` fixed. Fixed injection cost drops 2,535 → 1,064 tok per request (Anthropic path, memory + CCR enabled); overall ratio saved on a 120-turn transcript rises 27.3% → 33.1%. Also introduces the Claude ≥ 4.8 / GPT ≥ 5.5 model gating, default-on tool-search deferral, thinking compaction wiring, per-request routing scope (fixing cross-request state bleed in the shared `ContentRouter`), and stage-wise savings accounting. |
 | [#15](https://github.com/JustasMonkev/headroom/pull/15) | **Token-efficiency review.** Full-codebase audit of where Headroom itself spends unnecessary tokens, with ranked findings and `file:line` references — [`docs/token-efficiency-review.md`](docs/token-efficiency-review.md). Implemented (and re-measured with a real tokenizer) in #16. |
-| [#14](https://github.com/JustasMonkev/headroom/pull/14) | **Lossless grep folding along all four repeating axes.** The new `search_tree_heading` fold composes the previous file- and directory-folds and adds line-run and repeated-body collapsing, plus ripgrep `-C` context-row parsing. 37.3% of raw search tokens removed (up from 24.9%), byte-exactly recoverable, verified against 150k adversarial payloads. |
-| [#13](https://github.com/JustasMonkev/headroom/pull/13) | **Exact offline BPE tokenization.** tiktoken's vocab tables are vendored in the Rust core, so air-gapped hosts no longer silently degrade to character estimation. Also fixes `register_tokenizer(model, factory=...)` (was a documented no-op), over-broad cache eviction on register, and an ~80×-allocation hot spot in CJK char counting. |
+| [#14](https://github.com/JustasMonkev/headroom/pull/14) | **Lossless grep folding along all four repeating axes.** The new `search_tree_heading` fold composes the previous file- and directory-folds and adds line-run and repeated-body collapsing, plus ripgrep `-C` context-row parsing. An estimated 37.3% of raw search tokens removed (up from 24.9%), byte-exactly recoverable, verified against 150k adversarial payloads. |
+| [#13](https://github.com/JustasMonkev/headroom/pull/13) | **Exact offline BPE tokenization.** tiktoken's vocab tables are vendored in the Rust core, so air-gapped hosts no longer silently degrade tiktoken-based counting to character estimation. Also fixes `register_tokenizer(model, factory=...)` (was a documented no-op), over-broad cache eviction on register, and an ~80×-allocation hot spot in CJK char counting. |
 | [#12](https://github.com/JustasMonkev/headroom/pull/12) | **Offline guarantees, buffered SSE, stage deadlines, tool references.** Documents and pins (with regression tests) what local-first and `HEADROOM_OFFLINE` actually guarantee; stops successful buffered SSE responses from being returned as 502s; makes the compression deadline bound the whole content-router stage; keeps outgoing tool references resolvable after compaction. |
 | [#4](https://github.com/JustasMonkev/headroom/pull/4) | **Codex attestation headers redacted** (`x-oai-attestation`) in opt-in wire-debug captures — signed attestations are credential-like and should not be persisted. Imported from upstream #2612. |
 | [#2](https://github.com/JustasMonkev/headroom/pull/2) | **Codex WebSocket `/v1/responses` frames actually forwarded compressed.** The success path was unreachable — compression was attempted and reported, but the original bytes were forwarded. Imported from upstream #2307. |
