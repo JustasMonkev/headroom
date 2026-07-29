@@ -1185,3 +1185,40 @@ class TestSectionVocabulary:
         }
 
         assert len(_parse_llm_response(raw)) == 2
+
+
+def test_off_vocabulary_headings_snap_to_canonical_spelling() -> None:
+    """Merging by normalized key must also canonicalize the stored heading.
+
+    Folding ``Environment Rules`` into ``Environment`` only fixes the grouping.
+    If the surviving recommendation still *renders* the model's variant,
+    ``_merge_recommendations`` treats it as authoritative on the next write,
+    drops the existing ``Environment`` section and rewrites the heading — so two
+    runs that disagree on the variant rewrite the learned block back and forth
+    and bust its prompt-cache prefix on every ``headroom learn``.
+    """
+    from headroom.learn.analyzer import _merge_equivalent_sections
+    from headroom.learn.models import Recommendation, RecommendationTarget
+
+    def _rec(section: str, content: str) -> Recommendation:
+        return Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE,
+            section=section,
+            content=content,
+            evidence_count=1,
+            estimated_tokens_saved=10,
+            confidence=0.9,
+        )
+
+    # Whichever spelling the model happens to emit first, the result is the
+    # canonical one — that is what makes the output byte-stable across runs.
+    variant_first = _merge_equivalent_sections([_rec("Environment Rules", "a"), _rec("Environment", "b")])
+    canonical_first = _merge_equivalent_sections([_rec("Environment", "b"), _rec("Environment Rules", "a")])
+
+    assert [r.section for r in variant_first] == ["Environment"]
+    assert [r.section for r in canonical_first] == ["Environment"]
+
+    # A heading with no vocabulary equivalent has nothing to snap to and is
+    # left exactly as written.
+    custom = _merge_equivalent_sections([_rec("Totally Custom Heading", "z")])
+    assert [r.section for r in custom] == ["Totally Custom Heading"]

@@ -54,9 +54,17 @@ MEMORY_UPDATE_DESCRIPTION = (
     "new facts and memory_delete to remove; edit history is preserved."
 )
 
+# NB: "Permanent" is load-bearing and must not be softened for byte count.
+# Every backend hard-deletes — LocalBackend drops the row via the SQLite
+# adapter's `DELETE FROM memories`, and DirectMem0 calls its client's delete —
+# so the previous "Soft delete; history is kept" told the model the opposite of
+# what happens. That wording is read during a *forget* request, the one moment
+# a user is owed an accurate answer about whether their data is recoverable.
+# (`memory_update` really does keep history, via supersession chains, so its
+# description's claim stands.)
 MEMORY_DELETE_DESCRIPTION = (
     "Remove a memory the user asks you to forget, that is obsolete (merely changed → "
-    "use memory_update), or that was saved in error. Soft delete; history is kept."
+    "use memory_update), or that was saved in error. Permanent and not recoverable."
 )
 
 MEMORY_LIST_DESCRIPTION = (

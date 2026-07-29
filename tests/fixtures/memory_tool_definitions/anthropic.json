@@ -108,7 +108,7 @@
     },
     {
       "name": "memory_search",
-      "description": "Recall stored memories. Search memory before searching files or asking the user — a past session may already hold the answer — and before memory_save to avoid duplicates.",
+      "description": "Recall stored memories. Search memory before searching files or asking the user \u2014 a past session may already hold the answer \u2014 and before memory_save to avoid duplicates.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -170,7 +170,7 @@
     },
     {
       "name": "memory_delete",
-      "description": "Remove a memory the user asks you to forget, that is obsolete (merely changed → use memory_update), or that was saved in error. Soft delete; history is kept.",
+      "description": "Remove a memory the user asks you to forget, that is obsolete (merely changed \u2192 use memory_update), or that was saved in error. Permanent and not recoverable.",
       "input_schema": {
         "type": "object",
         "properties": {
