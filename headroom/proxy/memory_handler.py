@@ -1152,15 +1152,16 @@ memory_update / memory_delete.
         backend returned fewer rows than were asked for — i.e. the listing is
         provably complete and a prefix that is absent from ``ids`` is absent
         from the store. Returns ``None`` when the backend exposes no usable
-        listing API at all, which is different from "the user has no memories"
-        and must not be reported as "that memory does not exist".
+        authoritative listing API at all, which is different from "the user
+        has no memories" and must not be reported as "that memory does not
+        exist". Semantic search is deliberately not a listing: it may filter
+        or cap results without saying so, so it cannot prove alias uniqueness.
         """
         results: Any = None
         supported = False
         for attr, kwargs in (
             ("get_user_memories", {"user_id": user_id, "limit": limit}),
             ("list_memories", {"user_id": user_id, "limit": limit}),
-            ("search_memories", {"query": "", "user_id": user_id, "top_k": limit}),
         ):
             fn = getattr(backend, attr, None)
             if not callable(fn):

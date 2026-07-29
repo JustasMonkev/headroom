@@ -27,8 +27,8 @@ from headroom import paths as _paths
 from headroom._subprocess import run
 from headroom.config import (
     MIN_CLAUDE_FEATURE_VERSION,
-    MIN_GPT_FEATURE_VERSION,
     model_supports_gated_features,
+    parse_model_family_version,
 )
 from headroom.proxy import (
     diagnostic_decode_policy,
@@ -3102,26 +3102,24 @@ def inject_tool_search_deferral(
 #     ``function`` (non-core) and ``mcp`` tools and keep OTHER typed/hosted tools
 #     (web_search, file_search, code_interpreter, computer, image_generation, and
 #     the search tool itself) resident.
-#   * Model-gated: only recent GPT models support it; older ones 400 on the
-#     fields. Uses the shared cutoff (MIN_GPT_FEATURE_VERSION, gpt >= 5.5).
+#   * Model-gated: only GPT 5.4+ supports it; older models 400 on the fields.
 #   * No ``cache_control`` (OpenAI caches automatically), so no breakpoint move.
 # ---------------------------------------------------------------------------
 
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-# Version-gated on the shared model-feature cutoff so every model-specific
-# optimization engages at the same generation; overridable per deployment via a
-# regex in HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name)
-# so new model families can be enabled without a code edit + release.
-_OPENAI_TOOL_SEARCH_MIN_VERSION = MIN_GPT_FEATURE_VERSION
+# Overridable per deployment via a regex in HEADROOM_OPENAI_TOOL_SEARCH_MODELS
+# (matched against the model name) so new model families can be enabled without
+# a code edit + release.
+_OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
 
 
 def _model_supports_openai_tool_search(model: str | None) -> bool:
     """True when an OpenAI model supports the Responses ``tool_search`` feature.
 
-    Default gate: ``gpt-<major>.<minor>`` >= ``MIN_GPT_FEATURE_VERSION`` (5.5),
-    so ``gpt-5`` through ``gpt-5.4`` are below it. A regex in
+    Default gate: ``gpt-<major>.<minor>`` >= 5.4, so earlier GPT-5 models are
+    below it. A regex in
     ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (matched against the model name) wins
     when set; a malformed pattern falls back to the version gate rather than
     crashing. Fail-closed on an unparseable model id.
@@ -3131,7 +3129,8 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     override = _openai_model_override_verdict(model)
     if override is not None:
         return override
-    return model_supports_gated_features(model, family="gpt")
+    parsed = parse_model_family_version(model)
+    return bool(parsed and parsed[0] == "gpt" and parsed[1] >= _OPENAI_TOOL_SEARCH_MIN_VERSION)
 
 
 def _openai_model_override_verdict(model: str | None) -> bool | None:
@@ -3202,7 +3201,7 @@ def openai_tool_search_enabled(model: str | None, *, first_party_target: bool = 
 
     The OpenAI analogue of :func:`anthropic_tool_search_enabled`, with one
     deliberate difference: the MODEL gate is never bypassed. ``tool_search`` /
-    ``defer_loading`` are hard 400s on pre-5.5 Responses models, and unlike the
+    ``defer_loading`` are hard 400s on pre-5.4 Responses models, and unlike the
     Anthropic path this one already ships a dedicated model escape hatch
     (``HEADROOM_OPENAI_TOOL_SEARCH_MODELS``) for ids newer than this code — so
     ``HEADROOM_TOOL_SEARCH=1`` overrides the *upstream* gate, not the model one.

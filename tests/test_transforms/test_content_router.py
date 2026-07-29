@@ -1236,7 +1236,17 @@ class TestExcludeTools:
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
         # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep outputs)
-        for tool in ("Read", "Glob", "Grep", "Write", "Edit"):
+        for tool in (
+            "Read",
+            "ReadFile",
+            "read_file",
+            "NotebookRead",
+            "notebook_read",
+            "Glob",
+            "Grep",
+            "Write",
+            "Edit",
+        ):
             assert tool in DEFAULT_EXCLUDE_TOOLS, f"{tool} should be in DEFAULT_EXCLUDE_TOOLS"
             assert tool.lower() in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool.lower()} should be in DEFAULT_EXCLUDE_TOOLS"

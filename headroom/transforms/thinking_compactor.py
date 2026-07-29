@@ -3,10 +3,9 @@
 On recent Claude models, prior-turn thinking is re-sent as input and **billed**
 (verified live: opus-4-6 +995 tok/block, sonnet-4-6 +688; older models strip it
 server-side, so this transform is a no-op there — gate on model generation at
-the call site). This is a model-specific optimization, so it only engages at or
-above ``MIN_CLAUDE_FEATURE_VERSION`` (see :mod:`headroom.config`); older Claude
-models still go through the proxy and still get ordinary compression. Two
-findings dictate the mechanism:
+the call site). This is a model-specific optimization, so it only engages on
+Claude 4.6+; older Claude models still go through the proxy and still get
+ordinary compression. Two findings dictate the mechanism:
 
 1. **Editing a thinking block in place is futile** — Anthropic pins the original
    via the block ``signature`` and re-expands it server-side, ignoring whatever
@@ -37,7 +36,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
-from headroom.config import model_supports_gated_features
+from headroom.config import parse_model_family_version
 
 log = logging.getLogger(__name__)
 
@@ -51,22 +50,22 @@ _CACHE_CAP = 8192
 # Prefix on the emitted text block so the compaction is legible to the model
 # (and greppable in logs). Kept short; the token cost is negligible vs the block.
 _MARKER = "[prior reasoning, compressed]"
+_THINKING_COMPACTION_MIN_VERSION = (4, 6)
 
 
 def bills_prior_thinking(model: str) -> bool:
     """True if ``model`` re-bills prior-turn thinking as input (so compaction pays).
 
-    Gated on :data:`headroom.config.MIN_CLAUDE_FEATURE_VERSION` (Claude >= 4.8),
-    like every other model-specific optimization. Recent Claude models keep
-    prior-turn thinking in context and bill it (verified live: opus-4-6 and
-    sonnet-4-6 bill); older ones (sonnet-4-5, haiku-4-5, 3.x) strip it
-    server-side. **Conservative / fail-closed** — returns False unless the model
-    parses as a Claude at or above the cutoff, because compacting on a stripping
-    model would turn free (stripped) thinking into billed text. A false negative
-    costs only missed savings; a false positive costs real tokens. Models below
-    the cutoff keep working, they just skip this transform.
+    Claude 4.6+ keeps prior-turn thinking in context and bills it (verified
+    live: opus-4-6 and sonnet-4-6 bill); older models (sonnet-4-5, haiku-4-5,
+    3.x) strip it server-side. **Conservative / fail-closed** — returns False
+    unless the model parses as Claude 4.6 or newer, because compacting on a
+    stripping model would turn free (stripped) thinking into billed text. A
+    false negative costs only missed savings; a false positive costs real
+    tokens. Models below the cutoff keep working, they just skip this transform.
     """
-    return model_supports_gated_features(model, family="claude")
+    parsed = parse_model_family_version(model)
+    return bool(parsed and parsed[0] == "claude" and parsed[1] >= _THINKING_COMPACTION_MIN_VERSION)
 
 
 def _memo_compact(text: str, kompress: Any) -> str | None:
@@ -385,11 +384,11 @@ def _demo() -> None:
     assert out3[3]["content"][0]["type"] == "text", "keep_last_turns=0 compacts all"
     assert stats3["turns_compacted"] == 2, stats3
 
-    # model gate: Claude >= MIN_CLAUDE_FEATURE_VERSION (4.8) compacts; below it we skip
+    # model gate: Claude >= 4.6 compacts; below it we skip
     assert bills_prior_thinking("claude-opus-4-8")
     assert bills_prior_thinking("claude-sonnet-5")
-    assert not bills_prior_thinking("claude-opus-4-6")
-    assert not bills_prior_thinking("claude-sonnet-4-6")
+    assert bills_prior_thinking("claude-opus-4-6")
+    assert bills_prior_thinking("claude-sonnet-4-6")
     assert not bills_prior_thinking("claude-sonnet-4-5-20250929")
     assert not bills_prior_thinking("claude-haiku-4-5-20251001")
     assert not bills_prior_thinking("claude-3-5-sonnet-20241022")

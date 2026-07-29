@@ -190,6 +190,29 @@ def test_structured_prompts_collapse_legacy_and_current_blocks() -> None:
     assert body["system"] == [{"type": "text", "text": steering_text(4)}]
 
 
+def test_structured_prompt_moves_cache_control_off_removed_duplicate() -> None:
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    body = {
+        "system": [
+            {"type": "text", "text": _LEGACY_BLOCK},
+            {
+                "type": "text",
+                "text": steering_text(1),
+                "cache_control": cache_control,
+            },
+        ]
+    }
+
+    assert apply_verbosity_steering(body, 4) is True
+    assert body["system"] == [
+        {
+            "type": "text",
+            "text": steering_text(4),
+            "cache_control": cache_control,
+        }
+    ]
+
+
 def test_structured_prompt_collapses_multiple_blocks_in_one_part() -> None:
     body = {
         "system": [

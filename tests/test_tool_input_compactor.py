@@ -884,7 +884,7 @@ def test_read_only_git_subcommands_stay_compactable(command: str) -> None:
     [
         # `patch` as a CLI subcommand: the word is followed by a resource type,
         # not by `-`/`<`.
-        "kubectl patch deployment app --patch '{\"spec\": {\"replicas\": 3}}'",
+        'kubectl patch deployment app --patch \'{"spec": {"replicas": 3}}\'',
         "oc patch svc web -p '{}'",
         "kubectl apply --patch-file overlay.yaml",
         # ...and the classic forms still match.
@@ -923,3 +923,75 @@ def test_patch_and_package_mutations_are_detected(command: str) -> None:
 )
 def test_patch_lookalikes_and_queries_stay_compactable(command: str) -> None:
     assert is_mutating_tool_input("Bash", command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "kubectl apply -f -",
+        "kubectl --context prod -n api create configmap settings --from-file app.env",
+        'kubectl --context "$CTX" apply -f -',
+        "kubectl replace -f deployment.yaml",
+        "kubectl scale deployment api --replicas=3",
+        "kubectl rollout restart deployment/api",
+        "oc delete route app",
+        "helm upgrade --install app ./chart",
+        'helm --kube-context "$CTX" upgrade app ./chart',
+        "helm uninstall app",
+        'curl -X POST https://api.example.test/items -d \'{"name":"x"}\'',
+        "curl --request=PUT https://api.example.test/items/1 --data-binary @item.json",
+        'curl -XPATCH https://api.example.test/items/1 --json \'{"name":"y"}\'',
+        "curl -X DELETE https://api.example.test/items/1",
+        "curl https://api.example.test/items --data-urlencode name=x",
+        "curl -F artifact=@build.tgz https://api.example.test/upload",
+        "curl -T build.tgz https://api.example.test/upload",
+    ],
+)
+def test_remote_mutating_shell_commands_are_detected(command: str) -> None:
+    assert is_mutating_tool_input("Bash", json.dumps({"command": command})) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "kubectl get pods",
+        "kubectl describe deployment api",
+        "kubectl logs deployment/api",
+        "kubectl diff -f deployment.yaml",
+        "helm list",
+        "helm status app",
+        "helm template app ./chart",
+        "curl https://api.example.test/items",
+        "curl -I https://api.example.test/items",
+        "curl -X GET https://api.example.test/items",
+        "curl -d q=headroom -X GET https://api.example.test/search",
+        "curl --request HEAD https://api.example.test/items",
+        "curl -G https://api.example.test/search --data-urlencode q=headroom",
+    ],
+)
+def test_remote_read_commands_stay_compactable(command: str) -> None:
+    assert is_mutating_tool_input("Bash", json.dumps({"command": command})) is False
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        json.dumps(
+            {
+                "command": "kubectl apply -f -",
+                "stdin": "apiVersion: v1\nkind: ConfigMap\ndata:\n  body: " + "x" * 2000,
+            }
+        ),
+        json.dumps(
+            {
+                "command": "curl -X POST https://api.example.test/items -d '" + "x" * 2000 + "'",
+            }
+        ),
+    ],
+)
+def test_remote_mutation_payload_is_never_compacted(args: str) -> None:
+    store = _FakeStore()
+    result = ToolInputCompactor(_cfg(), compression_store=store).apply(_openai_call("Bash", args))
+    assert result.compacted_count == 0
+    assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == args
+    assert store.stored == []

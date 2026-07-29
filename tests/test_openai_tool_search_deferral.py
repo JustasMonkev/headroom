@@ -1,10 +1,9 @@
-"""Server-side Tool Search deferral for OpenAI Responses (gpt-5.5+).
+"""Server-side Tool Search deferral for OpenAI Responses (gpt-5.4+).
 
 The OpenAI-side analogue of the Anthropic path (issue #746): mark non-core
 function / MCP tools ``defer_loading: true`` and inject ``{"type": "tool_search"}``
 so OpenAI keeps their heavy parameter schemas out of the model's context until
-searched. Gated on the shared model-feature cutoff
-(``MIN_GPT_FEATURE_VERSION`` = gpt 5.5); older models 400 on the fields, and
+searched. Gated specifically at GPT 5.4; older models 400 on the fields, and
 they keep working through the proxy with ordinary compression instead.
 """
 
@@ -16,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from headroom.config import model_supports_gated_features
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.helpers import (
     _model_supports_openai_tool_search,
@@ -49,7 +49,15 @@ def _tools() -> list[dict]:
 
 @pytest.mark.parametrize(
     "model",
-    ["gpt-5.5", "gpt-5.5-codex", "gpt-5.5-2026-02-01", "gpt-6", "gpt-6.2", "openai/gpt-5.5"],
+    [
+        "gpt-5.4",
+        "gpt-5.4-codex",
+        "gpt-5.4-2026-02-01",
+        "gpt-5.5",
+        "gpt-6",
+        "gpt-6.2",
+        "openai/gpt-5.4",
+    ],
 )
 def test_model_supported(model):
     assert _model_supports_openai_tool_search(model) is True
@@ -62,8 +70,6 @@ def test_model_supported(model):
         "gpt-4.1",
         "gpt-5",
         "gpt-5.3",
-        "gpt-5.4",
-        "gpt-5.4-2026-02-01",
         "o3",
         "",
         None,
@@ -81,7 +87,13 @@ def test_env_override_wins_then_falls_back(monkeypatch):
     # a malformed regex must not crash — fall back to the version gate.
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
     assert _model_supports_openai_tool_search("gpt-5.5") is True
-    assert _model_supports_openai_tool_search("gpt-5.4") is False
+    assert _model_supports_openai_tool_search("gpt-5.4") is True
+    assert _model_supports_openai_tool_search("gpt-5.3") is False
+
+
+def test_tool_search_cutoff_does_not_weaken_the_shared_gpt_gate():
+    assert _model_supports_openai_tool_search("gpt-5.4") is True
+    assert model_supports_gated_features("gpt-5.4", family="gpt") is False
 
 
 # --- deferral behavior -------------------------------------------------------
@@ -232,9 +244,9 @@ def test_auto_injection_requires_a_first_party_target():
 
 def test_injection_noops_on_a_custom_gateway_but_fires_first_party():
     tools = _tools()
-    assert inject_tool_search_deferral_openai(tools, "openai/gpt-5.5", first_party_target=False) is (
-        tools
-    )
+    assert inject_tool_search_deferral_openai(
+        tools, "openai/gpt-5.5", first_party_target=False
+    ) is (tools)
     out = inject_tool_search_deferral_openai(tools, "openai/gpt-5.5", first_party_target=True)
     assert out is not tools
     assert out[0] == {"type": "tool_search"}
@@ -257,7 +269,7 @@ def test_model_regex_override_also_opts_a_gateway_in(monkeypatch):
 
 
 def test_force_on_never_widens_the_model_gate(monkeypatch):
-    """`tool_search`/`defer_loading` are hard 400s on pre-5.5 Responses models.
+    """`tool_search`/`defer_loading` are hard 400s on pre-5.4 Responses models.
 
     HEADROOM_TOOL_SEARCH=1 asserts *upstream* support, not model support — the
     model escape hatch is HEADROOM_OPENAI_TOOL_SEARCH_MODELS. Savings profiles
@@ -320,7 +332,7 @@ _TS_TRANSFORM = "openai:responses:tool_search_deferral"
 def _payload() -> dict:
     return {
         "type": "response.create",
-        "model": "openai/gpt-5.5",
+        "model": "openai/gpt-5.4",
         "tools": _tools(),
         "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
@@ -331,7 +343,7 @@ def _payload() -> dict:
 def _transforms_for(upstream: str | None) -> list[str]:
     kwargs = {} if upstream is None else {"upstream_base_url": upstream}
     _working, _mod, _saved, transforms, *_rest = _Harness()._compress_openai_responses_payload(
-        _payload(), model="openai/gpt-5.5", request_id="hr_ts_gate", **kwargs
+        _payload(), model="openai/gpt-5.4", request_id="hr_ts_gate", **kwargs
     )
     return list(transforms)
 
@@ -346,7 +358,7 @@ def test_handler_injects_when_no_override_is_given():
 
 
 def test_handler_skips_injection_for_a_custom_gateway_upstream():
-    """The regression: `x-headroom-base-url` → gateway + `openai/gpt-5.5`.
+    """The regression: `x-headroom-base-url` → gateway + `openai/gpt-5.4`.
 
     The shared model parser accepts the vendor-prefixed id the old anchored
     regex rejected, so without the target gate the handler injects
@@ -387,10 +399,11 @@ def test_malformed_model_override_still_falls_back_to_the_version_gate(monkeypat
     """Falling back is the documented behaviour and must not regress.
 
     On a first-party target the malformed pattern is ignored and the version
-    gate decides — admitting 5.5+ and still refusing older models.
+    gate decides — admitting 5.4+ and still refusing older models.
     """
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "gpt-5.5[")
     assert openai_tool_search_enabled("gpt-5.5", first_party_target=True) is True
     assert openai_tool_search_enabled("gpt-4o", first_party_target=True) is False
     assert _model_supports_openai_tool_search("gpt-5.5") is True
-    assert _model_supports_openai_tool_search("gpt-5.4") is False
+    assert _model_supports_openai_tool_search("gpt-5.4") is True
+    assert _model_supports_openai_tool_search("gpt-5.3") is False

@@ -1851,6 +1851,7 @@ class OpenAIHandlerMixin:
                         )
                     continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
+                    tool_name = function_name_by_call_id.get(call_id, "")
                     if call_id in verbatim_excluded_call_ids:
                         if debug_enabled:
                             extraction_debug.append(
@@ -1872,6 +1873,7 @@ class OpenAIHandlerMixin:
                     # individually using ("output_part", index) slots to preserve the
                     # array structure (non-text parts like images are left untouched).
                     raw_output = item.get("output")
+                    folded = False
                     if isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
                             if (
@@ -1880,15 +1882,21 @@ class OpenAIHandlerMixin:
                                 and isinstance(part.get("text"), str)
                             ):
                                 part_text = part["text"]
-                                pf = router._lossless_compact_excluded(part_text)
+                                pf = router._lossless_compact_excluded(part_text, tool_name)
                                 if pf is not None:
+                                    folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
                     else:
                         excl_out = _responses_part_text(raw_output)
-                        fold = router._lossless_compact_excluded(excl_out) if excl_out else None
+                        fold = (
+                            router._lossless_compact_excluded(excl_out, tool_name)
+                            if excl_out
+                            else None
+                        )
                         if fold is not None:
+                            folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
@@ -1897,7 +1905,7 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": (
                                     "exclude_tools_lossless_fold"
-                                    if fold is not None
+                                    if folded
                                     else "exclude_tools_protected"
                                 ),
                                 "item_type": item_type,

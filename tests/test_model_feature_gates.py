@@ -3,14 +3,15 @@
 Headroom's ordinary compression runs on every model. A handful of transforms
 are different: they exploit provider behaviour that only exists on recent
 frontier models (server-side tool search, native output controls, prior-turn
-thinking being re-billed as input). Those engage only at or above
-``MIN_CLAUDE_FEATURE_VERSION`` / ``MIN_GPT_FEATURE_VERSION``.
+thinking being re-billed as input). The shared conservative cutoffs are
+``MIN_CLAUDE_FEATURE_VERSION`` / ``MIN_GPT_FEATURE_VERSION``; features with
+verified earlier support keep narrower thresholds.
 
 Two properties are load-bearing and pinned here:
 
-* **One definition.** Every gate routes through
-  :func:`model_supports_gated_features`, so raising a cutoff is a one-line
-  change and no call site can drift.
+* **Feature-specific definitions.** Anthropic tool search and OpenAI native
+  output controls use the shared cutoffs. Thinking compaction starts at Claude
+  4.6, and OpenAI tool search starts at GPT 5.4.
 * **Fail closed.** An unrecognized or unparseable model id must NOT get the
   gated features. Firing one where the provider doesn't support it costs real
   tokens (compacting thinking a pre-cutoff model would have stripped for free)
@@ -175,8 +176,7 @@ def test_family_restriction_blocks_cross_vendor_ids() -> None:
     assert model_supports_gated_features("claude-sonnet-5", family="gpt") is False
 
 
-def test_every_gate_agrees_with_the_shared_predicate() -> None:
-    """No gate may re-derive its own threshold."""
+def test_each_gate_uses_its_feature_cutoff() -> None:
     from headroom.proxy.helpers import (
         _model_supports_anthropic_tool_search,
         _model_supports_openai_tool_search,
@@ -187,13 +187,16 @@ def test_every_gate_agrees_with_the_shared_predicate() -> None:
     for model, expected in GATE_TABLE:
         if not isinstance(model, str):
             continue
-        claude = expected and model_supports_gated_features(model, family="claude")
-        gpt = expected and model_supports_gated_features(model, family="gpt")
-        assert bills_prior_thinking(model) is bool(claude), model
-        assert _model_supports_anthropic_tool_search(model) is bool(claude), model
-        assert _model_supports_openai_tool_search(model) is bool(gpt), model
+        parsed = parse_model_family_version(model)
+        claude_shared = expected and model_supports_gated_features(model, family="claude")
+        gpt_shared = expected and model_supports_gated_features(model, family="gpt")
+        thinking = bool(parsed and parsed[0] == "claude" and parsed[1] >= (4, 6))
+        openai_tool_search = bool(parsed and parsed[0] == "gpt" and parsed[1] >= (5, 4))
+        assert bills_prior_thinking(model) is thinking, model
+        assert _model_supports_anthropic_tool_search(model) is bool(claude_shared), model
+        assert _model_supports_openai_tool_search(model) is openai_tool_search, model
         # first_party_target isolates the MODEL axis; the upstream axis is
         # ANDed on top and is covered in tests/test_output_effort_policy.py.
-        assert (
-            can_create_openai_text_verbosity(model, first_party_target=True) is bool(gpt)
+        assert can_create_openai_text_verbosity(model, first_party_target=True) is bool(
+            gpt_shared
         ), model

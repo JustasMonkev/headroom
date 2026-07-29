@@ -476,6 +476,24 @@ def test_backend_without_a_listing_api_reports_that_it_cannot_resolve() -> None:
         asyncio.run(handler._resolve_memory_alias(backend, "u", f"{MEMORY_ALIAS_PREFIX}a1b2c3d4"))
 
 
+def test_semantic_search_is_not_used_to_prove_alias_uniqueness() -> None:
+    """A short semantic result is not proof that every colliding ID was seen."""
+
+    class _SearchOnly:
+        async def search_memories(self, **kwargs: Any) -> list[_Result]:
+            return [_Result(memory=_Memory(id=UUID_A, content="visible match"))]
+
+    handler = _handler(_fresh_backend())
+    with pytest.raises(MemoryAliasError, match="cannot list"):
+        asyncio.run(
+            handler._resolve_memory_alias(
+                _SearchOnly(),
+                "u",
+                handler._alias_for_memory(UUID_A),
+            )
+        )
+
+
 # ---------------------------------------------------------------------------
 # Exact backend-side prefix lookup
 # ---------------------------------------------------------------------------

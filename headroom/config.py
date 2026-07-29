@@ -35,11 +35,10 @@ DEFAULT_MODEL_CONTEXT_LIMITS: dict[str, int] = {}
 # thinking being re-billed as input). Firing those on an older model is not
 # merely a missed saving — it can cost tokens or 400 the request.
 #
-# These two constants are the SINGLE definition of "recent enough". Every
-# model-specific optimization routes its version predicate through
-# :func:`model_supports_gated_features` below; do not re-derive a threshold at
-# a call site. Older models keep working through the proxy and keep getting
-# ordinary compression — they just don't get the gated features.
+# These are the shared conservative cutoffs. Features with verified earlier
+# support keep their own threshold while reusing :func:`parse_model_family_version`.
+# Older models keep working through the proxy and keep getting ordinary
+# compression — they just don't get unsupported gated features.
 MIN_CLAUDE_FEATURE_VERSION: tuple[int, int] = (4, 8)
 MIN_GPT_FEATURE_VERSION: tuple[int, int] = (5, 5)
 
@@ -166,11 +165,11 @@ def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | N
 def model_supports_gated_features(model: object, *, family: str | None = None) -> bool:
     """True when ``model`` is new enough for Headroom's model-specific features.
 
-    The cutoffs are :data:`MIN_CLAUDE_FEATURE_VERSION` and
-    :data:`MIN_GPT_FEATURE_VERSION`. Applied strictly by version number — there
-    are no per-model carve-outs, so e.g. ``claude-haiku-4-5`` and
-    ``claude-sonnet-4-6`` are below the Claude cutoff and ``gpt-5.4`` is below
-    the GPT cutoff.
+    The shared cutoffs are :data:`MIN_CLAUDE_FEATURE_VERSION` and
+    :data:`MIN_GPT_FEATURE_VERSION`. Applied strictly by version number, so
+    ``claude-sonnet-4-6`` and ``gpt-5.4`` remain below these conservative
+    defaults. Features with verified earlier support use
+    :func:`parse_model_family_version` with their own cutoff.
 
     ``family`` optionally restricts the answer to one family (``"claude"`` or
     ``"gpt"``) so a provider-specific gate can't be opened by a model id from
@@ -381,6 +380,12 @@ class AnchorConfig:
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
+        "ReadFile",
+        "readfile",
+        "read_file",
+        "NotebookRead",
+        "notebookread",
+        "notebook_read",
         "Glob",
         "Grep",
         "Write",

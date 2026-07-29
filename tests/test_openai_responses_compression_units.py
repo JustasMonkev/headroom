@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from types import MethodType, SimpleNamespace
 
+import pytest
+
 from headroom.proxy.handlers import openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.transforms.compression_units import UnitCompressionResult
@@ -764,7 +766,45 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
     assert search_fold_recovers(folded[0]["text"], grep_out)
 
 
-def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_parts_with_non_text():
+@pytest.mark.parametrize("tool_name", ["Read", "read_file", "mcp_my_fs_read_file"])
+@pytest.mark.parametrize("content_parts", [False, True])
+def test_openai_responses_adapter_keeps_small_reads_byte_identical(tool_name, content_parts):
+    router = ContentRouter()
+    handler = _handler_with_router(router)
+    output = (
+        '{\n  "path": "src/app.py",\n  "content": "literal bytes for a later edit",\n  "line": 1\n}'
+    )
+    assert 80 <= len(output) < 200
+    assert router._lossless_compact_excluded(output) is not None
+    rendered_output = [{"type": "output_text", "text": output}] if content_parts else output
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": tool_name, "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": rendered_output,
+            },
+        ],
+    }
+
+    new_payload, modified, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id="req_small_read",
+    )
+
+    assert modified is False
+    assert new_payload == payload
+    actual = new_payload["input"][1]["output"]
+    actual = actual[0]["text"] if content_parts else actual
+    assert actual.encode() == output.encode()
+
+
+def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_parts_with_non_text(
+    monkeypatch,
+):
     """Excluded tool output with content-part array preserves non-text parts.
 
     When output is a content-part array that includes non-text parts (images,
@@ -773,6 +813,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_
     """
     from headroom.transforms.lossless_compaction import search_fold_recovers
 
+    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *_a, **_k: None)
     router = ContentRouter()
     router.config.exclude_tools = {"grep"}
     handler = _handler_with_router(router)

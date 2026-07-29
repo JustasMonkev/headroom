@@ -2421,9 +2421,8 @@ class AnthropicHandlerMixin:
                 )
 
             # F2: prior-turn thinking compaction (HEADROOM_THINKING_COMPACT,
-            # off by default). On recent Claude models (>= the shared
-            # MIN_CLAUDE_FEATURE_VERSION cutoff) prior-turn `thinking` blocks
-            # are re-sent AND re-billed as input (~688 tok/block on sonnet-4-6,
+            # off by default). On Claude 4.6+ prior-turn `thinking` blocks are
+            # re-sent AND re-billed as input (~688 tok/block on sonnet-4-6,
             # ~995 on opus-4-6). Editing a thinking block in place is futile —
             # Anthropic re-expands it from the signature — so the only way to
             # shrink it is to convert it to a signature-free `text` block

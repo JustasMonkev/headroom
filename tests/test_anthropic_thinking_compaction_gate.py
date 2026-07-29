@@ -5,9 +5,8 @@ from the Anthropic handler, but only when BOTH hold:
 
   * `bills_prior_thinking(model)` — older Claude strips prior thinking
     server-side, so compacting there would turn free tokens into billed text.
-    Gated on the shared model-feature cutoff (`MIN_CLAUDE_FEATURE_VERSION` =
-    Claude 4.8); models below it still proxy and still get ordinary
-    compression, they just skip this transform.
+    Gated specifically at Claude 4.6; models below it still proxy and still get
+    ordinary compression, they just skip this transform.
   * `HEADROOM_THINKING_COMPACT` — the transform is LOSSY (signed reasoning
     becomes a generated summary). The billing predicate establishes that
     compaction *could* pay, not that the user accepted a lossy transform.
@@ -20,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from headroom.config import model_supports_gated_features
 from headroom.proxy.handlers import anthropic as anthropic_handler
 from headroom.transforms.thinking_compactor import (
     bills_prior_thinking,
@@ -99,18 +99,23 @@ def test_thinking_compaction_is_offloaded_to_the_bounded_compression_executor() 
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "model",
-    ["claude-opus-4-8", "claude-sonnet-5", "anthropic/claude-opus-4-8", "claude-opus-5-20260301"],
+    [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "anthropic/claude-opus-4-6",
+        "claude-opus-5-20260301",
+    ],
 )
-def test_billing_gate_open_at_or_above_the_feature_cutoff(model: str) -> None:
+def test_billing_gate_open_at_or_above_claude_4_6(model: str) -> None:
     assert bills_prior_thinking(model) is True
 
 
 @pytest.mark.parametrize(
     "model",
     [
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-7",
         "claude-sonnet-4-5-20250929",
         "claude-haiku-4-5-20251001",
         "claude-3-5-sonnet-20241022",
@@ -125,9 +130,14 @@ def test_billing_gate_open_at_or_above_the_feature_cutoff(model: str) -> None:
         "not-a-model",
     ],
 )
-def test_billing_gate_closed_below_the_feature_cutoff(model: str) -> None:
+def test_billing_gate_closed_below_claude_4_6(model: str) -> None:
     """Fail closed: compacting where thinking is stripped would BILL free tokens."""
     assert bills_prior_thinking(model) is False
+
+
+def test_thinking_cutoff_does_not_weaken_the_shared_claude_gate() -> None:
+    assert bills_prior_thinking("claude-sonnet-4-6") is True
+    assert model_supports_gated_features("claude-sonnet-4-6", family="claude") is False
 
 
 # --------------------------------------------------------------------------

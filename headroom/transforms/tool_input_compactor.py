@@ -238,6 +238,24 @@ _PKG_MUTATION_RE = re.compile(
     r"(?:install|add|remove|uninstall|publish|upgrade|update)\b"
 )
 
+#: Remote mutations whose terse result does not preserve the applied payload.
+#: The bounded character gap admits quoted/global options
+#: (``kubectl --context "$CTX" apply``) without scanning an unbounded command tail.
+_DEPLOYMENT_MUTATION_RE = re.compile(
+    r"\b(?:kubectl|oc)\b[^\r\n]{0,512}?\b"
+    r"(?:apply|create|delete|edit|replace|patch|scale|annotate|label|taint|"
+    r"cordon|uncordon|drain|set|autoscale|expose|run|rollout\s+(?:restart|undo))\b"
+    r"|\bhelm\b[^\r\n]{0,512}?\b(?:install|upgrade|uninstall|rollback)\b"
+)
+_CURL_METHOD_RE = re.compile(r"(?:^|\s)(?:-X|--request)(?:[=\s]*)([A-Za-z]+)\b")
+_CURL_GET_RE = re.compile(r"(?:^|\s)(?:-G|--get)\b")
+_CURL_PAYLOAD_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"-d|--data(?:-ascii|-binary|-raw|-urlencode)?|--json|"
+    r"-F|--form(?:-string)?|-T|--upload-file"
+    r")(?:[=\s]|(?=[^-]))"
+)
+
 _WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("tee",), _TEE_RE),
     (
@@ -293,6 +311,29 @@ _WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
 )
 
 
+def _has_remote_mutation(text: str) -> bool:
+    """Deployment commands and HTTP requests that write remote state."""
+    if ("kubectl" in text or "oc" in text or "helm" in text) and _DEPLOYMENT_MUTATION_RE.search(
+        text
+    ):
+        return True
+    if "curl" not in text:
+        return False
+    for segment in _SHELL_SEGMENT_RE.split(text):
+        curl = re.search(r"\bcurl\b", segment)
+        if curl is None:
+            continue
+        tail = segment[curl.end() :]
+        methods = _CURL_METHOD_RE.findall(tail)
+        if methods:
+            if methods[-1].upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                return True
+            continue
+        if not _CURL_GET_RE.search(tail) and _CURL_PAYLOAD_RE.search(tail):
+            return True
+    return False
+
+
 def _has_write_redirect(text: str) -> bool:
     """``> path`` / ``>> path`` write redirection.
 
@@ -331,10 +372,12 @@ def _has_inplace_edit(text: str) -> bool:
 
 
 def _has_shell_mutation(text: str) -> bool:
-    """Shell write-redirection / in-place edit / destructive file ops."""
+    """Local or remote shell mutations whose arguments must remain durable."""
     if ">" in text and _has_write_redirect(text):
         return True
     if _has_inplace_edit(text):
+        return True
+    if _has_remote_mutation(text):
         return True
     for literals, pattern in _WORD_MUTATION_PROBES:
         for literal in literals:
