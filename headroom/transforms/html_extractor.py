@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import trafilatura
 from trafilatura.settings import use_config
@@ -31,6 +31,14 @@ _MD_LINK_TARGET_RE = re.compile(r"\]\((?P<target>[^()\s]*)\)")
 
 # Query parameters that exist for the *referrer's* analytics and are ignored by
 # the resource itself. `utm_*` is handled by prefix, not by listing every one.
+#
+# This list is deliberately restricted to *opaque vendor click identifiers* —
+# keys whose value is a vendor-minted blob that cannot address a resource. Keys
+# that merely look like tracking but that a destination can legitimately give
+# meaning to (`ref_url`, which some sites use as the real redirect target;
+# `spm`; the generic three-letter `trk`) were removed after the PR #16 review:
+# extraction output is not recoverable, so a link we break stays broken. When
+# in doubt, the parameter stays.
 _TRACKING_PARAMS = frozenset(
     {
         "gclid",
@@ -46,16 +54,118 @@ _TRACKING_PARAMS = frozenset(
         "_ga",
         "_gl",
         "ref_src",
-        "ref_url",
         "s_kwcid",
-        "spm",
-        "trk",
-        "trkcampaign",
         "vero_conv",
         "vero_id",
         "wickedid",
     }
 )
+
+# ---------------------------------------------------------------------------
+# Signed-query detection.
+#
+# A signed URL carries a MAC computed over the *original query bytes*. Removing
+# a parameter — or merely re-encoding the query, which is why this module no
+# longer round-trips through `parse_qsl`/`urlencode` — invalidates it, and the
+# working URL cannot be recovered from the extracted text. So: if any key in
+# the query hints at a signature, credential or expiry, the whole query is left
+# byte-for-byte alone, tracking parameters included.
+#
+# Over-matching here costs a few bytes of saving; under-matching costs the user
+# a dead download link. The bias is intentional.
+# ---------------------------------------------------------------------------
+_SIGNED_QUERY_KEYS = frozenset(
+    {
+        "sig",
+        "sign",
+        "signed",
+        "hash",
+        "md5",
+        "sha1",
+        "sha256",
+        "mac",
+        "policy",
+        "key",
+        "apikey",
+        "api_key",
+        "auth",
+        "jwt",
+        "verify",
+        "awsaccesskeyid",
+        "key-pair-id",
+        "keypairid",
+    }
+)
+_SIGNED_QUERY_SUBSTRINGS = (
+    "signature",
+    "hmac",
+    "token",
+    "expire",
+    "secret",
+    "credential",
+    "nonce",
+    "checksum",
+    "digest",
+)
+# Vendor-namespaced signing parameters (S3, GCS, Azure, OSS, COS, OBS).
+_SIGNED_QUERY_PREFIXES = ("x-amz-", "x-goog-", "x-ms-", "x-oss-", "x-obs-", "x-cos-")
+
+
+def _is_signed_query_key(lowered_key: str) -> bool:
+    """True if ``lowered_key`` suggests the query is signed / credentialed."""
+    if lowered_key in _SIGNED_QUERY_KEYS:
+        return True
+    if lowered_key.startswith(_SIGNED_QUERY_PREFIXES):
+        return True
+    return any(hint in lowered_key for hint in _SIGNED_QUERY_SUBSTRINGS)
+
+
+def _strip_tracking_params(url: str) -> str:
+    """Drop known tracking parameters, preserving every other byte verbatim.
+
+    The kept parameters are re-emitted as the *original substrings* of the
+    query, never re-encoded: `?a=%2Fx` stays `?a=%2Fx` rather than becoming
+    `?a=%252Fx` or `?a=/x`, and separators are untouched. The only edit this
+    function can make is deleting whole `key=value` segments.
+
+    Returns ``url`` unchanged whenever anything about the query is uncertain:
+    a signed/credentialed key anywhere, a legacy `;` separator, a valueless
+    segment (which could itself be a signature blob), an empty segment, or
+    simply nothing to drop.
+    """
+    head, sep, rest = url.partition("?")
+    if not sep or "#" in head:
+        # No query, or the `?` we found lives inside a fragment.
+        return url
+
+    query, frag_sep, fragment = rest.partition("#")
+    if not query:
+        return url
+
+    kept: list[str] = []
+    dropped = False
+    for segment in query.split("&"):
+        if not segment or ";" in segment:
+            return url
+        raw_key, eq, _value = segment.partition("=")
+        if not eq:
+            return url
+        lowered = raw_key.lower()
+        if _is_signed_query_key(lowered):
+            return url
+        if lowered in _TRACKING_PARAMS or lowered.startswith("utm_"):
+            dropped = True
+            continue
+        kept.append(segment)
+
+    if not dropped:
+        return url
+
+    new_query = "&".join(kept)
+    if new_query:
+        return f"{head}?{new_query}{frag_sep}{fragment}"
+    return f"{head}{frag_sep}{fragment}"
+
 
 # Suppress trafilatura's internal parse-error noise (e.g. "parsed tree length: 0")
 # which appears at WARNING level on every document that fails to extract content.
@@ -242,6 +352,12 @@ class HTMLExtractor:
           `https://docs.example.com/a/b` under `https://docs.example.com/x`
           becomes `/a/b`. The origin is still recoverable from the page URL.
 
+        Both edits are *conservative by construction* (PR #16 review): every
+        byte we do not intend to delete is preserved exactly, the query is
+        never re-encoded, a query that looks signed or otherwise uncertain is
+        left completely alone, and origin folding is skipped whenever it could
+        change which host the link points at.
+
         A URL that would end up empty, or that has no query and no matching
         origin, is left exactly as it was. Non-HTTP schemes (`mailto:`,
         `#anchor`, relative paths) are never touched.
@@ -274,21 +390,29 @@ class HTMLExtractor:
             parts = urlsplit(target)
         except ValueError:
             return target
+        if not parts.netloc:
+            return target
 
-        query = parts.query
-        if self.config.strip_tracking_params and query:
-            kept = [
-                (k, v)
-                for k, v in parse_qsl(query, keep_blank_values=True)
-                if k.lower() not in _TRACKING_PARAMS and not k.lower().startswith("utm_")
-            ]
-            query = urlencode(kept)
+        # Edits are string surgery on the original target, never a
+        # `urlsplit`/`urlunsplit` round-trip: re-encoding bytes we did not
+        # intend to change is exactly how a signed URL gets broken.
+        rebuilt = target
+        if self.config.strip_tracking_params and parts.query:
+            rebuilt = _strip_tracking_params(rebuilt)
 
-        rebuilt = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
-        if origin and rebuilt.startswith(origin + "/"):
-            rebuilt = rebuilt[len(origin) :]
-        elif origin and rebuilt == origin:
-            rebuilt = "/"
+        if origin:
+            if rebuilt.startswith(origin + "/"):
+                remainder = rebuilt[len(origin) :]
+                # A path that itself begins with `//` must keep its origin:
+                # `https://example.com//cdn.example.net/f` folded to
+                # `//cdn.example.net/f` is read by Markdown clients as
+                # scheme-relative, i.e. a *different host*. Same-origin
+                # folding must never be able to repoint a link.
+                if not remainder.startswith("//"):
+                    rebuilt = remainder
+            elif rebuilt == origin:
+                rebuilt = "/"
+
         # Never emit an empty target: a bare `]()` is a broken link, which is
         # strictly worse than the bytes it saves.
         return rebuilt or target

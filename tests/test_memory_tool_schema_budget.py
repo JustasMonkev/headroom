@@ -22,12 +22,15 @@ These tests pin what the shrink must not break:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from headroom.memory.tools import (
+    EXTRACTED_ENTITY_ITEM_SCHEMA,
+    EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
     MEMORY_SEARCH_DESCRIPTION,
     MEMORY_TOOLS,
     MEMORY_TOOLS_OPTIMIZED,
@@ -47,6 +50,20 @@ from headroom.proxy.memory_tool_adapter import (
 #   ANTHROPIC_CUSTOM_TOOLS  3,774 chars /   922 tok -> 3,093 chars /   778 tok
 #   OPENAI_TOOLS            2,959 chars /   742 tok -> 3,221 chars /   813 tok
 #   GEMINI_TOOLS            2,225 chars /   534 tok -> 2,734 chars /   672 tok
+#
+# The PR #16 review then required the nested item schemas on
+# ``extracted_entities`` / ``extracted_relationships`` to come back (see the
+# "Graph pre-extraction arrays" section below — free-form objects there mean a
+# partial save plus a duplicating retry). That costs part of the A1 win back on
+# the three variants that carry those fields:
+#
+#   MEMORY_TOOLS_OPTIMIZED   3,923 chars /  984 tok -> 4,170 chars / 1,050 tok
+#   ANTHROPIC_CUSTOM_TOOLS   3,093 chars /  778 tok -> 3,340 chars /   844 tok
+#   OPENAI_TOOLS             3,221 chars /  813 tok -> 3,468 chars /   879 tok
+#
+# i.e. +66 tok on the schema the proxy actually injects (MEMORY_TOOLS_OPTIMIZED,
+# still 55% below the 2,356 tok it started at). Not corrupting a user's memory
+# store is worth 66 tokens a request.
 #
 # (The adapter's OpenAI/Gemini variants grew slightly: they used to carry
 # one-line descriptions with no usage guidance at all, and now share the same
@@ -146,6 +163,105 @@ def test_required_params_unchanged(tools: list[dict[str, Any]]) -> None:
         "new_content",
     }
     assert _params(_by_name(tools, "memory_delete"))["required"] == ["memory_id"]
+
+
+# ---------------------------------------------------------------------------
+# Graph pre-extraction arrays (PR #16 review, P2)
+#
+# ``DirectMem0Adapter._save_optimized`` writes the facts to Qdrant FIRST and
+# only then calls ``_write_graph_to_neo4j``, which indexes ``e["entity"]``,
+# ``e["entity_type"]``, ``rel["source"]``, ``rel["relationship"]`` and
+# ``rel["destination"]`` unconditionally. A schema that permits an entity
+# object without ``entity_type`` therefore permits a tool call that raises
+# KeyError *after* a partial save — and the model's natural retry duplicates
+# the memories it already stored. The nested item schemas are the only thing
+# stopping the provider from emitting such a call, so they are load-bearing,
+# not decoration, and must not be collapsed back to ``{"type": "object"}``.
+# ---------------------------------------------------------------------------
+
+_GRAPH_ARRAY_REQUIRED = {
+    "extracted_entities": {"entity", "entity_type"},
+    "extracted_relationships": {"source", "relationship", "destination"},
+}
+
+GRAPH_VARIANTS = pytest.mark.parametrize(
+    "tools",
+    [MEMORY_TOOLS_OPTIMIZED, ANTHROPIC_CUSTOM_TOOLS, OPENAI_TOOLS],
+    ids=["optimized", "anthropic", "openai"],
+)
+
+
+@GRAPH_VARIANTS
+def test_graph_arrays_constrain_their_item_objects(tools: list[dict[str, Any]]) -> None:
+    props = _params(_by_name(tools, "memory_save"))["properties"]
+    for field, required in _GRAPH_ARRAY_REQUIRED.items():
+        assert field in props, f"{field} missing"
+        item = props[field]["items"]
+        assert item != {"type": "object"}, (
+            f"{field} items are free-form again — the direct backend indexes "
+            "these keys after it has already persisted the facts, so a missing "
+            "key is a partial save plus a duplicating retry."
+        )
+        assert set(item["required"]) == required
+        assert set(item["properties"]) == required
+        assert all(p["type"] == "string" for p in item["properties"].values())
+
+
+@GRAPH_VARIANTS
+def test_graph_item_schemas_are_shared_objects(tools: list[dict[str, Any]]) -> None:
+    """Every provider variant points at the same schema object, so the
+    constraint cannot be restored in one place and dropped in another."""
+    props = _params(_by_name(tools, "memory_save"))["properties"]
+    assert props["extracted_entities"]["items"] is EXTRACTED_ENTITY_ITEM_SCHEMA
+    assert props["extracted_relationships"]["items"] is EXTRACTED_RELATIONSHIP_ITEM_SCHEMA
+
+
+def test_required_keys_match_what_the_graph_writer_indexes() -> None:
+    """Derive the constraint from the code that would crash without it.
+
+    If ``_write_graph_to_neo4j`` starts indexing another key unconditionally,
+    this fails rather than waiting for a production partial save.
+    """
+    src = Path("headroom/memory/backends/direct_mem0.py").read_text(encoding="utf-8")
+    start = src.index("async def _write_graph_to_neo4j")
+    end = src.index("\n    async def ", start + 1)
+    body = src[start:end]
+
+    entity_keys = set(re.findall(r'\be\["([a-z_]+)"\]', body))
+    rel_keys = set(re.findall(r'\brel\["([a-z_]+)"\]', body))
+
+    assert entity_keys, "graph writer no longer indexes entity dicts as e[...]"
+    assert entity_keys <= set(EXTRACTED_ENTITY_ITEM_SCHEMA["required"])
+    assert rel_keys, "graph writer no longer indexes relationship dicts as rel[...]"
+    assert rel_keys <= set(EXTRACTED_RELATIONSHIP_ITEM_SCHEMA["required"])
+
+
+@GRAPH_VARIANTS
+def test_partial_graph_object_is_schema_invalid(tools: list[dict[str, Any]]) -> None:
+    """The exact call shape Codex described — facts plus an entity missing
+    ``entity_type`` — must not validate."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _params(_by_name(tools, "memory_save"))
+
+    good = {
+        "content": "User works at Acme",
+        "importance": 0.6,
+        "facts": ["User works at Acme"],
+        "extracted_entities": [{"entity": "Acme", "entity_type": "organization"}],
+        "extracted_relationships": [
+            {"source": "user", "relationship": "works_at", "destination": "Acme"}
+        ],
+    }
+    jsonschema.validate(good, schema)
+
+    for bad in (
+        {**good, "extracted_entities": [{"entity": "Acme"}]},
+        {**good, "extracted_entities": [{"entity_type": "organization"}]},
+        {**good, "extracted_relationships": [{"source": "user", "destination": "Acme"}]},
+        {**good, "extracted_relationships": [{"relationship": "works_at"}]},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(bad, schema)
 
 
 @ALL_VARIANTS

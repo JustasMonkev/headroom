@@ -137,6 +137,44 @@ def _is_trivial(line: str) -> bool:
     }
 
 
+def _escape_anchor(text: str) -> str:
+    """Make an anchor unambiguous inside the ``[...]``-delimited pointer.
+
+    The pointer is closed by a literal ``]``, so an anchor that CONTAINS one —
+    ``values[index] = result``, an entirely ordinary line of code, or any JSON /
+    array-subscript payload — would otherwise be indistinguishable from the
+    terminator. A reader (or the documented pointer regex, which stops at the
+    first unescaped ``]``) would recover only ``values[index``, so the anchor no
+    longer names the line it points at and the "lossless in-context reference"
+    promise breaks.
+
+    This used to be masked by the ``{anchor!r}`` quoting that wrapped the anchor
+    in ``repr()`` quotes; removing that quoting (a token win) exposed it.
+
+    Backslash-escape both ``]`` and ``\\`` itself — escaping only ``]`` would
+    make a trailing backslash ambiguous with an escape introducer. Costs one
+    character per occurrence and nothing at all for the overwhelmingly common
+    bracket-free anchor. :func:`_unescape_anchor` is the exact inverse.
+    """
+    return text.replace("\\", "\\\\").replace("]", "\\]")
+
+
+def _unescape_anchor(text: str) -> str:
+    """Inverse of :func:`_escape_anchor` — used by the recovery path."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _pointer(span: list[str], ref_turn: int, delta: int = 0) -> str:
     """A one-line, obviously-a-reference marker naming the in-context original.
 
@@ -161,9 +199,15 @@ def _pointer(span: list[str], ref_turn: int, delta: int = 0) -> str:
     # that fragment its tokenization (and doubled up whenever the anchor itself
     # contained a quote). The leading ``[`` plus ``L same as msg`` already make
     # the line unmistakably a marker.
+    #
+    # The anchor is escaped (see `_escape_anchor`): the pointer is closed by a
+    # literal ``]``, so an anchor containing one must not be able to terminate
+    # it early. Truncation happens on the RAW text so the visible budget is
+    # unchanged; escaping is applied after.
     anchor = next((_num_and_key(ln)[2].strip() for ln in span if ln.strip()), "")
     if len(anchor) > 20:
         anchor = anchor[:17] + "..."
+    anchor = _escape_anchor(anchor)
     if delta:
         return f"[{len(span)}L same as msg {ref_turn} {delta:+d}L: {anchor}]"
     return f"[{len(span)}L same as msg {ref_turn}: {anchor}]"

@@ -25,6 +25,19 @@ the backend. These tests pin the properties that make that safe:
 4. Full IDs pass through untouched.
 5. Two rows in the same block that would share an alias both fall back to
    their full IDs, so what we render is never ambiguous.
+
+The PR #16 review then found that resolution enumerated only a bounded
+10,000-row slice, so a recalled memory outside that slice could be aliased but
+never addressed — and, worse, a lone match *inside* a truncated slice was
+treated as unique when a second match could be sitting past the cut. The last
+two sections pin the repaired behaviour:
+
+6. A memory past the first page still resolves (the scan escalates until the
+   listing is provably exhausted).
+7. Anything short of proof — a listing that never exhausts, a backend that
+   cannot list at all — raises instead of guessing.
+8. A backend that can answer the prefix question itself short-circuits the
+   enumeration entirely.
 """
 
 from __future__ import annotations
@@ -36,6 +49,7 @@ from typing import Any
 
 import pytest
 
+from headroom.proxy import memory_handler
 from headroom.proxy.memory_handler import (
     MEMORY_ALIAS_PREFIX,
     MemoryAliasError,
@@ -338,3 +352,153 @@ def test_alias_row_ids_handles_missing_ids() -> None:
         "?",
         f"{MEMORY_ALIAS_PREFIX}f9e8d7c6",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Reach: resolution must not be capped at a bounded slice (PR #16 review, P2)
+# ---------------------------------------------------------------------------
+
+
+class _PagedBackend(_Backend):
+    """Backend whose listing honours ``limit`` and records what was asked."""
+
+    def __init__(self, memories: list[_Memory]) -> None:
+        super().__init__(memories)
+        self.limits: list[int] = []
+
+    async def get_user_memories(self, user_id: str, limit: int = 100) -> list[_Memory]:
+        self.limits.append(limit)
+        return list(self.memories[:limit])
+
+
+def _many(count: int, target_index: int, target_id: str) -> list[_Memory]:
+    memories = [
+        _Memory(id=f"{i:08x}-0000-4000-8000-{i:012d}", content=f"m{i}") for i in range(count)
+    ]
+    memories[target_index] = _Memory(id=target_id, content="the recalled one")
+    return memories
+
+
+def test_alias_resolves_for_a_memory_beyond_the_first_page() -> None:
+    """THE regression test for the review finding.
+
+    Passive recall can surface (and therefore alias) any stored memory. When
+    the record sits past the old hard-capped 10,000-row lookup slice, update /
+    delete used to report "no memory matches" for an alias the model had just
+    been shown. The scan now escalates until the listing is exhausted.
+    """
+    target = "beef1234-9999-4fff-8fff-999999999999"
+    backend = _PagedBackend(_many(12_001, 12_000, target))
+    handler = _handler(backend)
+    alias = handler._alias_for_memory(target)
+
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", alias)) == target
+    # It had to look past the first page to get there.
+    assert backend.limits[0] == 10_000
+    assert max(backend.limits) > 10_000
+
+
+def test_ordinary_store_is_listed_exactly_once() -> None:
+    """Escalation must not cost a second round-trip in the normal case: a
+    listing shorter than the page size has already proven itself complete."""
+    backend = _PagedBackend(_fresh_backend().memories)
+    handler = _handler(backend)
+    asyncio.run(handler._resolve_memory_alias(backend, "u", handler._alias_for_memory(UUID_A)))
+    assert backend.limits == [10_000]
+
+
+def test_delete_reaches_a_memory_beyond_the_first_page() -> None:
+    """End to end: the advertised ``[id]`` is actually usable."""
+    target = "beef1234-9999-4fff-8fff-999999999999"
+    backend = _PagedBackend(_many(12_001, 12_000, target))
+    handler = _handler(backend)
+
+    raw = asyncio.run(
+        handler._execute_delete({"memory_id": handler._alias_for_memory(target)}, "u")
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "deleted"
+    assert payload["memory_id"] == target
+    assert backend.deleted == [target]
+
+
+def test_single_match_in_a_truncated_listing_is_never_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The safety property, restated for the capped case.
+
+    A listing that keeps returning exactly as many rows as were asked for is
+    not proof of anything: a second memory sharing the prefix could be sitting
+    just past the cut. Resolving the single visible match would mutate a
+    guessed record, so resolution must fail instead.
+    """
+    monkeypatch.setattr(memory_handler, "MEMORY_ALIAS_PAGE_LIMIT", 4)
+    monkeypatch.setattr(memory_handler, "MEMORY_ALIAS_MAX_LOOKUP", 16)
+
+    class _AlwaysTruncating(_Backend):
+        async def get_user_memories(self, user_id: str, limit: int = 100) -> list[_Memory]:
+            # Always "full": never proves it returned everything.
+            return [_Memory(id=UUID_A, content="visible")] + [
+                _Memory(id=f"{i:08x}-1111-4111-8111-{i:012d}", content="filler")
+                for i in range(limit - 1)
+            ]
+
+    backend = _AlwaysTruncating([])
+    handler = _handler(backend)
+    with pytest.raises(MemoryAliasError, match="cannot be proven"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", handler._alias_for_memory(UUID_A)))
+
+
+def test_backend_without_a_listing_api_reports_that_it_cannot_resolve() -> None:
+    """A backend that cannot enumerate must not be reported as "deleted"."""
+
+    class _Opaque:
+        async def delete_memory(self, memory_id: str) -> bool:
+            raise AssertionError("must not be reached")
+
+    handler = _handler(_fresh_backend())
+    backend = _Opaque()
+    with pytest.raises(MemoryAliasError, match="cannot"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", f"{MEMORY_ALIAS_PREFIX}a1b2c3d4"))
+
+
+# ---------------------------------------------------------------------------
+# Exact backend-side prefix lookup
+# ---------------------------------------------------------------------------
+
+
+class _PrefixCapableBackend(_Backend):
+    """Backend that answers the prefix question itself — no enumeration."""
+
+    def __init__(self, memories: list[_Memory]) -> None:
+        super().__init__(memories)
+        self.enumerated = False
+
+    async def get_memory_ids_by_prefix(self, prefix: str, user_id: str) -> list[_Memory]:
+        return [m for m in self.memories if m.id.startswith(prefix)]
+
+    async def get_user_memories(self, user_id: str, limit: int = 100) -> list[_Memory]:
+        self.enumerated = True
+        return []
+
+
+def test_backend_prefix_hook_short_circuits_enumeration() -> None:
+    backend = _PrefixCapableBackend(_fresh_backend().memories)
+    handler = _handler(backend)
+    alias = handler._alias_for_memory(UUID_B)
+
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", alias)) == UUID_B
+    assert backend.enumerated is False
+
+
+def test_backend_prefix_hook_still_fails_loudly_on_ambiguity() -> None:
+    backend = _PrefixCapableBackend(
+        [
+            _Memory(id="dupprefix-1111-4aaa-8bbb-000000000001", content="one"),
+            _Memory(id="dupprefix-2222-4ccc-8ddd-000000000002", content="two"),
+        ]
+    )
+    handler = _handler(backend)
+    alias = handler._alias_for_memory("dupprefix-1111-4aaa-8bbb-000000000001")
+    with pytest.raises(MemoryAliasError, match="ambiguous"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", alias))

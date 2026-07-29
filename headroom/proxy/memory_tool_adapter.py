@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from headroom.memory.tools import (
+    EXTRACTED_ENTITY_ITEM_SCHEMA,
+    EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
     MEMORY_DELETE_DESCRIPTION,
     MEMORY_ID_PARAM_DESCRIPTION,
     MEMORY_SAVE_DESCRIPTION,
@@ -107,13 +109,13 @@ ANTHROPIC_CUSTOM_TOOLS: list[dict[str, Any]] = [
                 },
                 "extracted_entities": {
                     "type": "array",
-                    "items": {"type": "object"},
-                    "description": "Typed entities as {entity, entity_type} objects.",
+                    "items": EXTRACTED_ENTITY_ITEM_SCHEMA,
+                    "description": "Typed entities for graph storage.",
                 },
                 "extracted_relationships": {
                     "type": "array",
-                    "items": {"type": "object"},
-                    "description": "Graph links as {source, relationship, destination} objects.",
+                    "items": EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
+                    "description": "Graph links between entities.",
                 },
             },
             "required": ["content", "importance"],
@@ -229,13 +231,13 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
                     },
                     "extracted_entities": {
                         "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Typed entities as {entity, entity_type} objects.",
+                        "items": EXTRACTED_ENTITY_ITEM_SCHEMA,
+                        "description": "Typed entities for graph storage.",
                     },
                     "extracted_relationships": {
                         "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Graph links as {source, relationship, destination} objects.",
+                        "items": EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
+                        "description": "Graph links between entities.",
                     },
                 },
                 "required": ["content", "importance"],

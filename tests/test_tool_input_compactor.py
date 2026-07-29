@@ -303,6 +303,42 @@ def test_shell_redirection_input_is_never_compacted():
     assert result.compacted_count == 0
 
 
+def test_quoted_redirection_target_is_never_compacted():
+    """Codex (marked outdated, verified still broken): the redirection target's
+    character class rejected the quote/escape that immediately follows `>`.
+
+    The arguments are a serialized JSON string, so `> "$file"` arrives as
+    `> \\"$file\\"`. Both the raw and the JSON-escaped spelling must classify
+    as mutating — otherwise a `printf … > "$file"` write is replaced by an
+    expiring CCR marker whose only companion is an empty shell result.
+    """
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    for command in (
+        'printf "%s" "$body" > "$file"',
+        "echo hi > 'output.txt'",
+        'cmd >> "output file"',
+    ):
+        assert is_mutating_tool_input("Bash", command) is True, f"raw: {command}"
+        assert is_mutating_tool_input("Bash", json.dumps({"command": command})) is True, command
+
+    cmd = 'printf "%s" "' + "x" * 2000 + '" > "$out_file"'
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Bash", json.dumps({"command": cmd}))
+    )
+    assert result.compacted_count == 0
+
+
+def test_touch_style_file_mutation_is_never_compacted():
+    """Codex P2: creating/linking/truncating a path is a mutation even when the
+    command produces no output at all."""
+    cmd = "touch " + " ".join(f"pkg{i}/__init__.py" for i in range(200))
+    result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
+        _openai_call("Bash", json.dumps({"command": cmd}))
+    )
+    assert result.compacted_count == 0
+
+
 def test_read_only_shell_input_is_still_compacted():
     cmd = "rg -n 'def handler' " + " ".join(f"pkg{i}" for i in range(300))
     result = ToolInputCompactor(_cfg(), compression_store=_FakeStore()).apply(
@@ -374,6 +410,33 @@ def test_unknown_mcp_write_verbs_are_treated_as_mutating():
         assert is_mutating_tool_input(name, "{}") is True, name
 
 
+def test_single_underscore_mcp_write_verbs_are_treated_as_mutating():
+    """Codex P2: `mcp_server_tool` (single underscore) must be judged too.
+
+    Anthropic-speaking clients emit the MCP wrapper as `mcp_github_create_file`
+    rather than `mcp__github__create_file` (see `config._tool_name_aliases` and
+    `proxy.tool_name_policy.normalize_headroom_tool_name`). Without leaf
+    extraction the whole name normalizes to `mcpgithubcreatefile`, which starts
+    with neither a denylisted name nor a mutating verb — so a write whose
+    arguments contain only paths and file contents (no shell/SQL syntax to fall
+    back on) was compactable, and the expiring CCR marker would leave a bare
+    "success" result as the only record.
+    """
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    for name in (
+        "mcp_github_create_or_update_file",  # leaf itself contains underscores
+        "mcp_fs_write_file",
+        "mcp_notion_update_page",
+        "mcp_linear_create_issue",
+        "mcp_github_push_files",
+        "mcp_slack_post_message",
+        "mcp_github_delete_file",
+        "MCP_GitHub_Create_Or_Update_File",  # casing is not significant
+    ):
+        assert is_mutating_tool_input(name, '{"path":"a.py","content":"x"}') is True, name
+
+
 def test_read_only_mcp_tools_are_still_compactable():
     from headroom.transforms.tool_input_compactor import is_mutating_tool_input
 
@@ -381,6 +444,11 @@ def test_read_only_mcp_tools_are_still_compactable():
         "mcp__github__get_file_contents",
         "mcp__github__search_code",
         "mcp__linear__list_issues",
+        # The single-underscore spelling must not become a blanket "mutating":
+        # the leaf-candidate expansion is conservative, not indiscriminate.
+        "mcp_github_get_file_contents",
+        "mcp_github_search_code",
+        "mcp_linear_list_issues",
         "Grep",
         "Read",
         "WebFetch",
@@ -403,6 +471,27 @@ MUTATING_COMMANDS = [
     "printf x >/tmp/f",
     "make 2> build.log",
     "ls | tee listing.txt",
+    # Quoted redirection targets (Codex, "outdated" finding — it was NOT fixed).
+    # Note these are json.dumps()-ed by the test, so the quotes reach the
+    # classifier escaped, exactly as they do in real serialized arguments.
+    'printf "%s" "$body" > "$file"',
+    "echo hi > 'output.txt'",
+    'cmd >> "output file"',
+    'cat a.py >"b.py"',
+    "echo x >| clobbered.txt",
+    # touch-style mutations: create / link / truncate / metadata (Codex P2)
+    "touch /tmp/newfile",
+    "install -m 755 build/app /usr/local/bin/app",
+    "mkfifo /tmp/pipe",
+    "mknod /tmp/dev c 1 3",
+    "unlink stale.lock",
+    "shred -u secret.pem",
+    "chgrp staff report.txt",
+    "chattr +i locked.conf",
+    "rsync -a src/ dst/",
+    "setfacl -m u:me:rw f",
+    "patch -p1 < fix.diff",
+    "patch < fix.diff",
     # in-place edits
     "sed -i s/a/b/ f.py",
     "sed --regexp-extended -i 's/a/b/' f.py",
@@ -445,6 +534,11 @@ NON_MUTATING_COMMANDS = [
     "git status --porcelain",
     "npm ls --depth 0",
     "find . -name '*.py' -newer f",
+    # The touch-family additions are word+separator anchored, so merely naming
+    # one of the commands in a search pattern stays compactable.
+    "grep -rn 'touch' docs/",
+    "rg 'patch' src/",
+    "ls -l installers/",
 ]
 
 
@@ -555,3 +649,7 @@ def test_hostile_blob_still_detects_a_trailing_mutation() -> None:
     assert is_mutating_tool_input("Bash", padding + " ; echo x > out.txt") is True
     assert is_mutating_tool_input("Bash", padding + " ; sed -i s/a/b/ f.py") is True
     assert is_mutating_tool_input("Bash", padding + " ; DROP TABLE t") is True
+    # Shapes added for the Codex P2 findings must be caught after padding too.
+    assert is_mutating_tool_input("Bash", padding + ' ; echo x > "$out"') is True
+    assert is_mutating_tool_input("Bash", padding + " ; touch marker") is True
+    assert is_mutating_tool_input("Bash", padding + " ; mkfifo p") is True

@@ -1883,12 +1883,29 @@ def _open_router_request_scope(router: Any) -> None:
     task's context, every ``apply()`` replaces this router's slot wholesale, and
     leaving it in place keeps the routing decisions inspectable after
     ``apply()`` returns (tests and the savings reporter rely on that).
+
+    The outer map is COPIED and re-``set()`` rather than mutated in place. A
+    context is propagated by SHALLOW copy (``copy_context()``, and therefore
+    ``asyncio.to_thread`` / ``loop.run_in_executor`` / ``Task``), so a caller
+    that already has a scope open — e.g. a direct ``apply()`` on the event-loop
+    context followed by two concurrent ``asyncio.to_thread(router.apply, ...)``
+    calls — hands BOTH workers the same dict object. Mutating it would let the
+    second worker's slot assignment replace the first worker's still-in-use
+    entry, putting the first request back on the second's target ratio,
+    tool-args map and read protection: exactly the cross-request bleed the
+    request scope exists to prevent. Copy-then-``set`` gives every scope opening
+    a private outer map, so the two workers can never observe each other.
     """
-    scope = _REQUEST_SCOPE.get(None)
-    if scope is None or len(scope) > _REQUEST_SCOPE_MAX_ROUTERS:
-        scope = {}
-        _REQUEST_SCOPE.set(scope)
+    inherited = _REQUEST_SCOPE.get(None)
+    if inherited is None or len(inherited) > _REQUEST_SCOPE_MAX_ROUTERS:
+        scope: dict[int, tuple[weakref.ref[Any], dict[str, Any]]] = {}
+    else:
+        # Drop entries whose owning router has been collected while copying, so
+        # a long-lived context can't accumulate dead slots (and can't hand a
+        # recycled ``id()`` a stale store).
+        scope = {rid: entry for rid, entry in inherited.items() if entry[0]() is not None}
     scope[id(router)] = (weakref.ref(router), {})
+    _REQUEST_SCOPE.set(scope)
 
 
 class ContentRouter(Transform):

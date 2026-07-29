@@ -3458,10 +3458,22 @@ class OpenAIHandlerMixin:
             # `detected_hashes` is empty, the sticky injection is skipped, and
             # the stored original is unreachable. Merge in the hashes the
             # pipeline reported minting (order-stable, de-duplicated).
-            from headroom.transforms.tool_input_compactor import merge_pipeline_ccr_hashes
+            #
+            # `pipeline_ccr_hashes` alone only covers markers minted THIS run.
+            # A conversation that already carries a compacted tool input and
+            # then reaches a new worker / restarted process mints nothing (the
+            # compactor skips `_ccr` as idempotent) and has an empty session
+            # tracker, so the marker in the transcript would never register.
+            # Scanning the forwarded tool arguments makes the decision depend
+            # on what is actually being sent, not on process-local state.
+            from headroom.transforms.tool_input_compactor import (
+                ccr_hashes_in_tool_arguments,
+                merge_pipeline_ccr_hashes,
+            )
 
             _detected_hashes = merge_pipeline_ccr_hashes(
-                injector.detected_hashes, pipeline_ccr_hashes
+                injector.detected_hashes,
+                [*pipeline_ccr_hashes, *ccr_hashes_in_tool_arguments(optimized_messages)],
             )
             if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
                 optimized_messages = injector.inject_into_system_message(optimized_messages)

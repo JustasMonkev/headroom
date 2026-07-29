@@ -73,8 +73,44 @@ _ENTITIES_DESCRIPTION = "Entity names referenced."
 _RELATIONSHIPS_DESCRIPTION = "Entity links as {source, relation, target} objects."
 _QUERY_DESCRIPTION = "What you are looking for."
 _FACTS_DESCRIPTION = "Pre-extracted self-contained facts."
-_EXTRACTED_ENTITIES_DESCRIPTION = "Typed entities as {entity, entity_type} objects."
-_EXTRACTED_RELATIONSHIPS_DESCRIPTION = "Graph links as {source, relationship, destination} objects."
+_EXTRACTED_ENTITIES_DESCRIPTION = "Typed entities for graph storage."
+_EXTRACTED_RELATIONSHIPS_DESCRIPTION = "Graph links between entities."
+
+# ---------------------------------------------------------------------------
+# Item schemas for the two pre-extraction arrays that reach the graph writer.
+#
+# These are NOT decoration and must not be collapsed to a bare
+# ``{"type": "object"}`` to save tokens (PR #16 review). ``DirectMem0Adapter
+# ._write_graph_to_neo4j`` indexes ``e["entity"]`` / ``e["entity_type"]`` and
+# ``rel["source"]`` / ``rel["relationship"]`` / ``rel["destination"]``
+# unconditionally, and it runs *after* ``_write_facts_to_qdrant`` has already
+# persisted the facts. A schema-valid call missing one of those keys therefore
+# raises KeyError on top of a partial save, and the model's natural retry
+# duplicates the memories. The required-field constraints are what keep the
+# provider from ever emitting such a call.
+#
+# ``entity_type`` is intentionally left un-enumerated: the graph writer accepts
+# any string, so an enum would cost bytes on every request to constrain
+# something nothing checks.
+# ---------------------------------------------------------------------------
+EXTRACTED_ENTITY_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "entity": {"type": "string"},
+        "entity_type": {"type": "string"},
+    },
+    "required": ["entity", "entity_type"],
+}
+
+EXTRACTED_RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source": {"type": "string"},
+        "relationship": {"type": "string"},
+        "destination": {"type": "string"},
+    },
+    "required": ["source", "relationship", "destination"],
+}
 
 MEMORY_TOOLS: list[dict[str, Any]] = [
     {
@@ -257,7 +293,7 @@ MEMORY_SAVE_OPTIMIZED: dict[str, Any] = {
                 },
                 "extracted_entities": {
                     "type": "array",
-                    "items": {"type": "object"},
+                    "items": EXTRACTED_ENTITY_ITEM_SCHEMA,
                     "description": _EXTRACTED_ENTITIES_DESCRIPTION,
                 },
                 "relationships": {
@@ -267,7 +303,7 @@ MEMORY_SAVE_OPTIMIZED: dict[str, Any] = {
                 },
                 "extracted_relationships": {
                     "type": "array",
-                    "items": {"type": "object"},
+                    "items": EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
                     "description": _EXTRACTED_RELATIONSHIPS_DESCRIPTION,
                 },
                 "background": {

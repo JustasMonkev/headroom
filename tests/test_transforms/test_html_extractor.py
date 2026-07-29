@@ -646,9 +646,7 @@ class TestURLSlimming:
 
     def test_slimming_can_be_turned_off(self):
         e = HTMLExtractor(
-            HTMLExtractorConfig(
-                strip_tracking_params=False, relativize_same_origin_links=False
-            )
+            HTMLExtractorConfig(strip_tracking_params=False, relativize_same_origin_links=False)
         )
         text = "[x](https://a.example/p?utm_source=news)"
         assert e._slim_urls(text, "https://a.example/q") == text
@@ -667,3 +665,119 @@ class TestURLSlimming:
         if "](" in result.extracted:  # trafilatura kept the link
             assert "utm_source" not in result.extracted
             assert "/guide" in result.extracted
+
+
+class TestURLSlimmingIsConservative:
+    """PR #16 review: slimming must never be able to break a link.
+
+    The router forwards only the *extracted* text and never keeps the original
+    HTML in CCR, so a URL this transform breaks is permanently broken. Two
+    hazards the first cut had:
+
+    (a) it rebuilt the whole query through ``parse_qsl``/``urlencode``, which
+        re-encodes bytes even when no parameter is dropped — enough on its own
+        to invalidate a signature computed over the original query string;
+    (b) it dropped tracking-*looking* keys (`ref_url`, `spm`) that some
+        destinations give real meaning to.
+
+    Plus a third, in the origin fold: a same-origin path that itself starts
+    with ``//`` becomes a scheme-relative URL — a *different host* — when the
+    origin is removed.
+    """
+
+    @pytest.fixture
+    def extractor(self):
+        return HTMLExtractor()
+
+    # -- (a) never re-encode bytes we did not intend to change --------------
+
+    def test_kept_params_keep_their_exact_bytes(self, extractor):
+        """`parse_qsl`/`urlencode` would rewrite `%20` to `+` and `%2B` to
+        `%252B`. Kept parameters must survive byte-for-byte."""
+        text = "[x](https://a.example/s?q=a%2Bb%20c&utm_source=news)"
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://a.example/s?q=a%2Bb%20c)"
+
+    def test_signed_query_is_left_completely_alone(self, extractor):
+        """An AWS-style presigned URL: the MAC covers the original query, so
+        even dropping an unrelated `utm_source` invalidates it."""
+        url = (
+            "https://b.example/f.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Credential=AKIA%2F20260101%2Fus-east-1%2Fs3%2Faws4_request"
+            "&X-Amz-Signature=deadbeef&utm_source=news"
+        )
+        text = f"[dl]({url})"
+        assert extractor._slim_urls(text, None) == text
+
+    @pytest.mark.parametrize(
+        "signed_pair",
+        [
+            "sig=abc123",
+            "signature=abc123",
+            "token=abc123",
+            "access_token=abc123",
+            "hmac=abc123",
+            "expires=1893456000",
+            "X-Goog-Signature=abc123",
+            "policy=eyJ0",
+        ],
+    )
+    def test_signature_shaped_keys_disable_slimming(self, extractor, signed_pair):
+        text = f"[x](https://a.example/f?{signed_pair}&utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_valueless_segment_disables_slimming(self, extractor):
+        """A bare segment can itself be a signature blob; we cannot tell."""
+        text = "[x](https://a.example/f?ZXlKMGVYQWlP&utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_legacy_semicolon_separator_disables_slimming(self, extractor):
+        text = "[x](https://a.example/f?a=1;utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_question_mark_inside_a_fragment_is_not_a_query(self, extractor):
+        text = "[x](https://a.example/p#section?utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_fragment_survives_a_dropped_param(self, extractor):
+        text = "[x](https://a.example/p?utm_source=news&a=1#frag)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?a=1#frag)"
+
+    def test_all_tracking_query_drops_the_question_mark(self, extractor):
+        text = "[x](https://a.example/p?utm_source=news)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p)"
+
+    # -- (b) tracking-looking keys the destination may actually use ---------
+
+    def test_ref_url_is_preserved(self, extractor):
+        """`ref_url` is the real destination on some redirectors; dropping it
+        turns the link into a different page."""
+        text = "[x](https://a.example/r?ref_url=https%3A%2F%2Fx.example%2Fp&utm_source=n)"
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://a.example/r?ref_url=https%3A%2F%2Fx.example%2Fp)"
+
+    def test_spm_is_preserved(self, extractor):
+        text = "[x](https://a.example/i?spm=a2h0k.1&id=9&utm_medium=cpc)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/i?spm=a2h0k.1&id=9)"
+
+    # -- unambiguous vendor click IDs still go ------------------------------
+
+    def test_opaque_click_ids_are_still_stripped(self, extractor):
+        text = "[x](https://a.example/p?gclid=Cj0KCQ&fbclid=IwAR&utm_source=n&id=7)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?id=7)"
+
+    # -- (c) same-origin `//` paths ----------------------------------------
+
+    def test_same_origin_double_slash_path_keeps_its_origin(self, extractor):
+        """`https://example.com//cdn.example.net/file` folded to
+        `//cdn.example.net/file` is read by Markdown clients as
+        `https://cdn.example.net/file` — a different host."""
+        text = "[x](https://example.com//cdn.example.net/file)"
+        out = extractor._slim_urls(text, "https://example.com/page")
+        assert out == text
+        assert "](//" not in out
+
+    def test_ordinary_same_origin_paths_still_fold(self, extractor):
+        text = "[x](https://example.com/cdn/file)"
+        out = extractor._slim_urls(text, "https://example.com/page")
+        assert out == "[x](/cdn/file)"

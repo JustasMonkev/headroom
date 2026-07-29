@@ -5,6 +5,7 @@ import re
 from headroom.transforms.cross_turn_dedup import (
     DedupBlock,
     _num_and_key,
+    _unescape_anchor,
     dedup_blocks,
     is_prefix_monotonic,
 )
@@ -14,7 +15,12 @@ from headroom.transforms.cross_turn_dedup import (
 # first-line anchor (no explicit line range; recovery locates the span by anchor).
 # No ``↑`` glyph and no quoting around the anchor: both cost tokens and neither
 # carried information (see `_pointer`).
-_FOLD_RE = re.compile(r"\[(\d+)L same as msg (\d+)(?: ([+-]\d+)L)?: ([^\]]*)\]")
+#
+# The anchor is backslash-escaped, so it terminates on the first UNESCAPED
+# ``]`` — ``(?:[^\]\\]|\\.)*``. Without that a perfectly ordinary anchor such as
+# ``values[index] = result`` would close the pointer at its own bracket and the
+# recovered anchor would read ``values[index``.
+_FOLD_RE = re.compile(r"\[(\d+)L same as msg (\d+)(?: ([+-]\d+)L)?: ((?:[^\]\\]|\\.)*)\]")
 _FOLD_MARK = "L same as msg "
 
 
@@ -52,7 +58,7 @@ def _reconstruct(orig_blocks, out_blocks):
             m = _FOLD_RE.search(line)
             if m and line.lstrip().startswith("["):
                 assert m.group(3) is None, "unexpected delta for an unnumbered span"
-                n, ref, anchor = int(m.group(1)), int(m.group(2)), m.group(4)
+                n, ref, anchor = int(m.group(1)), int(m.group(2)), _unescape_anchor(m.group(4))
                 assert ref < orig.turn, "reference must point to an EARLIER msg"
                 core = anchor[:-3] if anchor.endswith("...") else anchor
                 ref_lines = by_turn[ref]
@@ -139,6 +145,76 @@ def test_pointer_has_no_glyph_or_quoting():
     assert "↑" not in ptr
     assert "'" not in ptr and '"' not in ptr
     assert _FOLD_RE.fullmatch(ptr)
+
+
+def _bracket_span():
+    # First nonblank line is Codex's example: an entirely ordinary line of code
+    # whose own `]` sits where the pointer's terminator would be.
+    return "\n".join(
+        [
+            "values[index] = result",
+            "totals[bucket] = tally(values, index)",
+            "emit(values[index], totals[bucket])",
+        ]
+    )
+
+
+def test_bracket_in_anchor_does_not_terminate_the_pointer():
+    """A ``]`` inside the anchor must not close the ``[...]`` pointer early.
+
+    Unescaped, ``[3L same as msg 1: values[index] = r...]`` parses as an anchor
+    of ``values[index`` with ``= r...]`` trailing outside the marker — the
+    anchor stops naming the line it points at, so the "lossless in-context
+    reference" is unrecoverable. (The old ``{anchor!r}`` quoting hid this by
+    accident; removing it for tokens exposed it.)
+    """
+    span = _bracket_span()
+    blocks = [_blk(span, 1), _blk("later:\n" + span, 2)]
+    out, stats = dedup_blocks(blocks)
+
+    assert stats["spans_folded"] == 1
+    ptr = next(ln for ln in out[1].text.split("\n") if _FOLD_MARK in ln)
+    # The WHOLE line is the marker — nothing spilled out past a premature `]`.
+    m = _FOLD_RE.fullmatch(ptr)
+    assert m is not None, ptr
+    anchor = _unescape_anchor(m.group(4))
+    # …and the recovered anchor still carries the bracket it started with.
+    assert anchor.startswith("values[index]"), anchor
+    # The escape is what buys that; the raw pointer must not contain a bare `]`
+    # before its terminator.
+    assert "\\]" in ptr
+    # Still a net win despite the two escape characters.
+    assert stats["chars_removed"] > 0
+
+
+def test_bracket_anchor_round_trips():
+    """The recovery path (anchor -> original lines) survives the escaping."""
+    span = _bracket_span()
+    blocks = [_blk("head line one\n" + span, 1), _blk("later:\n" + span + "\ntail", 2)]
+    out, stats = dedup_blocks(blocks)
+    assert stats["spans_folded"] == 1
+    _reconstruct(blocks, out)
+    assert is_prefix_monotonic(blocks) is True
+
+
+def test_backslash_in_anchor_round_trips():
+    """``\\`` is escaped too, so a trailing backslash cannot pose as an escape
+    introducer for the terminator."""
+    span = "\n".join(
+        [
+            "path = C:\\repo\\pkg[0]",
+            "shutil.copy(path, dest_directory_root)",
+            "log.info(path, dest_directory_root)",
+        ]
+    )
+    blocks = [_blk(span, 1), _blk("again:\n" + span, 2)]
+    out, stats = dedup_blocks(blocks)
+    assert stats["spans_folded"] == 1
+    ptr = next(ln for ln in out[1].text.split("\n") if _FOLD_MARK in ln)
+    m = _FOLD_RE.fullmatch(ptr)
+    assert m is not None, ptr
+    assert _unescape_anchor(m.group(4)).startswith("path = C:\\repo\\pk")
+    _reconstruct(blocks, out)
 
 
 def test_trivial_repeated_lines_not_folded():

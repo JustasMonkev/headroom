@@ -24,6 +24,7 @@ from headroom.proxy.helpers import (
 from headroom.transforms.tool_input_compactor import (
     CCR_INPUT_KEY,
     ccr_hashes_from_markers,
+    ccr_hashes_in_tool_arguments,
     merge_pipeline_ccr_hashes,
 )
 
@@ -274,3 +275,216 @@ def test_a_genuine_tool_input_marker_still_reinjects_on_a_replayed_prefix(provid
     )
     assert should_inject is True
     assert is_override is True
+
+
+# ---------------------------------------------------------------------------
+# Codex P2: a REPLAYED compacted tool input must still register.
+#
+# `merge_pipeline_ccr_hashes` only covers hashes minted during the current
+# pipeline run. When a conversation that already contains a compacted
+# `tool_calls[].function.arguments` / `tool_use.input` reaches a new worker or a
+# restarted process, the compactor skips the existing `_ccr` value as idempotent
+# (nothing minted), the in-memory session tracker is empty (no sticky replay),
+# and `scan_for_markers` cannot see the marker — so the retrieval tool was never
+# injected even though the marker and its persistent CCR entry are still there.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("provider", "messages"),
+    [("anthropic", _anthropic_messages()), ("openai", _openai_messages())],
+)
+def test_existing_tool_arguments_are_scanned_for_ccr_hashes(provider: str, messages: Any) -> None:
+    assert ccr_hashes_in_tool_arguments(messages) == [HASH]
+
+
+def test_tool_argument_scan_ignores_non_ccr_content() -> None:
+    import json
+
+    from headroom.utils import create_tool_digest_marker
+
+    junk = [
+        {"role": "user", "content": f"hash={HASH}"},  # text is the scanner's job
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_x",
+                    "type": "function",
+                    "function": {
+                        "name": "Grep",
+                        "arguments": json.dumps(
+                            {
+                                "pattern": create_tool_digest_marker("0123456789ab"),
+                                "note": "stable_prefix_hash:deadbeef",
+                                "short": "Retrieve original: hash=abc",  # too short
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": f"<<ccr:{HASH}>>"}]},
+        "not-a-message",
+        {"role": "assistant", "tool_calls": [None, {"function": {"arguments": None}}]},
+    ]
+    assert ccr_hashes_in_tool_arguments(junk) == []
+
+
+def test_tool_argument_scan_reads_both_marker_spellings() -> None:
+    import json
+
+    other = "0123456789ab"
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Grep", "arguments": json.dumps({CCR_INPUT_KEY: MARKER})},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "Grep", "arguments": f'{{"blob":"<<ccr:{other},x,1>>"}}'},
+                },
+            ],
+        },
+        # De-duplicated across shapes and messages.
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "Grep", "input": {CCR_INPUT_KEY: MARKER}}
+            ],
+        },
+    ]
+    assert ccr_hashes_in_tool_arguments(messages) == [HASH, other]
+
+
+@pytest.mark.parametrize(
+    ("provider", "messages"),
+    [("anthropic", _anthropic_messages()), ("openai", _openai_messages())],
+)
+def test_replayed_compacted_input_injects_the_tool_after_a_restart(
+    provider: str, messages: Any
+) -> None:
+    """The restart case end-to-end, at the level the handlers compose it.
+
+    Nothing is minted this turn (`pipeline_ccr_hashes` empty) and the tracker is
+    fresh, so before the fix `detected` was empty and the marker in the
+    transcript stayed unredeemable.
+    """
+    injector = CCRToolInjector(
+        provider=provider, inject_tool=False, inject_system_instructions=False
+    )
+    injector.scan_for_markers(messages)
+    assert injector.detected_hashes == []
+
+    detected = merge_pipeline_ccr_hashes(
+        injector.detected_hashes,
+        [*[], *ccr_hashes_in_tool_arguments(messages)],
+    )
+    assert detected == [HASH]
+
+    has_new = has_new_ccr_markers(
+        current_detected_hashes=detected,
+        previous_forwarded_messages=None,
+        provider=provider,  # type: ignore[arg-type]
+    )
+    assert has_new is True
+
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider=provider,  # type: ignore[arg-type]
+        session_id="sess-restart",
+        request_id="req-1",
+        existing_tools=[],
+        has_compressed_content_this_turn=has_new,
+    )
+    assert injected is True
+    names = {t.get("name") or (t.get("function") or {}).get("name") for t in tools}
+    assert CCR_TOOL_NAME in names
+
+
+def test_openai_handler_injects_retrieve_tool_for_a_replayed_compacted_input() -> None:
+    """Wiring check: the OpenAI chat path itself must scan tool arguments.
+
+    Simulates the restart: the pipeline reports nothing minted (the compactor
+    skips the existing `_ccr` value as idempotent) and the process-wide session
+    CCR tracker is fresh, so the ONLY evidence that CCR is live in this
+    conversation is the marker inside `tool_calls[].function.arguments`.
+    """
+    pytest.importorskip("fastapi")
+
+    from types import SimpleNamespace
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=True,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    forwarded: dict[str, Any] = {}
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+
+        def _fake_apply(**kwargs: Any) -> Any:
+            # Nothing compacted this turn, nothing minted: the marker is
+            # historical, replayed from the client's transcript.
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=100,
+                tokens_after=100,
+                waste_signals=None,
+                markers_inserted=[],
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            forwarded["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 3, "total_tokens": 103},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [*_openai_messages(), {"role": "user", "content": "and now?"}],
+            },
+        )
+        assert response.status_code == 200
+
+    tools = forwarded["body"].get("tools") or []
+    names = {t.get("name") or (t.get("function") or {}).get("name") for t in tools}
+    assert CCR_TOOL_NAME in names, forwarded["body"].get("tools")

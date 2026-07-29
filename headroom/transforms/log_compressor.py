@@ -431,9 +431,11 @@ class LogCompressor:
             stack_traces.append(current_stack)
 
         selected: list[LogLine] = []
-        # Byte-identical dedup for errors/fails — see `_dedupe_identical`.
-        errors, suppressed = self._dedupe_identical(errors)
-        fails, fail_suppressed = self._dedupe_identical(fails)
+        # ERROR/FAIL fold on the line *and its context window* — see
+        # `_dedupe_identical_with_context`. Failure detail is never context
+        # expanded, so it folds on the plain line-level rule.
+        errors, suppressed = self._dedupe_identical_with_context(errors, log_lines)
+        fails, fail_suppressed = self._dedupe_identical_with_context(fails, log_lines)
         failure_details, detail_suppressed = self._dedupe_identical(failure_details)
         suppressed |= fail_suppressed
         suppressed |= detail_suppressed
@@ -516,6 +518,58 @@ class LogCompressor:
                 deduped.append(line)
         return deduped
 
+    def _context_window(self) -> tuple[int, int]:
+        """``(before, after)`` — the asymmetric window ``_add_context`` expands.
+
+        Shared with `_dedupe_identical_with_context`, which keys on exactly this
+        slice; the two MUST agree. Mirrors Rust `ctx_before`/`ctx_after`.
+        """
+        return (
+            -(-self.config.error_context_lines // 3),
+            -(-(2 * self.config.error_context_lines) // 3),
+        )
+
+    def _dedupe_identical_with_context(
+        self, lines: list[LogLine], all_lines: list[LogLine]
+    ) -> tuple[list[LogLine], set[int]]:
+        """Fold ERROR/FAIL entries whose line AND context window are identical.
+
+        Mirrors Rust `dedupe_identical_with_context`.
+
+        Line-level dedup is wrong for the two levels that get context expanded:
+        only the *kept* occurrence's neighbours are expanded and every later
+        occurrence is marked suppressed, so two ``ERROR request failed`` lines —
+        one followed by a database error, one by a permission error — collapsed
+        to one ``×2`` line plus the database context, silently dropping the
+        second failure's reason. Equality of the error line is not equality of
+        the failure; equality of the line *and its surroundings* is.
+
+        Truly identical repeats (a parametrized suite emitting the same error
+        with the same neighbours N times) still collapse to one ``×N`` entry.
+        """
+        before, after = self._context_window()
+        first_at: dict[str, int] = {}
+        counts: list[int] = []
+        kept: list[LogLine] = []
+        suppressed: set[int] = set()
+        for line in lines:
+            idx = line.line_number
+            lo = min(max(0, idx - before), len(all_lines))
+            hi = min(idx + after + 1, len(all_lines))
+            key = "\n".join(ln.content for ln in all_lines[lo:hi]) if lo < hi else line.content
+            pos = first_at.get(key)
+            if pos is None:
+                first_at[key] = len(kept)
+                counts.append(1)
+                kept.append(line)
+            else:
+                counts[pos] += 1
+                suppressed.add(line.line_number)
+        for line, count in zip(kept, counts, strict=True):
+            if count > 1:
+                line.content = f"{line.content} ×{count}"
+        return kept, suppressed
+
     def _dedupe_identical(self, lines: list[LogLine]) -> tuple[list[LogLine], set[int]]:
         """Fold BYTE-IDENTICAL lines: keep the first, append ``×N`` to it.
 
@@ -590,8 +644,7 @@ class LogCompressor:
         1 before / 2 after at the default ``error_context_lines = 3``.
         """
         suppressed = suppressed or set()
-        before = -(-self.config.error_context_lines // 3)
-        after = -(-(2 * self.config.error_context_lines) // 3)
+        before, after = self._context_window()
         selected_indices = {line.line_number for line in selected}
         context_indices: set[int] = set()
         for line in selected:

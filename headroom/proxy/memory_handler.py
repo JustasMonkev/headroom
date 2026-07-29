@@ -103,17 +103,35 @@ NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
 # The alias is therefore derived deterministically from the memory's own ID:
 # ``m:`` + the first 8 characters of the backend ID. Any worker, in any
 # process, resolves it by unambiguous prefix lookup against the backend — no
-# shared state, nothing to warm up. Resolution is strict: exactly one match
-# resolves, zero or many raise, so an alias can never resolve to a memory it
-# was not minted for. Values without the ``m:`` prefix are full IDs and pass
-# through untouched.
+# shared state, nothing to warm up. Resolution is strict: exactly one *proven*
+# match resolves; zero, many, or "cannot prove uniqueness" all raise, so an
+# alias can never resolve to a memory it was not minted for. Values without the
+# ``m:`` prefix are full IDs and pass through untouched.
 # ---------------------------------------------------------------------------
 MEMORY_ALIAS_PREFIX = "m:"
 MEMORY_ALIAS_ID_CHARS = 8
-# Upper bound on the ID scan used to resolve an alias. Generous on purpose:
-# a false "not found" caused by truncation would be indistinguishable from a
-# deleted memory, and this runs only on explicit update/delete calls.
-MEMORY_ALIAS_LOOKUP_LIMIT = 10_000
+
+# Alias resolution order (PR #16 review, P2):
+#
+#   1. ``backend.get_memory_ids_by_prefix`` — an exact, backend-side prefix
+#      lookup. Nothing in-tree implements it yet; it is the hook a backend that
+#      *can* answer the question cheaply (an indexed LIKE / range scan) should
+#      implement, and it short-circuits everything below.
+#   2. Otherwise enumerate the user's memory IDs and match the prefix here.
+#
+# The enumeration used to be a single capped 10,000-row slice, which had two
+# problems. The one the review named: a memory outside the slice could be
+# recalled (and therefore aliased) but never updated or deleted. The one that
+# is worse: with exactly one match *inside* a truncated slice, a second match
+# outside it could not be ruled out, so the alias could resolve to the wrong
+# record — precisely the failure the alias scheme exists to prevent.
+#
+# So the scan now escalates its page size until the backend reports fewer rows
+# than were asked for (i.e. the listing is provably exhausted). If the listing
+# cannot be exhausted within ``MEMORY_ALIAS_MAX_LOOKUP``, resolution *fails*
+# with an actionable error instead of trusting a partial view.
+MEMORY_ALIAS_PAGE_LIMIT = 10_000
+MEMORY_ALIAS_MAX_LOOKUP = 1_000_000
 
 
 class MemoryAliasError(Exception):
@@ -1020,34 +1038,9 @@ memory_update / memory_delete.
         collisions = {alias for alias in aliases if alias != "?" and aliases.count(alias) > 1}
         return [mid if alias in collisions else alias for mid, alias in zip(memory_ids, aliases)]
 
-    async def _list_memory_ids(self, backend: Any, user_id: str) -> list[str]:
-        """Best-effort enumeration of backend memory IDs for ``user_id``.
-
-        Used only by alias resolution. Tries the cheapest listing API the
-        backend exposes; an empty list simply means "no candidates", which
-        alias resolution reports as an unresolvable reference rather than
-        silently falling back to the raw alias.
-        """
-        results: Any = None
-        for attr, kwargs in (
-            ("get_user_memories", {"user_id": user_id, "limit": MEMORY_ALIAS_LOOKUP_LIMIT}),
-            ("list_memories", {"user_id": user_id, "limit": MEMORY_ALIAS_LOOKUP_LIMIT}),
-            (
-                "search_memories",
-                {"query": "", "user_id": user_id, "top_k": MEMORY_ALIAS_LOOKUP_LIMIT},
-            ),
-        ):
-            fn = getattr(backend, attr, None)
-            if not callable(fn):
-                continue
-            try:
-                results = await fn(**kwargs)
-            except Exception as e:  # pragma: no cover - backend-specific
-                logger.debug("Memory: alias lookup via %s failed: %s", attr, e)
-                continue
-            if results:
-                break
-
+    @staticmethod
+    def _memory_ids_from(results: Any) -> list[str]:
+        """Pull memory IDs out of a backend listing (Memory or SearchResult)."""
         ids: list[str] = []
         for r in results or []:
             mem = getattr(r, "memory", r)
@@ -1056,6 +1049,96 @@ memory_update / memory_delete.
                 ids.append(mem_id)
         return ids
 
+    async def _backend_prefix_lookup(
+        self, backend: Any, user_id: str, prefix: str
+    ) -> list[str] | None:
+        """Exact, backend-side resolution of an alias prefix.
+
+        Returns the matching IDs, or ``None`` when the backend exposes no such
+        hook (the common case today) so the caller falls back to enumeration.
+        A backend that implements ``get_memory_ids_by_prefix`` answers the
+        question authoritatively — no slice, nothing to truncate.
+        """
+        fn = getattr(backend, "get_memory_ids_by_prefix", None)
+        if not callable(fn):
+            return None
+        try:
+            results = await fn(prefix=prefix, user_id=user_id)
+        except Exception as e:  # pragma: no cover - backend-specific
+            logger.debug("Memory: backend prefix lookup failed: %s", e)
+            return None
+        return self._memory_ids_from(results)
+
+    async def _list_memory_ids(
+        self, backend: Any, user_id: str, limit: int
+    ) -> tuple[list[str], bool] | None:
+        """Enumerate up to ``limit`` backend memory IDs for ``user_id``.
+
+        Returns ``(ids, exhausted)`` where ``exhausted`` is True only when the
+        backend returned fewer rows than were asked for — i.e. the listing is
+        provably complete and a prefix that is absent from ``ids`` is absent
+        from the store. Returns ``None`` when the backend exposes no usable
+        listing API at all, which is different from "the user has no memories"
+        and must not be reported as "that memory does not exist".
+        """
+        results: Any = None
+        supported = False
+        for attr, kwargs in (
+            ("get_user_memories", {"user_id": user_id, "limit": limit}),
+            ("list_memories", {"user_id": user_id, "limit": limit}),
+            ("search_memories", {"query": "", "user_id": user_id, "top_k": limit}),
+        ):
+            fn = getattr(backend, attr, None)
+            if not callable(fn):
+                continue
+            try:
+                page = await fn(**kwargs)
+            except Exception as e:  # pragma: no cover - backend-specific
+                logger.debug("Memory: alias lookup via %s failed: %s", attr, e)
+                continue
+            supported = True
+            if page:
+                results = page
+                break
+
+        if not supported:
+            return None
+
+        rows = list(results or [])
+        return self._memory_ids_from(rows), len(rows) < limit
+
+    async def _scan_for_prefix(
+        self, backend: Any, user_id: str, prefix: str, alias: str
+    ) -> list[str]:
+        """Find every stored ID starting with ``prefix``, or refuse to guess.
+
+        Escalates the listing page size until the backend proves it returned
+        everything. A single match inside a *truncated* listing is not enough:
+        a second match could be sitting just past the cut, and resolving to the
+        wrong persistent record is the one outcome the alias scheme must never
+        produce.
+        """
+        limit = MEMORY_ALIAS_PAGE_LIMIT
+        while True:
+            page = await self._list_memory_ids(backend, user_id, limit)
+            if page is None:
+                raise MemoryAliasError(
+                    f"Cannot resolve memory reference {alias!r}: this backend cannot "
+                    "list memories. Call memory_search and pass the full id."
+                )
+            ids, exhausted = page
+            matches = [mid for mid in ids if mid.startswith(prefix)]
+            if exhausted or len(matches) > 1:
+                return matches
+            if limit >= MEMORY_ALIAS_MAX_LOOKUP:
+                raise MemoryAliasError(
+                    f"Could not resolve memory reference {alias!r}: more than "
+                    f"{limit:,} memories are stored and the listing could not be "
+                    "read in full, so a unique match cannot be proven. Call "
+                    "memory_search or memory_list and pass the full id."
+                )
+            limit = min(limit * 10, MEMORY_ALIAS_MAX_LOOKUP)
+
     async def _resolve_memory_alias(self, backend: Any, user_id: str, memory_id: str) -> str:
         """Translate a recall alias back to the real backend memory ID.
 
@@ -1063,11 +1146,14 @@ memory_update / memory_delete.
         returned unchanged — memory_search / memory_list results keep working
         verbatim, and no backend round-trip is spent on them.
 
-        Aliases are resolved by prefix lookup against the backend, so a fresh
+        Aliases resolve through an exact backend prefix lookup when the backend
+        offers one, and otherwise through an enumeration that is escalated
+        until it is provably exhaustive (see ``_scan_for_prefix``), so a fresh
         process (restart, different worker) resolves them exactly like the one
-        that minted them. Resolution is strict: raises ``MemoryAliasError``
-        unless exactly one stored memory matches, so an alias can never be
-        applied to a memory it was not minted for.
+        that minted them and the reachable set is not capped at some arbitrary
+        slice. Resolution is strict: raises ``MemoryAliasError`` unless exactly
+        one stored memory matches, so an alias can never be applied to a memory
+        it was not minted for.
         """
         if not memory_id.startswith(MEMORY_ALIAS_PREFIX):
             return memory_id
@@ -1076,9 +1162,9 @@ memory_update / memory_delete.
         if not prefix:
             raise MemoryAliasError(f"Malformed memory reference {memory_id!r}.")
 
-        matches = [
-            mid for mid in await self._list_memory_ids(backend, user_id) if mid.startswith(prefix)
-        ]
+        matches = await self._backend_prefix_lookup(backend, user_id, prefix)
+        if matches is None:
+            matches = await self._scan_for_prefix(backend, user_id, prefix, memory_id)
 
         if len(matches) == 1:
             return matches[0]

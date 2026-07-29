@@ -161,7 +161,17 @@ _HEREDOC_RE = re.compile(r"<<-?\s*[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?\s*(?:\\n|\n
 #: the preceding character, so arrows/comparisons (``->``, ``=>``, ``>=``,
 #: ``>>=``) still never look like a write and an ordinary search pattern such
 #: as ``def f() -> int`` stays compactable.
-_REDIRECT_AT_RE = re.compile(r">>?(?![=>])\s*[\w./~$-]*[\w/]")
+#:
+#: ``["'\\]*`` after the operator is load-bearing: the text being scanned is the
+#: SERIALIZED arguments, so a quoted target (``> "$file"``, ``>> 'out.txt'``)
+#: reaches this pattern as ``> \"$file\"`` — a backslash and a quote sit between
+#: the operator and the first word character. Without accepting them,
+#: ``printf … > "$file"`` classified as read-only and its arguments — the only
+#: record of what was written — became eligible for an expiring CCR marker.
+#: A word character is still required after the quotes, so a dangling ``> "`` at
+#: the end of a blob does not match.
+#: ``\|?`` covers bash's clobber form ``>| file``.
+_REDIRECT_AT_RE = re.compile(r">>?(?![=>])\|?\s*[\"'\\]*[\w./~$-]*[\w/]")
 
 #: ``sed``/``perl`` in-place editing, split into two anchors so the gap between
 #: them is bounded by one shell segment instead of the whole input.
@@ -174,8 +184,22 @@ _SHELL_SEGMENT_RE = re.compile(r"[|;&]")
 #: Word-anchored destructive commands. Each entry is
 #: ``(required-substrings, pattern)``: the pattern can only match if at least
 #: one of its literals is present, so the cheap membership test gates it.
+#:
+#: The file-op alternation covers everything that CREATES, LINKS, MOVES,
+#: TRUNCATES or CHANGES METADATA on a path — not just the obviously destructive
+#: verbs. ``touch f``, ``install -m 755 src dst``, ``mkfifo p``, ``mknod``,
+#: ``shred``, ``unlink``, ``chgrp``, ``chattr`` and ``rsync`` all produce a bare
+#: (often empty) acknowledgement, so their arguments are the sole record of the
+#: mutation — exactly the case THE RULE exists to protect.
 _TEE_RE = re.compile(r"\btee\b")
-_FILEOP_RE = re.compile(r"\b(?:rm|mv|cp|mkdir|rmdir|chmod|chown|ln|truncate|dd)\s")
+_FILEOP_RE = re.compile(
+    r"\b(?:rm|mv|cp|mkdir|rmdir|chmod|chown|chgrp|chattr|ln|unlink|truncate|dd|"
+    r"touch|install|mkfifo|mknod|shred|rsync|setfacl)\s"
+)
+#: ``patch`` is a common English word, so it is anchored on the option/redirect
+#: that a real invocation needs (``patch -p1 …``, ``patch < fix.diff``) rather
+#: than the bare token.
+_PATCH_CMD_RE = re.compile(r"\bpatch\s+[-<]")
 _GIT_MUTATION_RE = re.compile(
     r"\bgit\s+(?:commit|apply|checkout|reset|push|rebase|merge|am|revert|clean)\b"
 )
@@ -187,9 +211,34 @@ _PKG_MUTATION_RE = re.compile(
 _WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("tee",), _TEE_RE),
     (
-        ("rm", "mv", "cp", "mkdir", "rmdir", "chmod", "chown", "ln", "truncate", "dd"),
+        (
+            # NB: every literal here is a NECESSARY condition for one
+            # alternative of `_FILEOP_RE`; each costs ~15us on a 64 KB blob
+            # while running the regex costs ~1.2ms, so the gate stays worth it.
+            # `rmdir` is deliberately absent — `rm` already covers it.
+            "rm",
+            "mv",
+            "cp",
+            "mkdir",
+            "chmod",
+            "chown",
+            "chgrp",
+            "chattr",
+            "ln",
+            "unlink",
+            "truncate",
+            "dd",
+            "touch",
+            "install",
+            "mkfifo",
+            "mknod",
+            "shred",
+            "rsync",
+            "setfacl",
+        ),
         _FILEOP_RE,
     ),
+    (("patch",), _PATCH_CMD_RE),
     (("git",), _GIT_MUTATION_RE),
     (("npm", "pnpm", "yarn", "pip", "uv", "cargo", "apt", "brew"), _PKG_MUTATION_RE),
 )
@@ -301,6 +350,45 @@ def _normalize_tool_name(name: Any) -> str:
     return name.casefold().replace("_", "").replace("-", "")
 
 
+def _mcp_leaf_candidates(tool_name: str) -> tuple[str, ...]:
+    """Normalized leaf-name candidates for an MCP-wrapped tool name.
+
+    Two wire spellings exist, and both are handled elsewhere in the codebase
+    (``config._tool_name_aliases``, ``proxy.tool_name_policy``):
+
+    * ``mcp__server__tool`` — unambiguous: the leaf is the text after the last
+      ``__``, and the server label must never be judged (``mcp__github__get_file``
+      has to stay compactable).
+    * ``mcp_server_tool`` — emitted by Anthropic-speaking clients, and NOT
+      unambiguous: both the server label and the leaf may contain ``_``
+      (``mcp_github_create_or_update_file``, ``mcp_headroom_memory_memory_save``),
+      so there is no single correct split point. Splitting only at the second
+      underscore, the way ``_tool_name_aliases`` does for alias generation, is
+      wrong *here* because a miss is not symmetric: THE RULE trades missed
+      savings for never destroying a record. So EVERY underscore-delimited
+      suffix is offered as a candidate and one mutating candidate is enough —
+      ``mcp_github_create_or_update_file`` is caught via ``create_or_update_file``
+      regardless of where the label ends.
+
+    Returns an empty tuple for names that are not MCP-wrapped.
+    """
+    if "__" in tool_name:
+        return (_normalize_tool_name(tool_name.rsplit("__", 1)[-1]),)
+    if not tool_name.casefold().startswith("mcp_"):
+        return ()
+    rest = tool_name[4:]
+    candidates: list[str] = []
+    while rest:
+        normalized = _normalize_tool_name(rest)
+        if normalized:
+            candidates.append(normalized)
+        index = rest.find("_")
+        if index == -1:
+            break
+        rest = rest[index + 1 :]
+    return tuple(dict.fromkeys(candidates))
+
+
 def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
     """True when this call's arguments are the sole record of a mutation.
 
@@ -308,13 +396,14 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
     only missed savings, a false negative costs an unrecoverable record.
     """
     normalized = _normalize_tool_name(tool_name)
-    # `mcp__server__write_file` and friends: judge the trailing component,
-    # never the server label (`mcp__github__get_file` must stay compactable).
-    leaf = _normalize_tool_name(tool_name.rsplit("__", 1)[-1]) if "__" in tool_name else normalized
-    if normalized in MUTATING_TOOL_NAMES or leaf in MUTATING_TOOL_NAMES:
+    # `mcp__server__write_file` / `mcp_server_write_file`: judge the trailing
+    # component(s), never the server label. See `_mcp_leaf_candidates`.
+    leaves = _mcp_leaf_candidates(tool_name) or (normalized,)
+    if normalized in MUTATING_TOOL_NAMES:
         return True
-    if leaf.startswith(_MUTATING_NAME_PREFIXES):
-        return True
+    for leaf in leaves:
+        if leaf in MUTATING_TOOL_NAMES or leaf.startswith(_MUTATING_NAME_PREFIXES):
+            return True
     # Content checks are ordered cheapest-guard-first; each is substring-gated
     # so the regex engine only ever sees inputs that could actually match.
     if _has_sql_mutation(serialized_args):
@@ -362,6 +451,81 @@ def ccr_hashes_from_markers(markers: Any) -> list[str]:
             seen.add(marker)
             hashes.append(marker)
     return hashes
+
+
+#: A CCR hash as it appears INSIDE a compacted tool input. Both spellings this
+#: pass and its neighbours can leave in a tool argument are covered: the
+#: load-bearing ``Retrieve original: hash=`` phrase written by
+#: :meth:`ToolInputCompactor._store_original`, and the generic ``<<ccr:HASH>>``
+#: blob marker. Mirrors the corresponding entries of
+#: ``CCRToolInjector._marker_patterns`` (which only ever scans message TEXT).
+_TOOL_ARG_CCR_HASH_RE = re.compile(r"(?:Retrieve original: hash=|<<ccr:)([a-fA-F0-9]{12,24})")
+
+#: Cheap substring preconditions for :func:`ccr_hashes_in_tool_arguments`. Tool
+#: arguments are large and attacker-influenced, and this runs on every request,
+#: so the regex only ever sees text that could actually match.
+_TOOL_ARG_CCR_LITERALS: tuple[str, ...] = ("hash=", "<<ccr:")
+
+
+def _collect_tool_arg_hashes(text: str, out: list[str]) -> None:
+    if not any(literal in text for literal in _TOOL_ARG_CCR_LITERALS):
+        return
+    out.extend(_TOOL_ARG_CCR_HASH_RE.findall(text))
+
+
+def ccr_hashes_in_tool_arguments(messages: Any) -> list[str]:
+    """Redeemable CCR hashes already present in tool-call ARGUMENTS.
+
+    ``CCRToolInjector.scan_for_markers`` reads message text and tool-RESULT
+    content; :class:`ToolInputCompactor` writes its marker into
+    ``tool_calls[].function.arguments`` (OpenAI) / ``tool_use.input``
+    (Anthropic). ``merge_pipeline_ccr_hashes`` closes that gap only for markers
+    minted during the CURRENT pipeline run.
+
+    One step further out lies the same bug: when a conversation that already
+    contains a compacted tool input reaches a NEW worker or a restarted process,
+    the compactor skips the existing ``_ccr`` value as idempotent (so the
+    pipeline mints nothing), the in-memory session CCR tracker is empty (so the
+    sticky injection has no history to replay), and the scanner cannot see the
+    marker — the retrieval tool is never injected even though the marker and its
+    persistent CCR entry are both still in the transcript, leaving the model a
+    handle it cannot redeem. Scanning the transcript's tool arguments makes the
+    decision depend on what is actually being forwarded rather than on
+    process-local state.
+
+    Results are shape-filtered through :func:`ccr_hashes_from_markers`, so only
+    real ``[a-fA-F0-9]{12,24}`` hashes can drive injection.
+    """
+    found: list[str] = []
+    for msg in messages or ():
+        if not isinstance(msg, dict):
+            continue
+        # OpenAI shape: tool_calls[].function.arguments (JSON string).
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                func = tc.get("function")
+                if not isinstance(func, dict):
+                    continue
+                args = func.get("arguments")
+                if isinstance(args, str):
+                    _collect_tool_arg_hashes(args, found)
+        # Anthropic shape: tool_use content blocks with object input.
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                inp = block.get("input")
+                if isinstance(inp, str):
+                    _collect_tool_arg_hashes(inp, found)
+                elif isinstance(inp, dict):
+                    for value in inp.values():
+                        if isinstance(value, str):
+                            _collect_tool_arg_hashes(value, found)
+    return ccr_hashes_from_markers(found)
 
 
 def merge_pipeline_ccr_hashes(
