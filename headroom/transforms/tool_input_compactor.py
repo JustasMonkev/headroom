@@ -218,9 +218,19 @@ _PATCH_CMD_RE = re.compile(
 #: records what was staged. Read-only porcelain (status, log, diff, show, blame,
 #: grep, ls-files, rev-parse, describe) is deliberately absent so it stays
 #: compactable.
+_GIT_OPTION_VALUE = (
+    r"""(?:\\"[^"\r\n]*\\"|"[^"\r\n]*"|'[^'\r\n]*'|"""
+    r"""(?:[^\s"'\\]|\\(?!")[^\r\n])(?:[^\s"'\\]|\\[^\r\n])*)"""
+)
 _GIT_MUTATION_RE = re.compile(
     r"\bgit\s+"
-    r"(?:(?:(?:-C|-c)\s+\S+|--[-\w]+(?:=\S+)?|-p|-P)\s+){0,8}"
+    rf"(?:(?:(?:-C|-c)\s+{_GIT_OPTION_VALUE}|"
+    rf"(?:--git-dir|--work-tree|--namespace|--config-env|--shallow-file)"
+    rf"(?:=|\s+){_GIT_OPTION_VALUE}|"
+    rf"--exec-path={_GIT_OPTION_VALUE}|"
+    r"-p|-P|--paginate|--no-pager|--no-replace-objects|--no-lazy-fetch|"
+    r"--no-optional-locks|--no-advice|--bare|--literal-pathspecs|"
+    r"--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs)\s+)*"
     r"(?:"
     r"add|am|apply|branch|checkout|cherry-pick|clean|commit|config|fetch|gc|init|"
     r"merge|mv|notes|prune|pull|push|rebase|remote|reset|restore|revert|rm|"
@@ -384,7 +394,9 @@ def _has_shell_mutation(text: str) -> bool:
     for literals, pattern in _WORD_MUTATION_PROBES:
         for literal in literals:
             if literal in text:
-                if pattern.search(text):
+                if pattern.search(text) or (
+                    pattern is _GIT_MUTATION_RE and pattern.search(text.replace("\\\\", "\\"))
+                ):
                     return True
                 break
     return False

@@ -856,6 +856,20 @@ def test_read_only_names_stay_compactable(tool_name: str) -> None:
         "git -C /repo add src/a.py",
         "git -c user.name=x commit -m x",
         "git --git-dir=/repo/.git reset --hard HEAD",
+        'git -C "/tmp/my repo" add x',
+        'git -c "user.name=Jane Doe" commit -m x',
+        "git --git-dir repo reset --hard HEAD",
+        "git --work-tree tree --git-dir repo add x",
+        "git --namespace ns push",
+        r"git -C /tmp/my\ repo add x",
+        r"git -c user.name=Jane\ Doe commit -m x",
+        r"git --git-dir=/tmp/my\ repo reset --hard HEAD",
+        "git --literal-pathspecs add :(literal)file",
+        "git --glob-pathspecs add *.py",
+        "git --noglob-pathspecs add *.py",
+        "git --icase-pathspecs add README.md",
+        "git --shallow-file shallow reset --hard HEAD",
+        "git --shallow-file=shallow reset --hard HEAD",
     ],
 )
 def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
@@ -879,10 +893,40 @@ def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
         "git -C /repo status",
         "git -c color.ui=false log --oneline",
         "git --git-dir=/repo/.git diff HEAD",
+        "git --help add",
+        "git --version reset",
+        "git --html-path commit",
+        "git --definitely-invalid add",
     ],
 )
 def test_read_only_git_subcommands_stay_compactable(command: str) -> None:
     assert is_mutating_tool_input("Bash", command) is False
+
+
+def test_git_mutation_detection_has_no_global_option_count_ceiling() -> None:
+    options = " ".join(f"-c key{i}=value" for i in range(9))
+    assert is_mutating_tool_input("Bash", f"git {options} commit -m x") is True
+    quoted = json.dumps({"command": 'git -C "/tmp/my repo" add x'})
+    assert is_mutating_tool_input("Bash", quoted) is True
+    for command in (
+        r"git -C /tmp/my\ repo add x",
+        r"git -c user.name=Jane\ Doe commit -m x",
+        r"git --git-dir=/tmp/my\ repo reset --hard HEAD",
+        r"git -C /tmp/foo\\ add x",
+        r"git -c key=value\\ commit -m x",
+        r"git --git-dir=/tmp/foo\\ reset --hard HEAD",
+    ):
+        assert is_mutating_tool_input("Bash", command) is True
+        assert is_mutating_tool_input("Bash", json.dumps({"command": command})) is True
+
+    long_value = "git -c test.value=" + "x" * 513 + " commit -m x"
+    assert is_mutating_tool_input("Bash", long_value) is True
+    assert is_mutating_tool_input("Bash", json.dumps({"command": long_value})) is True
+
+
+def test_git_global_options_do_not_backtrack_on_read_only_command() -> None:
+    options = " ".join('-c "key=value"' for _ in range(30))
+    assert is_mutating_tool_input("Bash", f"git {options} status") is False
 
 
 @pytest.mark.parametrize(
