@@ -572,16 +572,11 @@ MUTATING_COMMANDS = [
 NON_MUTATING_COMMANDS = [
     "ls -la | wc -l",
     "git log --oneline -3",
-    "grep -rn 'def f() -> int' src/",
     "rg 'x => y' .",
-    "awk '$1 >= 5 {print}' data.txt",
     "cat f.py",
     "grep -rn 'sed' docs/",  # mentions sed, no -i
-    "sed -n '1,20p' f.py",  # sed without -i
-    "sed 's/a/b/' f.py | head -20",
     "git status --porcelain",
     "npm ls --depth 0",
-    "find . -name '*.py' -newer f",
     # The touch-family additions are word+separator anchored, so merely naming
     # one of the commands in a search pattern stays compactable.
     "grep -rn 'touch' docs/",
@@ -595,12 +590,57 @@ NON_MUTATING_COMMANDS = [
     "node --version",
     "which python3",
     "ls scripts/*.sh",
-    ".venv/bin/python -m pytest -q --tb=line -p no:cacheprovider tests/test_x.py",
-    ".venv/bin/python -m ruff check headroom/transforms/",
-    "python -m mypy headroom",
     "head -50 run.sh",
     "wc -l tests/*.py",
 ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "terraform apply -var x=" + "y" * 2048,
+        "docker run -e X=" + "y" * 2048,
+        "ansible-playbook site.yml",
+        "find . -delete",
+        "awk 'BEGIN { system(\"touch marker\") }'",
+        "rg x | terraform apply",
+        "ls && docker run image",
+        "ls\nterraform apply",
+        "curl -o /tmp/out https://example.test",
+        "sort -o /tmp/out input",
+        "uniq input /tmp/out",
+        "git diff --output=/tmp/out HEAD",
+        "git log --ext-diff -1",
+        "git -c diff.external=./mutator diff",
+        "helm template app --post-renderer ./mutator",
+        "rg --pre ./mutator needle",
+        "rg --hostname-bin=./mutator needle",
+        "git grep -O./mutator needle",
+        "cargo tree",
+        "cat =(terraform apply)",
+    ],
+)
+def test_unknown_shell_commands_fail_closed(command: str) -> None:
+    assert is_mutating_tool_input("Bash", json.dumps({"command": command})) is True
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["shell", "exec_command", "run_shell_command", "terminal", "functions.exec_command"],
+)
+def test_shell_executor_aliases_fail_closed(tool_name: str) -> None:
+    assert is_mutating_tool_input(tool_name, '{"cmd":"terraform apply"}') is True
+    assert is_mutating_tool_input(tool_name, '{"cmd":"rg needle src | head"}') is False
+    assert (
+        is_mutating_tool_input(
+            tool_name, '{"command":"rg needle src","cmd":"terraform apply"}'
+        )
+        is True
+    )
+
+
+def test_non_shell_lookalike_stays_compactable() -> None:
+    assert is_mutating_tool_input("Grep", '{"pattern":"terraform apply"}') is False
 
 
 @pytest.mark.parametrize("command", MUTATING_COMMANDS)
@@ -891,12 +931,10 @@ def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
         "git rev-parse HEAD",
         "git describe --tags",
         "git -C /repo status",
-        "git -c color.ui=false log --oneline",
         "git --git-dir=/repo/.git diff HEAD",
         "git --help add",
         "git --version reset",
         "git --html-path commit",
-        "git --definitely-invalid add",
     ],
 )
 def test_read_only_git_subcommands_stay_compactable(command: str) -> None:
@@ -924,9 +962,9 @@ def test_git_mutation_detection_has_no_global_option_count_ceiling() -> None:
     assert is_mutating_tool_input("Bash", json.dumps({"command": long_value})) is True
 
 
-def test_git_global_options_do_not_backtrack_on_read_only_command() -> None:
+def test_git_config_options_fail_closed_without_backtracking() -> None:
     options = " ".join('-c "key=value"' for _ in range(30))
-    assert is_mutating_tool_input("Bash", f"git {options} status") is False
+    assert is_mutating_tool_input("Bash", f"git {options} status") is True
 
 
 @pytest.mark.parametrize(
@@ -965,10 +1003,8 @@ def test_patch_and_package_mutations_are_detected(command: str) -> None:
         "kubectl describe deployment app",
         "npm ls",
         "pip list",
-        "cargo tree",
         "poetry show",
         "gem list",
-        "dotnet build",
     ],
 )
 def test_patch_lookalikes_and_queries_stay_compactable(command: str) -> None:
@@ -1015,17 +1051,8 @@ def test_remote_mutating_shell_commands_are_detected(command: str) -> None:
         "kubectl get pods",
         "kubectl describe deployment api",
         "kubectl logs deployment/api",
-        "kubectl diff -f deployment.yaml",
         "helm list",
         "helm status app",
-        "helm template app ./chart",
-        "curl https://api.example.test/items",
-        "curl -I https://api.example.test/items",
-        "curl -X GET https://api.example.test/items",
-        "curl -d q=headroom -X GET https://api.example.test/search",
-        "curl --request HEAD https://api.example.test/items",
-        "curl -G https://api.example.test/search --data-urlencode q=headroom",
-        "curl -k https://api.example.test/items",
     ],
 )
 def test_remote_read_commands_stay_compactable(command: str) -> None:

@@ -2056,6 +2056,7 @@ class ContentRouter(Transform):
     _runtime_skip_kompress = _RequestScoped(lambda: False)
     _runtime_kompress_model = _RequestScoped(lambda: None)
     _runtime_compression_policy = _RequestScoped(lambda: None)
+    _runtime_tokenizer = _RequestScoped(lambda: None)
     _tool_call_args = _RequestScoped(dict)
     _tool_call_commands = _RequestScoped(dict)
     _protect_read_tool_ids = _RequestScoped(set)
@@ -2921,9 +2922,23 @@ class ContentRouter(Transform):
                 cand = compact_lossless(content, kind)
             except Exception:
                 continue
-            if len(cand) < len(best):
+            if self._lossless_candidate_is_smaller(content, cand) and len(cand) < len(best):
                 best, best_label = cand, f"lossless_{kind}"
         return best, best_label
+
+    def _lossless_candidate_ratio(self, original: str, candidate: str) -> float | None:
+        tokenizer = self._runtime_tokenizer
+        if tokenizer is None:
+            return len(candidate) / max(1, len(original))
+        try:
+            original_tokens = tokenizer.count_text(original)
+            return tokenizer.count_text(candidate) / original_tokens if original_tokens else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _lossless_candidate_is_smaller(self, original: str, candidate: str) -> bool:
+        ratio = self._lossless_candidate_ratio(original, candidate)
+        return ratio is not None and ratio < 1.0
 
     @staticmethod
     def _looks_like_diff(content: str) -> bool:
@@ -4727,6 +4742,7 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        self._runtime_tokenizer = tokenizer
         # Shared CCR store for the pre-processing passes below. is None (not
         # truthiness) so falsy test doubles are honored; guarded import keeps
         # the passes running in stripped builds.
@@ -5812,7 +5828,12 @@ class ContentRouter(Transform):
             try:
                 # A registered provider is authoritative for excluded-tool
                 # compaction; fall back to the built-in folds only if it raises.
-                return provider(content)
+                candidate = provider(content)
+                if candidate is not None and self._lossless_candidate_is_smaller(
+                    content, candidate[0]
+                ):
+                    return candidate
+                return None
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "lossless provider failed; using built-in compaction",
@@ -5826,12 +5847,19 @@ class ContentRouter(Transform):
             det = _try_detect_search(content)
             if det is not None and det.content_type is ContentType.SEARCH_RESULTS:
                 out = compact_lossless(content, "search")
-                return (out, "search") if len(out) < len(content) else None
+                return (
+                    (out, "search") if self._lossless_candidate_is_smaller(content, out) else None
+                )
             if _try_detect_log(content) is not None:
                 out = compact_lossless(content, "log")
-                return (out, "log") if len(out) < len(content) else None
+                return (out, "log") if self._lossless_candidate_is_smaller(content, out) else None
             minified = self._minify_json_data_lossless(content)
-            return (minified, "json") if minified is not None else None
+            return (
+                (minified, "json")
+                if minified is not None
+                and self._lossless_candidate_is_smaller(content, minified)
+                else None
+            )
         except Exception:  # noqa: BLE001
             return None
 
@@ -5893,7 +5921,7 @@ class ContentRouter(Transform):
             folded = compact_lossless(content, "search")
         except Exception:  # noqa: BLE001
             return None
-        if len(folded) >= len(content):
+        if not self._lossless_candidate_is_smaller(content, folded):
             return None
         best, label = self._lossless_first(content, CompressionStrategy.SEARCH)
         # `lossless_diff` is the one fold that is purely subtractive with no
@@ -6552,13 +6580,8 @@ class ContentRouter(Transform):
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-        # Lossless-anchored acceptance (byte-measured): a byte/data-lossless fold
-        # (search --heading, log run-collapse) has ZERO accuracy cost, so it must
-        # never be rejected by the WORD-ratio gate below — heading/indent folds
-        # cut tokens while word count stays flat or even rises. Accept on a real
-        # BYTE reduction (there is no tokenizer in scope here; byte length is a
-        # faithful token proxy for these folds) and store a byte-based ratio so
-        # the Tier-2 result cache reuses it on later turns.
+        # Lossless-anchored acceptance uses the request tokenizer rather than the
+        # word-ratio gate below. A byte-shorter fold can still cost more tokens.
         #
         # Two shapes take this path:
         #   • Pure fold  (chain == [lossless_*])           — byte-exact, always safe.
@@ -6572,9 +6595,17 @@ class ContentRouter(Transform):
         _chain = getattr(result, "strategy_chain", None) or []
         _starts_lossless = bool(_chain) and _chain[0].startswith("lossless_")
         _is_pure_lossless = _starts_lossless and all(s.startswith("lossless_") for s in _chain)
-        _byte_accept = _starts_lossless and (_is_pure_lossless or not self.config.ccr_inject_marker)
-        if _byte_accept and len(result.compressed) < len(content):
-            _ll_ratio = len(result.compressed) / max(1, len(content))
+        _lossless_accept = _starts_lossless and (
+            _is_pure_lossless or not self.config.ccr_inject_marker
+        )
+        _ll_ratio = self._lossless_candidate_ratio(content, result.compressed)
+        if _lossless_accept and (_ll_ratio is None or _ll_ratio >= 1.0):
+            self._cache.mark_skip(content_key)
+            if route_counts is not None:
+                route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
+            return None, False
+        if _lossless_accept:
+            assert _ll_ratio is not None
             _ll_label = _chain[0] if _is_pure_lossless else "+".join(_chain)
             self._cache.put(content_key, result.compressed, _ll_ratio, _ll_label)
             transforms_applied.append(f"router:{strategy_label}:{_ll_label}")

@@ -51,6 +51,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -529,6 +530,160 @@ def _has_sql_mutation(text: str) -> bool:
     return bool(_SQL_MUTATION_RE.search(text))
 
 
+_SHELL_EXECUTOR_NAMES = frozenset(
+    {
+        "bash",
+        "shell",
+        "execcommand",
+        "runshellcommand",
+        "executecommand",
+        "terminal",
+        "runcommand",
+        "runterminalcommand",
+        "localshell",
+    }
+)
+_READ_ONLY_SHELL_COMMANDS = frozenset(
+    {
+        "cat",
+        "cut",
+        "diff",
+        "echo",
+        "false",
+        "grep",
+        "head",
+        "ls",
+        "printf",
+        "pwd",
+        "rg",
+        "tail",
+        "test",
+        "true",
+        "type",
+        "wc",
+        "which",
+    }
+)
+_READ_ONLY_GIT_COMMANDS = frozenset(
+    {"blame", "describe", "diff", "grep", "log", "ls-files", "rev-parse", "show", "status"}
+)
+_GIT_GLOBAL_OPTIONS_WITH_VALUES = frozenset(
+    {"-C", "--git-dir", "--work-tree", "--namespace", "--shallow-file"}
+)
+
+
+def _shell_command(serialized_args: str) -> str | None:
+    """Extract a shell executor's command, failing closed on unknown shapes."""
+    try:
+        payload = json.loads(serialized_args)
+    except (TypeError, ValueError):
+        return serialized_args
+    if not isinstance(payload, dict):
+        return None
+    command, cmd = payload.get("command"), payload.get("cmd")
+    if isinstance(command, str) and isinstance(cmd, str) and command != cmd:
+        return None
+    value = command if isinstance(command, str) else cmd
+    return value if isinstance(value, str) else None
+
+
+def _git_command_is_read_only(args: list[str]) -> bool:
+    if any(
+        arg == option
+        or arg.startswith(f"{option}=")
+        or (option == "-O" and arg.startswith("-O"))
+        for arg in args
+        for option in ("--output", "--ext-diff", "--textconv", "--open-files-in-pager", "-O")
+    ):
+        return False
+    if args and args[0] in {"--help", "--version", "--html-path"}:
+        return True
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        option = args[i]
+        if option in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+            i += 2
+        elif any(option.startswith(f"{name}=") for name in _GIT_GLOBAL_OPTIONS_WITH_VALUES):
+            i += 1
+        elif option in {
+            "-p",
+            "-P",
+            "--paginate",
+            "--no-pager",
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--no-optional-locks",
+            "--no-advice",
+            "--bare",
+            "--literal-pathspecs",
+            "--glob-pathspecs",
+            "--noglob-pathspecs",
+            "--icase-pathspecs",
+        }:
+            i += 1
+        else:
+            return False
+    return i < len(args) and args[i] in _READ_ONLY_GIT_COMMANDS
+
+
+def _shell_command_is_read_only(command: str) -> bool:
+    """True only when every shell segment is an explicitly read-only command."""
+    if any(marker in command for marker in ("\n", "\r", "`", "(", ")")):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= {"|", "&", ";"}:
+            if not segments[-1]:
+                return False
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    if not segments[-1]:
+        return False
+
+    for segment in segments:
+        if segment and segment[0] == "cd":
+            continue
+        if not segment:
+            return False
+        executable = segment[0].rsplit("/", 1)[-1]
+        args = segment[1:]
+        if executable == "rg" and any(
+            arg in {"--pre", "--hostname-bin"}
+            or arg.startswith("--pre=")
+            or arg.startswith("--hostname-bin=")
+            for arg in args
+        ):
+            return False
+        if executable in _READ_ONLY_SHELL_COMMANDS:
+            continue
+        if executable in {"python", "python3", "node", "nodejs"} and args == ["--version"]:
+            continue
+        if executable == "git" and _git_command_is_read_only(args):
+            continue
+        if executable in {"npm", "pnpm", "yarn"} and args and args[0] in {"ls", "list"}:
+            continue
+        if executable == "pip" and args and args[0] == "list":
+            continue
+        if executable == "poetry" and args and args[0] == "show":
+            continue
+        if executable == "gem" and args and args[0] == "list":
+            continue
+        if executable in {"kubectl", "oc"} and args and args[0] in {"get", "describe", "logs", "diff"}:
+            continue
+        if executable == "helm" and args and args[0] in {"list", "status"}:
+            continue
+        return False
+    return True
+
+
 #: Verb prefixes that mark an arbitrary (e.g. MCP) tool as mutating. A fixed
 #: denylist cannot enumerate every third-party server's write operations, so
 #: the leading verb is used as the safety net. Conservative by design: a false
@@ -635,6 +790,10 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
     # `mcp__server__write_file` / `mcp_server_write_file`: judge the trailing
     # component(s), never the server label. See `_mcp_leaf_candidates`.
     leaves = _mcp_leaf_candidates(tool_name) or (normalized,)
+    shell_executor = bool(
+        {normalized, *leaves, _normalize_tool_name(tool_name.rsplit(".", 1)[-1])}
+        & _SHELL_EXECUTOR_NAMES
+    )
     if normalized in MUTATING_TOOL_NAMES:
         return True
     for leaf in leaves:
@@ -658,7 +817,12 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
         return True
     # Last because its literal gate (`sh`) is the weakest of the set: anything
     # the shell probes already caught never reaches it.
-    return _has_code_execution(serialized_args)
+    if _has_code_execution(serialized_args):
+        return True
+    if shell_executor:
+        command = _shell_command(serialized_args)
+        return command is None or not _shell_command_is_read_only(command)
+    return False
 
 
 #: A retrievable CCR hash: 12-24 lowercase hex characters. This is the exact

@@ -24,7 +24,12 @@ import pytest
 from headroom.providers import OpenAIProvider
 from headroom.tokenizer import Tokenizer
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.lossless_compaction import expand_runs, search_fold_recovers, strip_ansi
+from headroom.transforms.lossless_compaction import (
+    compact_lossless,
+    expand_runs,
+    search_fold_recovers,
+    strip_ansi,
+)
 from headroom.transforms.lossless_provider import (
     get_lossless_provider,
     set_lossless_provider,
@@ -116,6 +121,24 @@ def test_pipeline_compacts_log_output(tokenizer):
     out, transforms = _run(LOG, "glob", tokenizer)
     assert "router:excluded:lossless_log" in transforms
     assert expand_runs(out) == strip_ansi(LOG)
+
+
+def test_pipeline_rejects_byte_smaller_token_larger_fold(tokenizer):
+    lines = []
+    for i in range(30):
+        line = f"aaaaaaaa{i:02d}"
+        lines += [line, line]
+    for i in range(10):
+        lines[i * 2] = f"INFO {lines[i * 2]}"
+    content = "\n".join(lines) + "\n"
+    folded = compact_lossless(content, "log")
+    assert len(folded) < len(content)
+    assert tokenizer.count_text(folded) > tokenizer.count_text(content)
+
+    out, transforms = _run(content, "grep", tokenizer)
+
+    assert out == content
+    assert "router:excluded:lossless_log" not in transforms
 
 
 def test_pipeline_minifies_json_output(tokenizer):

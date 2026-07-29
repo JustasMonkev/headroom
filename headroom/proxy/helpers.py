@@ -2874,6 +2874,7 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "webfetch",
         "question",
         "skill",
+        "memory_search",
     }
 )
 

@@ -126,6 +126,16 @@ def test_terminal_reserved_namespace_stays_resident():
     assert tools == snapshot
 
 
+def test_memory_search_guidance_stays_resident():
+    memory_search = _fn("memory_search")
+    tools = [memory_search] + [_fn(f"peer_{i}") for i in range(11)]
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    assert next(t for t in out if t.get("name") == "memory_search") == memory_search
+    assert next(t for t in out if t.get("name") == "peer_0").get("defer_loading") is True
+
+
 def test_terminal_helper_remains_deferrable():
     tools = [_fn("terminal_helper")] + [_fn(f"peer_{i}") for i in range(11)]
 
