@@ -92,7 +92,9 @@ NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
 # Durable memory aliases (F4 token reduction, hardened after PR #15 review).
 #
 # Passive recall renders a short handle instead of the full backend UUID
-# (~16 tokens per recalled row). The first cut minted *session-local*
+# (~16 tokens per recalled row) when the backend can resolve it durably.
+# Backends without authoritative prefix/listing lookup render full IDs. The
+# first cut minted *session-local*
 # counters (m1, m2, ...) held in per-handler dicts, which is a data-integrity
 # bug: after a proxy restart — or when consecutive requests land on different
 # workers — the map is empty while `[m1]` references are still live in the
@@ -911,8 +913,9 @@ class MemoryHandler:
             # Both branches below render the same `i. [id] content` shape
             # so the format is stable regardless of whether a ranker is
             # in play. Row IDs are durable ``m:<prefix>`` aliases derived from
-            # the backend ID itself; `selected_pairs` keeps (alias, real
-            # backend id) so access tracking below can map surviving rows
+            # the backend ID itself when the backend can resolve them; opaque
+            # backends render full IDs. `selected_pairs` keeps (rendered id,
+            # real backend id) so access tracking below can map surviving rows
             # back to real IDs.
             selected_pairs: list[tuple[str, str]] = []
             if ranker is not None:
@@ -930,7 +933,10 @@ class MemoryHandler:
                     )
                     return None
                 ranked = ranked[: effective_budget.max_entries]
-                row_ids = self._alias_row_ids([c.id or "" for c in ranked])
+                row_ids = self._row_ids_for_backend(
+                    backend,
+                    [c.id or "" for c in ranked],
+                )
                 memory_lines = []
                 for i, (candidate, row_id) in enumerate(zip(ranked, row_ids), 1):
                     if candidate.id:
@@ -958,7 +964,7 @@ class MemoryHandler:
                 filtered_results = filtered_results[: effective_budget.max_entries]
 
                 real_ids = [(getattr(r.memory, "id", None) or "") for r in filtered_results]
-                row_ids = self._alias_row_ids(real_ids)
+                row_ids = self._row_ids_for_backend(backend, real_ids)
                 memory_lines = []
                 for i, (result, real_id, row_id) in enumerate(
                     zip(filtered_results, real_ids, row_ids), 1
@@ -1095,6 +1101,23 @@ memory_update / memory_delete.
         aliases = [cls._alias_for_memory(mid) if mid else "?" for mid in memory_ids]
         collisions = {alias for alias in aliases if alias != "?" and aliases.count(alias) > 1}
         return [mid if alias in collisions else alias for mid, alias in zip(memory_ids, aliases)]
+
+    @classmethod
+    def _row_ids_for_backend(cls, backend: Any, memory_ids: list[str]) -> list[str]:
+        """Render aliases only when this backend can resolve them durably.
+
+        DirectMem0/Qdrant currently has semantic search and exact-ID access but
+        no exhaustive listing or prefix lookup. Showing an alias there would
+        advertise a handle that update/delete can never resolve, so keep the
+        full ID until that adapter exposes one of the resolver APIs below.
+        """
+        can_resolve = any(
+            callable(getattr(backend, attr, None))
+            for attr in ("get_memory_ids_by_prefix", "get_user_memories", "list_memories")
+        )
+        if not can_resolve:
+            return [mid or "?" for mid in memory_ids]
+        return cls._alias_row_ids(memory_ids)
 
     @staticmethod
     def _memory_ids_from(results: Any) -> list[str]:

@@ -104,6 +104,13 @@ class _DeterministicBackend:
     ) -> list[_StubResult]:
         return list(self._fixture[:top_k])
 
+    async def get_user_memories(
+        self,
+        user_id: str,  # noqa: ARG002
+        limit: int = 100,
+    ) -> list[_StubMemory]:
+        return [result.memory for result in self._fixture[:limit]]
+
 
 def _build_handler() -> MemoryHandler:
     """Build a MemoryHandler in AutoTail mode with the deterministic stub."""

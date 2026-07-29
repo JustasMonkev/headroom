@@ -1245,14 +1245,6 @@ class AnthropicHandlerMixin:
                         compressor.close()
 
             _compression_failed = False
-            # CCR hashes minted by the pipeline's pre-processing passes
-            # (read-lifecycle, tool-input compaction). These markers live INSIDE
-            # tool_use inputs / tool_calls arguments, which `scan_for_markers`
-            # does not read — so without threading them into the injection
-            # decision below the very first compaction in a session would strand
-            # its own marker (no `headroom_retrieve` tool injected). See the
-            # CCR-injection block further down.
-            pipeline_ccr_hashes: list[str] = []
             original_messages = messages  # Preserve for 400-retry fallback
             _decision = CompressionDecision.decide(
                 headers=request.headers,
@@ -1595,22 +1587,6 @@ class AnthropicHandlerMixin:
                             optimized_messages = messages
                             optimized_tokens = original_tokens
 
-                    if result is not None:
-                        # Shape-filtered to REDEEMABLE hashes at the point of
-                        # contribution: `markers_inserted` also carries
-                        # SmartCrusher's `<headroom:tool_digest sha256="…">`
-                        # provenance strings, which `scan_for_markers` can never
-                        # return — so feeding them to `has_new_ccr_markers` made
-                        # every byte-identical replayed prefix look "new" and
-                        # re-injected `headroom_retrieve` on every frozen turn,
-                        # busting the tools cache segment.
-                        from headroom.transforms.tool_input_compactor import (
-                            ccr_hashes_from_markers,
-                        )
-
-                        pipeline_ccr_hashes = ccr_hashes_from_markers(
-                            getattr(result, "markers_inserted", None)
-                        )
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
                 except Exception as e:
@@ -1888,24 +1864,20 @@ class AnthropicHandlerMixin:
                 # which the scanner never visits — so on the first compaction of
                 # a session `detected_hashes` is empty, the sticky injection is
                 # skipped, and the stored original is unreachable. Merge the
-                # hashes the pipeline reported minting so the decision below
-                # sees them.
+                # hashes still present in the forwarded tool arguments so the
+                # decision below sees them.
                 from headroom.transforms.tool_input_compactor import (
                     ccr_hashes_in_tool_arguments,
                     merge_pipeline_ccr_hashes,
                 )
 
-                # Hashes minted this run cover the first compaction. A restart
-                # or a different worker loses the session tracker, so an
-                # already-compacted `tool_use.input` is skipped as idempotent
-                # and mints nothing — scan the transcript too, or the marker
-                # stays in context with no tool able to redeem it.
+                # Derive every hash from the final messages, after cache overlay
+                # and inflation rollback. A pipeline result may report a marker
+                # that the inflation guard discarded; carrying that stale hash
+                # forward would inject a retrieval tool for content never sent.
                 _detected_hashes = merge_pipeline_ccr_hashes(
                     injector.detected_hashes,
-                    [
-                        *pipeline_ccr_hashes,
-                        *ccr_hashes_in_tool_arguments(optimized_messages),
-                    ],
+                    ccr_hashes_in_tool_arguments(optimized_messages),
                 )
                 # Feed the merged list back into the injector: system-instruction
                 # injection keys off `has_compressed_content`, which reads the

@@ -3268,7 +3268,6 @@ class OpenAIHandlerMixin:
                 openai_frozen_count = 0
 
         _compression_failed = False
-        pipeline_ccr_hashes: list[str] = []
         original_messages = messages  # Preserve for 400-retry fallback
         _decision = CompressionDecision.decide(
             headers=request.headers,
@@ -3378,27 +3377,6 @@ class OpenAIHandlerMixin:
                         pipeline_timing = result.timing
                         original_tokens = result.tokens_before
                         optimized_tokens = result.tokens_after
-
-                # CCR hashes minted by the pipeline's pre-processing passes
-                # (read-lifecycle, tool-input compaction). Tool-input markers
-                # live inside `tool_calls[].function.arguments`, which
-                # `CCRToolInjector.scan_for_markers` never reads — see the CCR
-                # injection block below for why that matters.
-                #
-                # Shape-filtered to REDEEMABLE hashes at the point of
-                # contribution: `markers_inserted` also carries SmartCrusher's
-                # `<headroom:tool_digest sha256="…">` provenance strings, which
-                # the scanner can never return — so feeding them to
-                # `has_new_ccr_markers` made every byte-identical replayed
-                # prefix look "new" and re-injected `headroom_retrieve` on every
-                # frozen turn, busting the tools cache segment.
-                from headroom.transforms.tool_input_compactor import (
-                    ccr_hashes_from_markers,
-                )
-
-                pipeline_ccr_hashes = ccr_hashes_from_markers(
-                    getattr(result, "markers_inserted", None)
-                )
 
                 if result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()
@@ -3526,16 +3504,13 @@ class OpenAIHandlerMixin:
             # `tool_calls[].function.arguments`, which the scanner never
             # visits — so on the first compaction of a session
             # `detected_hashes` is empty, the sticky injection is skipped, and
-            # the stored original is unreachable. Merge in the hashes the
-            # pipeline reported minting (order-stable, de-duplicated).
+            # the stored original is unreachable. Merge in hashes still present
+            # in the forwarded tool arguments (order-stable, de-duplicated).
             #
-            # `pipeline_ccr_hashes` alone only covers markers minted THIS run.
-            # A conversation that already carries a compacted tool input and
-            # then reaches a new worker / restarted process mints nothing (the
-            # compactor skips `_ccr` as idempotent) and has an empty session
-            # tracker, so the marker in the transcript would never register.
-            # Scanning the forwarded tool arguments makes the decision depend
-            # on what is actually being sent, not on process-local state.
+            # Derive every hash from the final messages, after cache overlay
+            # and inflation rollback. A pipeline result may report a marker
+            # that the inflation guard discarded; carrying that stale hash
+            # forward would inject a retrieval tool for content never sent.
             from headroom.transforms.tool_input_compactor import (
                 ccr_hashes_in_tool_arguments,
                 merge_pipeline_ccr_hashes,
@@ -3543,7 +3518,7 @@ class OpenAIHandlerMixin:
 
             _detected_hashes = merge_pipeline_ccr_hashes(
                 injector.detected_hashes,
-                [*pipeline_ccr_hashes, *ccr_hashes_in_tool_arguments(optimized_messages)],
+                ccr_hashes_in_tool_arguments(optimized_messages),
             )
             # Same split as the Anthropic path: `has_compressed_content` reads
             # the injector's own list, so a marker that only ever lived in a

@@ -63,6 +63,7 @@ from typing import Any
 
 import pytest
 
+from headroom.memory.backends.direct_mem0 import DirectMem0Adapter, Mem0Config
 from headroom.proxy import memory_handler
 from headroom.proxy.memory_handler import (
     MEMORY_ALIAS_PREFIX,
@@ -71,6 +72,7 @@ from headroom.proxy.memory_handler import (
     MemoryHandler,
     MemoryMode,
 )
+from headroom.proxy.memory_ranker import RecencyBoostRanker
 
 # ---------------------------------------------------------------------------
 # Stub backend
@@ -366,6 +368,95 @@ def test_alias_row_ids_handles_missing_ids() -> None:
         "?",
         f"{MEMORY_ALIAS_PREFIX}f9e8d7c6",
     ]
+
+
+class _DirectMem0Stub(DirectMem0Adapter):
+    """DirectMem0's real lookup surface without optional services."""
+
+    def __init__(self) -> None:
+        super().__init__(Mem0Config(enable_graph=False))
+        self.memory = _Memory(id=UUID_A, content="User prefers Python.")
+        self.updated: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+
+    async def search_memories(self, **kwargs: Any) -> list[_Result]:
+        return [_Result(memory=self.memory)]
+
+    async def update_memory(self, memory_id: str, new_content: str, **kwargs: Any) -> _Memory:
+        self.updated.append((memory_id, new_content))
+        self.memory.content = new_content
+        return self.memory
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        self.deleted.append(memory_id)
+        return True
+
+
+def _qdrant_handler(backend: DirectMem0Adapter) -> MemoryHandler:
+    handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            backend="qdrant-neo4j",
+            inject_context=True,
+            inject_tools=True,
+            top_k=5,
+            min_similarity=0.3,
+            mode=MemoryMode.AUTO_TAIL,
+        )
+    )
+    handler._backend = backend
+    handler._initialized = True
+    return handler
+
+
+@pytest.mark.parametrize(
+    "ranker",
+    [None, RecencyBoostRanker()],
+    ids=["without-ranker", "with-ranker"],
+)
+def test_qdrant_recall_renders_resolvable_full_ids(ranker: Any) -> None:
+    """DirectMem0 cannot enumerate IDs, so its short aliases cannot resolve."""
+    backend = _DirectMem0Stub()
+    handler = _qdrant_handler(backend)
+
+    context = asyncio.run(
+        handler.search_and_format_context(
+            "u",
+            [{"role": "user", "content": "hi"}],
+            ranker=ranker,
+        )
+    )
+
+    assert context is not None
+    assert f"[{UUID_A}]" in context
+    assert f"[{MEMORY_ALIAS_PREFIX}a1b2c3d4]" not in context
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", UUID_A)) == UUID_A
+
+
+def test_qdrant_displayed_full_id_reaches_update_and_delete_unchanged() -> None:
+    backend = _DirectMem0Stub()
+    handler = _qdrant_handler(backend)
+    context = asyncio.run(
+        handler.search_and_format_context("u", [{"role": "user", "content": "hi"}])
+    )
+    assert context is not None
+    displayed_id = context.split("1. [", 1)[1].split("]", 1)[0]
+    assert displayed_id == UUID_A
+
+    updated = json.loads(
+        asyncio.run(
+            handler._execute_update(
+                {"memory_id": displayed_id, "new_content": "User prefers Rust."},
+                "u",
+            )
+        )
+    )
+    deleted = json.loads(asyncio.run(handler._execute_delete({"memory_id": displayed_id}, "u")))
+
+    assert updated == {"status": "updated", "memory_id": UUID_A}
+    assert deleted == {"status": "deleted", "memory_id": UUID_A}
+    assert backend.updated == [(UUID_A, "User prefers Rust.")]
+    assert backend.deleted == [UUID_A]
 
 
 # ---------------------------------------------------------------------------

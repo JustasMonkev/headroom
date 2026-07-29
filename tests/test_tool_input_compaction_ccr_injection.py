@@ -6,7 +6,7 @@ The tool-input compaction pass writes its marker inside
 visits — so on the first compaction of a session `detected_hashes` was empty,
 both provider handlers skipped the sticky `headroom_retrieve` injection, and the
 stored original was unreachable. The handlers now merge
-`TransformResult.markers_inserted` into the injection decision.
+hashes found in the final forwarded tool arguments into the injection decision.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from headroom.ccr.tool_injection import CCR_TOOL_NAME, CCRToolInjector
+from headroom.ccr.tool_injection import CCR_SYSTEM_INSTRUCTIONS, CCR_TOOL_NAME, CCRToolInjector
 from headroom.proxy.ccr_marker_policy import has_new_ccr_markers, should_inject_ccr_tool
 from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
@@ -110,8 +110,11 @@ def test_retrieve_tool_is_injected_for_a_tool_input_only_marker(
     )
     injector.scan_for_markers(messages)
 
-    # The handler merges the hashes the pipeline reported minting.
-    detected = merge_pipeline_ccr_hashes(injector.detected_hashes, [HASH])
+    # The handler merges hashes found in the final forwarded tool arguments.
+    detected = merge_pipeline_ccr_hashes(
+        injector.detected_hashes,
+        ccr_hashes_in_tool_arguments(messages),
+    )
     assert detected == [HASH]
 
     has_new = has_new_ccr_markers(
@@ -662,3 +665,144 @@ def test_openai_handler_injects_retrieve_tool_for_a_replayed_compacted_input() -
     tools = forwarded["body"].get("tools") or []
     names = {t.get("name") or (t.get("function") or {}).get("name") for t in tools}
     assert CCR_TOOL_NAME in names, forwarded["body"].get("tools")
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_handler_rollback_uses_only_hashes_in_forwarded_messages(provider: str) -> None:
+    """Rollback neither makes stale hashes sticky nor hides original markers."""
+    pytest.importorskip("fastapi")
+
+    import json
+    from types import SimpleNamespace
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    config = ProxyConfig(
+        optimize=True,
+        mode="token",
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=True,
+        ccr_inject_system_instructions=True,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    forwarded: list[dict[str, Any]] = []
+    pipeline_calls = 0
+    original_messages = [{"role": "user", "content": "hello"}]
+    inflated_messages = [{"role": "user", "content": f"{MARKER}\n" + ("inflated " * 10_000)}]
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+
+        def _fake_apply(**kwargs: Any) -> Any:
+            nonlocal pipeline_calls
+            pipeline_calls += 1
+            if pipeline_calls == 2:
+                return SimpleNamespace(
+                    messages=kwargs["messages"],
+                    transforms_applied=[],
+                    timing={},
+                    tokens_before=10,
+                    tokens_after=10,
+                    waste_signals=None,
+                    markers_inserted=[],
+                )
+            return SimpleNamespace(
+                messages=inflated_messages,
+                transforms_applied=["fake:ccr"],
+                timing={},
+                tokens_before=1,
+                tokens_after=1_000_000,
+                waste_signals=None,
+                markers_inserted=[HASH],
+            )
+
+        if provider == "openai":
+            proxy.openai_pipeline.apply = _fake_apply
+        else:
+            proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            forwarded.append(json.loads(json.dumps(body)))
+            if provider == "openai":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "chatcmpl_rollback",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 3,
+                            "total_tokens": 13,
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_rollback",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        path = "/v1/chat/completions" if provider == "openai" else "/v1/messages"
+        headers = (
+            {"authorization": "Bearer test-key"}
+            if provider == "openai"
+            else {"x-api-key": "test-key", "anthropic-version": "2023-06-01"}
+        )
+        headers["x-headroom-session-id"] = "rollback-session"
+
+        def _post(messages: list[dict[str, Any]]) -> None:
+            payload: dict[str, Any] = {
+                "model": "gpt-4o-mini" if provider == "openai" else "claude-sonnet-4-6",
+                "messages": messages,
+            }
+            if provider == "anthropic":
+                payload["max_tokens"] = 64
+            response = client.post(path, headers=headers, json=payload)
+            assert response.status_code == 200, response.text
+
+        _post(original_messages)
+        _post([{"role": "user", "content": "still no marker"}])
+        _post(_openai_messages() if provider == "openai" else _anthropic_messages())
+
+    assert len(forwarded) == 3
+    for body in forwarded[:2]:
+        assert HASH not in json.dumps(body["messages"])
+        assert CCR_SYSTEM_INSTRUCTIONS not in json.dumps(body["messages"])
+        names = {
+            t.get("name") or (t.get("function") or {}).get("name") for t in body.get("tools") or []
+        }
+        assert CCR_TOOL_NAME not in names
+
+    marker_body = forwarded[2]
+    assert HASH in json.dumps(marker_body["messages"])
+    assert CCR_SYSTEM_INSTRUCTIONS in json.dumps(marker_body["messages"])
+    marker_names = {
+        t.get("name") or (t.get("function") or {}).get("name")
+        for t in marker_body.get("tools") or []
+    }
+    assert CCR_TOOL_NAME in marker_names
