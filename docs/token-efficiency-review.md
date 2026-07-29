@@ -6,6 +6,33 @@ The short version: the compression algorithms are in good shape, but the *fixed 
 
 ---
 
+## Measured outcome
+
+The findings below were implemented and then measured against the merge-base on identical inputs with a real tokenizer (`o200k_base`). **The estimates in this document were made with a ~3.7 chars/token heuristic and run systematically high — treat every number below the fold as an estimate, and these as the measurements.**
+
+| | measured |
+|---|---|
+| Fixed per-request injection overhead (Anthropic, memory + CCR) | **2,535 → 1,064 tok (−58%)** |
+| — of which prefix-cacheable (tool schemas + system prompt) | 2,276 → 881 |
+| — of which **uncached** live zone (recall block) | 259 → 183 |
+| Whole-transcript token savings, 120-turn | 192,881 → 177,617 |
+| Whole-transcript token savings, 200-turn | 321,466 → 296,026 |
+| Overall ratio | 27.3% → **33.1%** saved |
+| Latency, realistic 120-turn request | 1.01× (no meaningful change) |
+| Peak memory, 200-turn / 442k tokens | 27.78 → 28.38 MB (+2.1%) |
+
+Three corrections that matter more than the totals:
+
+1. **The headline baseline was wrong.** The real fixed overhead is 2,535 tok/request, not "3,000–4,000".
+2. **Most of the saving is prefix-cached.** 1,395 of the 1,471 saved tokens sit in the sticky prefix, so on a cache hit their marginal value is roughly 140 full-price-equivalent tokens — not 1,395. A5's uncached saving is the one that bills in full every turn, and it is ~41 tok, not the ~165–180 claimed.
+3. **Section C largely does not reach the payloads it targets.** On a realistic 18-message coding transcript, `headroom.compress()` produced *identical* output before and after (69,285 → 47,227 both trees): the lossless fold wins first and returns before the improved lossy compressors are consulted. The section-C work pays off only where the router actually selects those paths (e.g. LOG: 1,911 → 1,136, −41%).
+
+Measurement also caught four defects in the implementation itself, all since fixed: a narrowed log window that dropped the *reason* a test failed, an unfiltered marker list that re-injected the retrieval tool on every frozen turn (busting the tools cache segment), a quadratic mutating-input regex (771 ms on a 64 KB blob), and a routing pre-empt that made C11's own target workload worse. Two threshold changes were reverted outright after measuring as net losses (`_MIN_SPAN_TO_COMPRESS` 50→100, `DEFAULT_MIN_CHARS` 40→120).
+
+Full test suite after all fixes: **107 failures on both the merge-base and the implemented tree — identical sets**, all environmental (blocked model downloads, AWS credentials, two order-dependent tests).
+
+---
+
 ## A. Per-request injection overhead (largest, compounding)
 
 ### A1. Memory tool schemas: ~2,600 tokens replayed on every request
