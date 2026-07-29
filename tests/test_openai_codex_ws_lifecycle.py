@@ -390,6 +390,127 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_ws_output_shaper_scopes_text_verbosity_to_a_first_party_upstream(
+    monkeypatch,
+):
+    """A gateway WS upstream must not gain a CREATED ``text.verbosity``.
+
+    The WS path resolves its upstream before any frame is shaped
+    (``wss://chatgpt.com/...`` for ChatGPT session auth, otherwise the
+    configured/overridden OpenAI base rewritten to ``wss://``), so the same
+    verified-target gate the HTTP path uses applies here too.
+    """
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
+    mechanical_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                # Vendor-prefixed id: clears the model cutoff, and is exactly
+                # the id shape an OpenAI-compatible gateway serves.
+                "model": "openai/gpt-5.5",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "ok",
+                    }
+                ],
+            },
+        }
+    )
+
+    async def _shape_against(api_url: str) -> dict:
+        upstream = _FakeUpstream(
+            [
+                json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+                json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "r_1",
+                            "usage": {"input_tokens": 10, "output_tokens": 1},
+                        },
+                    }
+                ),
+            ]
+        )
+        handler = _DummyOpenAIHandler()
+        handler.config.optimize = False
+        handler.OPENAI_API_URL = api_url
+        client_ws = _FakeWebSocket(frames=[mechanical_frame])
+        with patch.dict(
+            sys.modules,
+            {"websockets": _make_fake_websockets_module(upstream)},
+        ):
+            await handler.handle_openai_responses_ws(client_ws)
+        return json.loads(upstream.sent[0])["response"]
+
+    gateway_payload = await _shape_against("https://gateway.example/v1")
+    assert "text" not in gateway_payload
+    # Shaping is not lost — the portable steering lever takes over.
+    assert "instructions" in gateway_payload
+
+    first_party_payload = await _shape_against("https://api.openai.com")
+    assert first_party_payload["text"]["verbosity"] == "low"
+    assert "instructions" not in first_party_payload
+
+
+@pytest.mark.asyncio
+async def test_ws_output_shaper_lowers_client_supplied_verbosity_on_a_gateway(
+    monkeypatch,
+):
+    """Lowering an existing verbosity is never upstream-gated."""
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "r_1",
+                        "usage": {"input_tokens": 10, "output_tokens": 1},
+                    },
+                }
+            ),
+        ]
+    )
+    frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "openai/gpt-5.5",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "ok",
+                    }
+                ],
+                "text": {"verbosity": "high"},
+            },
+        }
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = False
+    handler.OPENAI_API_URL = "https://gateway.example/v1"
+    client_ws = _FakeWebSocket(frames=[frame])
+
+    with patch.dict(
+        sys.modules,
+        {"websockets": _make_fake_websockets_module(upstream)},
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    payload = json.loads(upstream.sent[0])["response"]
+    assert payload["text"]["verbosity"] == "low"
+
+
+@pytest.mark.asyncio
 async def test_ws_output_shaper_stratum_uses_frame_input_tokens(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")

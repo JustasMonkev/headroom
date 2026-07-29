@@ -59,7 +59,8 @@ def can_create_openai_text_verbosity(
       format) while the upstream is an arbitrary compatible gateway that may
       reject the field. That gap widened when the shared model parser started
       accepting vendor-prefixed ids such as ``openai/gpt-5.5`` — exactly the
-      ids gateways use — where the old anchored ``gpt-…`` regex rejected them.
+      ids gateways use — where this gate's previous anchored
+      ``startswith("gpt-5")`` check rejected them.
       So ``first_party_target`` must carry the *verified upstream identity*
       (:func:`headroom.proxy.helpers.is_first_party_openai_target` applied to
       the already-resolved destination), never the request dialect.
