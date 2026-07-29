@@ -123,19 +123,7 @@ def test_pipeline_compacts_log_output(tokenizer):
     assert expand_runs(out) == strip_ansi(LOG)
 
 
-def test_lossless_folds_never_inflate_tokens(tokenizer):
-    """No lossless fold may shrink bytes while growing tokens.
-
-    This case used to reach the pipeline: `…x2` is a multi-byte ellipsis that
-    merges with nothing (~3 tokens) while a short BPE-friendly duplicate is one
-    or two, so `compact_lossless` returned something 710 bytes -> smaller and
-    token-larger, and only the whole-pass guard below stood between that and
-    the wire. `collapse_runs` now consults the tokenizer per fold, so the
-    inflating output is never produced in the first place.
-
-    The whole-pass guard is still asserted underneath, as the backstop for any
-    future transform that regresses this way.
-    """
+def test_pipeline_rejects_byte_smaller_token_larger_fold(tokenizer):
     lines = []
     for i in range(30):
         line = f"aaaaaaaa{i:02d}"
@@ -143,13 +131,14 @@ def test_lossless_folds_never_inflate_tokens(tokenizer):
     for i in range(10):
         lines[i * 2] = f"INFO {lines[i * 2]}"
     content = "\n".join(lines) + "\n"
-
     folded = compact_lossless(content, "log")
-    assert tokenizer.count_text(folded) <= tokenizer.count_text(content)
+    assert len(folded) < len(content)
+    assert tokenizer.count_text(folded) > tokenizer.count_text(content)
 
-    # Whatever the fold decided, the pipeline forwards no token-larger payload.
     out, transforms = _run(content, "grep", tokenizer)
-    assert tokenizer.count_text(out) <= tokenizer.count_text(content)
+
+    assert out == content
+    assert "router:excluded:lossless_log" not in transforms
 
 
 def test_pipeline_minifies_json_output(tokenizer):

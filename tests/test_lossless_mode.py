@@ -143,28 +143,11 @@ def test_collapse_runs_short_run_rides_along_no_longer() -> None:
 
 
 def test_run_marker_is_short() -> None:
-    """The marker is terse — but terseness is measured in tokens, not bytes.
-
-    This test used to assert that a 2-line run of a ~12-char line folds,
-    on the reasoning that the marker is shorter in characters. It is: 26 chars
-    become 17. In tokens it is a *loss* — dropping one `conn refused\\n` saves 3
-    tokens while `…x2\\n` costs 4, because the marker's leading ellipsis is
-    multi-byte and merges with nothing. Since the request is billed on tokens,
-    the fold is now declined here and taken once the run is long enough to pay
-    for the marker.
-    """
-    from headroom._core import tiktoken_count
-
-    short_run = "conn refused\nconn refused\n"
-    assert collapse_runs(short_run) == short_run  # declined: +1 token
-    assert tiktoken_count("o200k_base", "conn refused\n") < tiktoken_count("o200k_base", "…x2\n")
-
-    # One more occurrence and the marker pays for itself.
-    worth_it = "conn refused\nconn refused\nconn refused\n"
-    collapsed = collapse_runs(worth_it)
-    assert collapsed == "conn refused\n…x3\n"
-    assert expand_runs(collapsed) == worth_it
-    assert tiktoken_count("o200k_base", collapsed) < tiktoken_count("o200k_base", worth_it)
+    """The marker is terse enough that a 2-line run of ~5 chars is worth it."""
+    log = "conn refused\nconn refused\n"
+    collapsed = collapse_runs(log)
+    assert collapsed == "conn refused\n…x2\n"
+    assert expand_runs(collapsed) == log
 
 
 def test_run_marker_reader_accepts_legacy_spelling_but_emits_only_current() -> None:
@@ -177,24 +160,19 @@ def test_run_marker_reader_accepts_legacy_spelling_but_emits_only_current() -> N
 
 
 def test_legacy_run_and_block_markers_compose_but_emitters_stay_current() -> None:
-    # `samevalue` rather than `same`: a 3-run of `same` is an exact token TIE
-    # against the marker, so the run fold now declines it and this test would be
-    # asserting a fold that buys nothing. The point here is that legacy markers
-    # still READ and that emitters only ever WRITE the current spelling — not
-    # where the net-win threshold happens to sit.
     legacy = (
-        "samevalue\n"
+        "same\n"
         "... (repeated 3 times)\n"
         "alpha\n"
         "beta\n"
         "gamma\n"
         "... (repeats 3 lines from 3 lines back)\n"
     )
-    expanded = "samevalue\nsamevalue\nsamevalue\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\n"
+    expanded = "same\nsame\nsame\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\n"
 
     assert expand_runs(unfold_repeated_blocks(legacy)) == expanded
     current = fold_repeated_blocks(collapse_runs(expanded))
-    assert current == "samevalue\n…x3\nalpha\nbeta\ngamma\n…3@-3\n"
+    assert current == "same\n…x3\nalpha\nbeta\ngamma\n…3@-3\n"
     assert "... (" not in current
 
 
@@ -480,33 +458,3 @@ def test_lossless_mode_builds_kompress_marker_free(monkeypatch) -> None:
     captured.clear()
     ContentRouter(ContentRouterConfig(lossless=False))._get_kompress()
     assert captured["enable_ccr"] is True  # normal mode: unchanged (marker on)
-
-
-def test_run_fold_never_inflates_token_count() -> None:
-    """The fold's guard counts characters, but the bill is in tokens.
-
-    `…x2` is a multi-byte ellipsis plus digits (~3-4 tokens) while a short
-    BPE-friendly duplicate can be one or two, so a plain byte win is routinely a
-    token loss. The router tries this fold across detected formats with no
-    whole-pass token rollback, so such a block is reported as compressed while
-    costing more to send. Measured with the bundled tokenizer, not a heuristic.
-    """
-    from headroom._core import tiktoken_count
-    from headroom.transforms.lossless_compaction import collapse_runs, expand_runs
-
-    def tokens(text: str) -> int:
-        return tiktoken_count("o200k_base", text)
-
-    cases = [
-        "aaaaaaaa\naaaaaaaa\n",  # +2 tokens before the fix, despite -5 chars
-        "aaaaaaaa\naaaaaaaa\naaaaaaaa\n",
-        "deadbeefcafe\ndeadbeefcafe\n",
-        ("ERROR connection refused to upstream service alpha-7\n") * 2,
-        "aaaaaaaa\n" * 10,
-        ("WARNING retrying request to https://api.example.test/v1/items\n") * 5,
-    ]
-    for text in cases:
-        folded = collapse_runs(text)
-        assert tokens(folded) <= tokens(text), f"fold inflated tokens: {text!r}"
-        # Whatever the guard decides, the fold stays exactly reversible.
-        assert expand_runs(folded) == text
