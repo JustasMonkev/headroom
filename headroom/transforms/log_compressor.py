@@ -159,9 +159,27 @@ def _represented_count(
     ``ERROR request failed ×5``. The two contradict each other and the phantom
     count can trigger a retrieval for errors already on screen.
 
-    A `` ×N`` suffix counts only when it matches the original survivor and the
-    number of byte-identical source lines.
+    Generated `` ×N`` line folds must match the exact source multiplicity.
+    Generated `` [same trace ×N]`` heads may represent a subset of identical
+    openers split across different trace bodies, so their count need only fit
+    within the source multiplicity. In both cases the source line itself must
+    be unannotated, which keeps literal marker lookalikes from claiming credit.
     """
+    trace_original, trace_sep, trace_tail = line.content.removesuffix("]").rpartition(
+        " [same trace ×"
+    )
+    if trace_sep and trace_tail.isdigit():
+        count = int(trace_tail)
+        source = original_by_line.get(line.line_number)
+        if (
+            count > 1
+            and source is not None
+            and source.level == line.level
+            and source.content == trace_original
+            and identical_counts.get((line.level, trace_original), 0) >= count
+        ):
+            return count
+
     original, sep, tail = line.content.rpartition(" ×")
     if not sep or not tail.isdigit():
         return 1
@@ -621,7 +639,7 @@ class LogCompressor:
             pos = first_at.get(key)
             if pos is None:
                 first_at[key] = len(kept)
-                kept.append(trace)
+                kept.append([replace(line) for line in trace])
                 counts.append(1)
             else:
                 counts[pos] += 1
@@ -715,6 +733,8 @@ class LogCompressor:
         original_by_line = {line.line_number: line for line in all_lines}
         identical_counts: dict[tuple[LogLevel, str], int] = {}
         for line in all_lines:
+            if line.level not in (LogLevel.ERROR, LogLevel.FAIL, LogLevel.WARN):
+                continue
             key = (line.level, line.content)
             identical_counts[key] = identical_counts.get(key, 0) + 1
         parts: list[str] = []

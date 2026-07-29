@@ -932,6 +932,34 @@ class TestC2EmissionWaste:
         assert "[same trace ×" in result.compressed
         assert result.compressed.count('File "app.py", line 12, in run') <= 2
 
+    def test_trace_annotation_does_not_corrupt_folded_error_counts(self):
+        compressor = LogCompressor()
+        all_lines = [
+            LogLine(0, "fatal error: concurrent map writes", LogLevel.ERROR, True),
+            LogLine(1, "runtime.throw()", is_stack_trace=True),
+            LogLine(2, "fatal error: concurrent map writes", LogLevel.ERROR, True),
+            LogLine(3, "runtime.throw()", is_stack_trace=True),
+        ]
+        errors, _, _ = compressor._dedupe_identical([all_lines[0], all_lines[2]], 10)
+        traces, _ = compressor._dedupe_identical_traces(
+            [[all_lines[0], all_lines[1]], [all_lines[2], all_lines[3]]]
+        )
+        selected = sorted({*errors, *traces[0]}, key=lambda line: line.line_number)
+
+        assert all_lines[0].content == "fatal error: concurrent map writes"
+        assert compressor._omission_summary(selected, all_lines) == "2 lines compressed away"
+        assert compressor._omission_summary(traces[0], all_lines) == "2 lines compressed away"
+
+        literal = [
+            LogLine(0, "fatal error: boom [same trace ×2]", LogLevel.ERROR),
+            LogLine(1, "fatal error: boom", LogLevel.ERROR),
+            LogLine(2, "fatal error: boom", LogLevel.ERROR),
+        ]
+        assert (
+            compressor._omission_summary([literal[0]], literal)
+            == "2 lines compressed away: 2 ERROR"
+        )
+
     def test_traces_differing_by_a_line_number_are_both_kept(self):
         def trace(n):
             return [

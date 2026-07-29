@@ -1451,10 +1451,12 @@ fn omission_summary(selected: &[LogLine], all_lines: &[LogLine]) -> Option<Strin
         return None;
     }
     let mut identical_counts: HashMap<(LogLevel, &str), u64> = HashMap::new();
-    for line in all_lines
-        .iter()
-        .filter(|line| matches!(line.level, LogLevel::Error | LogLevel::Fail))
-    {
+    for line in all_lines.iter().filter(|line| {
+        matches!(
+            line.level,
+            LogLevel::Error | LogLevel::Fail | LogLevel::Warn
+        )
+    }) {
         *identical_counts
             .entry((line.level, line.content.as_str()))
             .or_default() += 1;
@@ -1509,6 +1511,25 @@ fn represented_level_count(
         .iter()
         .filter(|line| line.level == level)
         .map(|line| {
+            if let Some((original, count)) = line
+                .content
+                .strip_suffix(']')
+                .and_then(|content| content.rsplit_once(" [same trace ×"))
+                .and_then(|(original, count)| {
+                    count.parse::<u64>().ok().map(|count| (original, count))
+                })
+            {
+                let originals = identical_counts
+                    .get(&(level, original))
+                    .copied()
+                    .unwrap_or_default();
+                let is_generated_fold = original_by_line
+                    .get(&line.line_number)
+                    .is_some_and(|source| source.level == level && source.content == original);
+                if is_generated_fold && count > 1 && count <= originals {
+                    return count;
+                }
+            }
             if !matches!(level, LogLevel::Error | LogLevel::Fail) {
                 return 1;
             }
@@ -2192,6 +2213,66 @@ mod tests {
     }
 
     #[test]
+    fn omission_footer_counts_generated_trace_head_multiplicity_only() {
+        let line = |number, content, level| {
+            let mut line = LogLine::new(number, content);
+            line.level = level;
+            line
+        };
+        let all_lines = vec![
+            line(0, "fatal error: boom", LogLevel::Error),
+            line(1, "fatal error: boom", LogLevel::Error),
+            line(2, "fatal error: boom", LogLevel::Error),
+            line(3, "fatal error: boom", LogLevel::Error),
+        ];
+        let mut generated = all_lines[0].clone();
+        generated.content = "fatal error: boom [same trace ×2]".into();
+
+        let (output, _) = cmp().format_output(&[generated], &all_lines);
+        assert_eq!(
+            output,
+            "fatal error: boom [same trace ×2]\n[3 lines compressed away: 2 ERROR]"
+        );
+
+        let literal_lines = vec![
+            line(0, "fatal error: boom [same trace ×2]", LogLevel::Error),
+            line(1, "fatal error: boom", LogLevel::Error),
+            line(2, "fatal error: boom", LogLevel::Error),
+        ];
+        let (output, _) = cmp().format_output(&literal_lines[0..1], &literal_lines);
+        assert_eq!(
+            output,
+            "fatal error: boom [same trace ×2]\n[2 lines compressed away: 2 ERROR]"
+        );
+
+        let warning_lines = vec![
+            line(0, "at warning (/app.js:1:2)", LogLevel::Warn),
+            line(1, "at warning (/app.js:1:2)", LogLevel::Warn),
+        ];
+        let mut generated = warning_lines[0].clone();
+        generated.content = "at warning (/app.js:1:2) [same trace ×2]".into();
+        let (output, _) = cmp().format_output(&[generated], &warning_lines);
+        assert_eq!(
+            output,
+            "at warning (/app.js:1:2) [same trace ×2]\n[1 lines compressed away]"
+        );
+
+        let literal_lines = vec![
+            line(
+                0,
+                "at warning (/app.js:1:2) [same trace ×2]",
+                LogLevel::Warn,
+            ),
+            line(1, "at warning (/app.js:1:2)", LogLevel::Warn),
+        ];
+        let (output, _) = cmp().format_output(&literal_lines[0..1], &literal_lines);
+        assert_eq!(
+            output,
+            "at warning (/app.js:1:2) [same trace ×2]\n[1 lines compressed away: 1 WARN]"
+        );
+    }
+
+    #[test]
     fn identical_errors_fold_to_one_with_a_count() {
         let lines: Vec<LogLine> = (0..4)
             .map(|i| {
@@ -2313,6 +2394,93 @@ mod tests {
         assert!(
             !footer.contains("ERROR"),
             "footer double-counts folded duplicates: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn counted_trace_head_keeps_default_cap_footer_honest() {
+        let trace = [
+            "fatal error: concurrent map writes",
+            "goroutine 1 [running]:",
+            "main.main()",
+            "\t/work/main.go:42 +0x2a",
+            "",
+        ];
+        let mut lines: Vec<String> = (0..10).map(|i| format!("ERROR before {i}")).collect();
+        lines.extend(trace.iter().map(|line| (*line).into()));
+        lines.push("INFO separator".into());
+        lines.extend(trace.iter().map(|line| (*line).into()));
+        lines.extend((0..2).map(|i| format!("ERROR after {i}")));
+        lines.extend((0..30).map(|i| format!("INFO noise {i}")));
+
+        let config = LogCompressorConfig {
+            enable_ccr: false,
+            ..Default::default()
+        };
+        let (result, _) = LogCompressor::new(config).compress(&lines.join("\n"), 1.0);
+
+        assert!(
+            result
+                .compressed
+                .contains("fatal error: concurrent map writes [same trace ×2]"),
+            "{}",
+            result.compressed
+        );
+        for i in 0..10 {
+            assert!(
+                result.compressed.contains(&format!("ERROR before {i}")),
+                "{}",
+                result.compressed
+            );
+        }
+        for i in 0..2 {
+            assert!(
+                result.compressed.contains(&format!("ERROR after {i}")),
+                "{}",
+                result.compressed
+            );
+        }
+        let footer = result
+            .compressed
+            .lines()
+            .find(|line| line.contains("compressed away"))
+            .unwrap_or("");
+        assert!(
+            !footer.contains("ERROR"),
+            "footer double-counts trace heads: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn counted_warning_trace_head_keeps_footer_honest() {
+        let trace = ["at warning (/app.js:1:2)", "    at helper (/app.js:2:3)"];
+        let mut lines: Vec<String> = trace.iter().map(|line| (*line).into()).collect();
+        lines.push("INFO separator".into());
+        lines.extend(trace.iter().map(|line| (*line).into()));
+        lines.extend((0..100).map(|i| format!("INFO noise {i}")));
+
+        let config = LogCompressorConfig {
+            enable_ccr: false,
+            max_warnings: 0,
+            ..Default::default()
+        };
+        let (result, _) = LogCompressor::new(config).compress(&lines.join("\n"), 1.0);
+        let footer = result
+            .compressed
+            .lines()
+            .find(|line| line.contains("compressed away"))
+            .unwrap_or("");
+
+        assert!(
+            result
+                .compressed
+                .contains("at warning (/app.js:1:2) [same trace ×2]"),
+            "{}",
+            result.compressed
+        );
+        assert!(
+            !footer.contains("WARN"),
+            "footer double-counts warning trace heads: {footer:?}"
         );
     }
 
