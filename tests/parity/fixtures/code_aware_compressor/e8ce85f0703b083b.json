@@ -19,10 +19,10 @@
   "input_sha256": "e8ce85f0703b083bca8130c3b32c97eeb453dfc6dfcde0988cbaf8d9fc75f354",
   "output": {
     "cache_key": null,
-    "compressed": "import os\nimport sys\nfrom typing import List, Optional\n\n@dataclass\nclass Processor:\n    \"\"\"Process a stream of items efficiently.\"\"\"\n    name: str\n    count: int = 0\n    def process(self, items: List[str]) -> List[str]:\n        \"\"\"Process a list of items and return cleaned results.\"\"\"\n        results = []\n        # [7 lines omitted]\n        pass\n    def reset(self):\n        self.count = 0\n\ndef standalone(x: int, y: int) -> int:\n    total = 0\n    # [4 lines omitted]\n    pass\n\nGLOBAL_CONST = 42\nif __name__ == \"__main__\":\n    p = Processor(\"main\")\n    print(p.process([\"a\", \"b\"]))",
+    "compressed": "import os\nimport sys\nfrom typing import List, Optional\n\n@dataclass\nclass Processor:\n    \"\"\"Process a stream of items efficiently.\"\"\"\n    name: str\n    count: int = 0\n    def process(self, items: List[str]) -> List[str]:\n        \"\"\"Process a list of items and return cleaned results.\"\"\"\n        results = []\n        # [7 lines omitted]\n    def reset(self):\n        self.count = 0\n\ndef standalone(x: int, y: int) -> int:\n    total = 0\n    # [4 lines omitted]\n\nGLOBAL_CONST = 42\nif __name__ == \"__main__\":\n    p = Processor(\"main\")\n    print(p.process([\"a\", \"b\"]))",
     "compressed_bodies": 0,
-    "compressed_tokens": 145,
-    "compression_ratio": 0.7073170731707317,
+    "compressed_tokens": 140,
+    "compression_ratio": 0.6829268292682927,
     "language": "python",
     "language_confidence": 1.0,
     "original": "import os\nimport sys\nfrom typing import List, Optional\n\nGLOBAL_CONST = 42\n\n@dataclass\nclass Processor:\n    \"\"\"Process a stream of items efficiently.\"\"\"\n    name: str\n    count: int = 0\n\n    def process(self, items: List[str]) -> List[str]:\n        \"\"\"Process a list of items and return cleaned results.\"\"\"\n        results = []\n        for item in items:\n            if not item:\n                continue\n            processed = item.strip().lower()\n            results.append(processed)\n            self.count += 1\n        return results\n\n    def reset(self):\n        self.count = 0\n\n\ndef standalone(x: int, y: int) -> int:\n    total = 0\n    for i in range(x):\n        for j in range(y):\n            total += i * j\n    return total\n\n\nif __name__ == \"__main__\":\n    p = Processor(\"main\")\n    print(p.process([\"a\", \"b\"]))\n",

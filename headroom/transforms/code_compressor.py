@@ -795,6 +795,9 @@ class _SymbolAnalysis:
     ref_counts: dict[str, int] = field(default_factory=dict)
     body_line_counts: dict[str, int] = field(default_factory=dict)
     bare_names: dict[str, str] = field(default_factory=dict)  # qname -> short_name
+    # Memoized set of callees named by >50% of this file's functions; see
+    # `_ubiquitous_callees`. None means "not computed yet".
+    common_callees: frozenset[str] | None = None
 
 
 class CodeAwareCompressor(Transform):
@@ -1263,13 +1266,16 @@ class CodeAwareCompressor(Transform):
                     )
                     summary_str = f" {code_summary}." if code_summary else ""
 
-                    # Use the actual config attribute (not the wrong name)
-                    ttl_min = max(1, self.config.ccr_ttl // 60)
+                    # No `Expires in Nm.` clause. It cost ~6 tokens per marker
+                    # to tell the model something it cannot act on (it has no
+                    # clock, and the TTL is measured from store time then
+                    # replayed verbatim on every later turn) — and it was
+                    # wrong: it printed this compressor's `ccr_ttl` (300s → 5m)
+                    # while the store's real TTL is 1800s.
                     compressed += (
                         f"\n# [{original_tokens - compressed_tokens} tokens compressed."
                         f"{summary_str}"
-                        f" Retrieve more: hash={cache_key}."
-                        f" Expires in {ttl_min}m.]"
+                        f" Retrieve more: hash={cache_key}]"
                     )
 
             return CodeCompressionResult(
@@ -1831,10 +1837,11 @@ class CodeAwareCompressor(Transform):
         if opening_brace_line is not None:
             result_parts.append(opening_brace_line)
 
-        if docstring_text and self.config.docstring_mode not in (
+        emitted_docstring = bool(docstring_text) and self.config.docstring_mode not in (
             DocstringMode.NONE,
             DocstringMode.REMOVE,
-        ):
+        )
+        if emitted_docstring:
             result_parts.append(docstring_text)
 
         if kept_lines:
@@ -1846,7 +1853,13 @@ class CodeAwareCompressor(Transform):
                     func_name, omitted_lines, indent, lang_config.comment_prefix, analysis
                 )
             )
-            if lang_config.uses_colon_after_signature:
+            # `pass` is only needed when the body would otherwise be EMPTY —
+            # a comment alone is not a statement, so the colon-suffixed
+            # languages need a filler. When a docstring or any kept line
+            # survives, the block already has a body and the extra `pass` is
+            # ~4 wasted tokens per compressed function that also misreads as
+            # real control flow.
+            if lang_config.uses_colon_after_signature and not kept_lines and not emitted_docstring:
                 result_parts.append(f"{indent}pass")
 
         if closing_brace_line is not None:
@@ -2411,6 +2424,41 @@ def _get_body_limit(
     return max_body_lines
 
 
+# At most this many callees are listed in an omitted-body comment. The list is
+# a hint about what the body reached for, not an index of it.
+_MAX_CALLS_LISTED = 3
+
+# A callee named by more than this fraction of the file's functions carries no
+# information about any one of them.
+_UBIQUITOUS_CALLEE_RATIO = 0.5
+
+
+def _ubiquitous_callees(analysis: _SymbolAnalysis) -> frozenset[str]:
+    """Callees named by more than half the file's functions (memoized)."""
+    cached = analysis.common_callees
+    if cached is not None:
+        return cached
+    total = len(analysis.calls)
+    if total < 4:
+        # Too few functions for "most of them" to mean anything.
+        computed: frozenset[str] = frozenset()
+    else:
+        counts: dict[str, int] = {}
+        for called in analysis.calls.values():
+            for name in called:
+                counts[name] = counts.get(name, 0) + 1
+        threshold = total * _UBIQUITOUS_CALLEE_RATIO
+        computed = frozenset(name for name, n in counts.items() if n > threshold)
+    analysis.common_callees = computed
+    return computed
+
+
+def _informative_callees(analysis: _SymbolAnalysis, called: set[str]) -> list[str]:
+    """Sorted locally defined callees worth naming."""
+    common = _ubiquitous_callees(analysis)
+    return [name for name in sorted(called) if name not in common]
+
+
 def _make_omitted_comment(
     func_name: str | None,
     omitted_count: int,
@@ -2418,7 +2466,19 @@ def _make_omitted_comment(
     comment_prefix: str,
     analysis: _SymbolAnalysis | None,
 ) -> str:
-    """Build omitted comment with call information from analysis."""
+    """Build omitted comment with call information from analysis.
+
+    The `calls:` list is what the reader gets *instead of* the body, so it has
+    to carry signal. Two filters keep it that way:
+
+    * **Ubiquitous callees are dropped.** Anything called by more than half the
+      functions in the file is background noise for this file specifically —
+      the module's own helper that everything routes through carries no
+      discriminating information.
+    * **Capped at 3, with no `+N more`.** The list is a hint, not an index; the
+      suffix cost ~5 tokens to say the hint was truncated, which the reader can
+      already assume.
+    """
     calls_info = ""
     if analysis and func_name:
         for key in (
@@ -2426,12 +2486,9 @@ def _make_omitted_comment(
             *(k for k in analysis.calls if k.endswith(f".{func_name}")),
         ):
             if key in analysis.calls:
-                called = analysis.calls[key]
+                called = _informative_callees(analysis, analysis.calls[key])
                 if called:
-                    sorted_calls = sorted(called)[:5]
-                    calls_info = "; calls: " + ", ".join(sorted_calls)
-                    if len(called) > 5:
-                        calls_info += f" +{len(called) - 5} more"
+                    calls_info = "; calls: " + ", ".join(called[:_MAX_CALLS_LISTED])
                 break
     return f"{indent}{comment_prefix} [{omitted_count} lines omitted{calls_info}]"
 

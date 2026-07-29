@@ -20,11 +20,13 @@ from headroom.transforms.lossless_compaction import (
     compact_lossless,
     diff_strip_index,
     expand_runs,
+    fold_repeated_blocks,
     is_run_collapsed,
     search_fold_recovers,
     search_heading,
     search_unheading,
     strip_ansi,
+    unfold_repeated_blocks,
 )
 
 
@@ -96,6 +98,82 @@ def test_collapse_runs_singletons_untouched() -> None:
 def test_collapse_runs_empty() -> None:
     assert collapse_runs("") == ""
     assert expand_runs("") == ""
+
+
+# --------------------------------------------------------------------------
+# Per-fold net-win guard (a marker must cost less than the run it replaces)
+# --------------------------------------------------------------------------
+def test_collapse_runs_skips_runs_the_marker_would_not_shrink() -> None:
+    """Two short identical lines: the marker costs more than the duplicate."""
+    log = "ok\nok\n"
+    assert collapse_runs(log) == log
+    assert not is_run_collapsed(collapse_runs(log))
+
+
+def test_collapse_runs_never_grows_its_input() -> None:
+    """The whole point of the guard: no input gets bigger, on any shape."""
+    cases = [
+        "a\na\n",
+        "ab\nab\nab\n",
+        "x\nx\nx\nx\nx\nx\nx\nx\n",
+        "short\nshort\n",
+        "a really quite long log line that repeats\n" * 2,
+        "tiny\ntiny\n" + "a really quite long log line that repeats\n" * 9,
+    ]
+    for text in cases:
+        out = collapse_runs(text)
+        assert len(out) <= len(text), text
+        assert expand_runs(out) == text, text
+
+
+def test_collapse_runs_short_run_rides_along_no_longer() -> None:
+    """A long winning run must not smuggle a losing short run onto the wire.
+
+    Only the *global* size check used to stand between a net-negative fold and
+    the output, so any input where one long run won carried every short run's
+    loss with it.
+    """
+    text = "a\na\n" + "a very long line that genuinely benefits from collapsing\n" * 8
+    out = collapse_runs(text)
+    assert expand_runs(out) == text
+    # The long run folded...
+    assert is_run_collapsed(out)
+    # ...and the leading 1-char pair did not.
+    assert out.startswith("a\na\n")
+
+
+def test_run_marker_is_short() -> None:
+    """The marker is terse enough that a 2-line run of ~5 chars is worth it."""
+    log = "conn refused\nconn refused\n"
+    collapsed = collapse_runs(log)
+    assert collapsed == "conn refused\n…x2\n"
+    assert expand_runs(collapsed) == log
+
+
+def test_run_marker_reader_accepts_legacy_spelling_but_emits_only_current() -> None:
+    legacy = "conn refused\n... (repeated 3 times)\ndone\n"
+    expanded = "conn refused\nconn refused\nconn refused\ndone\n"
+
+    assert is_run_collapsed(legacy)
+    assert expand_runs(legacy) == expanded
+    assert collapse_runs(expanded) == "conn refused\n…x3\ndone\n"
+
+
+def test_legacy_run_and_block_markers_compose_but_emitters_stay_current() -> None:
+    legacy = (
+        "same\n"
+        "... (repeated 3 times)\n"
+        "alpha\n"
+        "beta\n"
+        "gamma\n"
+        "... (repeats 3 lines from 3 lines back)\n"
+    )
+    expanded = "same\nsame\nsame\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\n"
+
+    assert expand_runs(unfold_repeated_blocks(legacy)) == expanded
+    current = fold_repeated_blocks(collapse_runs(expanded))
+    assert current == "same\n…x3\nalpha\nbeta\ngamma\n…3@-3\n"
+    assert "... (" not in current
 
 
 # --------------------------------------------------------------------------

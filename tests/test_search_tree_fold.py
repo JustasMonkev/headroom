@@ -627,3 +627,114 @@ def test_search_fold_recovers_rejects_a_fold_of_different_content():
 def test_ambiguous_blobs_are_still_recoverable_given_the_original(original):
     out = compact_lossless(original, "search")
     assert out == original or search_fold_recovers(out, original)
+
+
+# --------------------------------------------------------------------------
+# C12: the composed dir+file fold
+#
+# `search_heading` factors a repeated FILE and `search_dir_heading` factors a
+# repeated DIRECTORY; picking whichever is smaller ALONE leaves the other axis
+# unfolded. `search_tree_heading` normally composes both, but it declines on
+# shapes it cannot parse unambiguously (a space in the path plus a `-<digits>-`
+# marker inside it). On those, the explicit composition is the only fold left.
+# --------------------------------------------------------------------------
+def test_composed_dir_then_file_fold_wins_where_the_tree_fold_declines():
+    from headroom.transforms.lossless_compaction import (
+        compact_lossless,
+        search_dir_heading,
+        search_heading,
+        search_tree_heading,
+    )
+
+    grep = "\n".join(
+        f"my project/logs 2026-05-03/{mod}.py:{10 + i}:    value = compute(item, ctx)"
+        for mod in ("alpha", "beta", "gamma")
+        for i in range(4)
+    )
+
+    # The tree fold declines this shape outright.
+    assert search_tree_heading(grep) == grep
+
+    out = compact_lossless(grep, "search")
+    assert len(out) < len(search_heading(grep))
+    assert len(out) < len(search_dir_heading(grep))
+
+
+def test_composed_fold_round_trips_exactly():
+    from headroom.transforms.lossless_compaction import (
+        search_dir_heading,
+        search_dir_unheading,
+        search_heading,
+        search_unheading,
+    )
+
+    grep = "\n".join(
+        f"my project/logs 2026-05-03/{mod}.py:{10 + i}:    value = compute(item, ctx)"
+        for mod in ("alpha", "beta", "gamma")
+        for i in range(4)
+    )
+    folded = search_heading(search_dir_heading(grep))
+    assert search_dir_unheading(search_unheading(folded)) == grep
+
+
+def test_composed_fold_never_wins_by_breaking_the_round_trip():
+    """Every candidate is verified; a composition that can't invert must lose."""
+    from headroom.transforms.lossless_compaction import compact_lossless
+
+    # Content that is itself heading-shaped — the folds cannot survive it.
+    grep = "src/\na.py\n12:body\nsrc/a.py:12:body\n"
+    out = compact_lossless(grep, "search")
+    assert len(out) <= len(grep)
+
+
+# --- gating the composed candidate ---------------------------------------
+
+
+def test_repetition_axes_sees_only_what_the_folds_could_fold():
+    from headroom.transforms.lossless_compaction import _search_repetition_axes
+
+    one_file = "pkg/a.py:1:x\npkg/a.py:2:y\npkg/a.py:3:z\n"
+    one_dir = "pkg/a.py:1:x\npkg/b.py:2:y\npkg/c.py:3:z\n"
+    both = "pkg/a.py:1:x\npkg/a.py:2:y\npkg/b.py:3:z\npkg/b.py:4:w\n"
+
+    assert _search_repetition_axes(one_file) == (True, False)
+    assert _search_repetition_axes(one_dir) == (False, True)
+    assert _search_repetition_axes(both) == (True, True)
+    # Not search output at all.
+    assert _search_repetition_axes("just some prose\nand more of it\n") == (False, False)
+    # Repetition that is never adjacent is not repetition the folds can use.
+    assert _search_repetition_axes("a/x.py:1:p\nb/y.py:2:q\na/x.py:3:r\n") == (False, False)
+
+
+@pytest.mark.parametrize(
+    "grep",
+    [
+        # one file, many matches
+        "".join(f"src/services/invoice.py:{40 + i}:    total += item\n" for i in range(12)),
+        # one dir, one match per file
+        "".join(f"src/services/h{i}.py:{10 + i}:from .invoice import Invoice\n" for i in range(12)),
+        # both axes
+        "".join(
+            f"src/services/h{f}.py:{10 + m}:    charge(customer, amount)\n"
+            for f in range(6)
+            for m in range(3)
+        ),
+        # not search output
+        "".join(f"the quick brown fox, iteration {i}\n" for i in range(12)),
+    ],
+)
+def test_gating_the_composed_candidate_changes_no_output(grep, monkeypatch):
+    """The gate is a pure cost optimisation: byte-identical results.
+
+    Pinned by comparing against an ungated run — if a future edit makes the
+    axis scan disagree with what the folds can actually exploit, the gated
+    result gets larger and this fails.
+    """
+    import headroom.transforms.lossless_compaction as L
+
+    gated = L.compact_lossless(grep, "search")
+    monkeypatch.setattr(L, "_search_repetition_axes", lambda _t: (True, True))
+    ungated = L.compact_lossless(grep, "search")
+
+    assert gated == ungated
+    assert search_fold_recovers(gated, grep)

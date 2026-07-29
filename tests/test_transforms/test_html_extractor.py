@@ -593,3 +593,343 @@ if __name__ == '__main__':
 """
         result = detect_content_type(code)
         assert result.content_type == ContentType.SOURCE_CODE
+
+
+class TestURLSlimming:
+    """C10: shorten link targets losslessly instead of dropping links.
+
+    Turning `include_links` off would be unrecoverable — the router forwards
+    only `HTMLExtractionResult.extracted` and the original HTML is never stored
+    in CCR, and on docs/search/index pages the destination URL often *is* the
+    payload. These edits remove only bytes the destination server ignores.
+    """
+
+    @pytest.fixture
+    def extractor(self):
+        return HTMLExtractor()
+
+    def test_tracking_params_are_stripped(self, extractor):
+        text = "See [the guide](https://a.example/g?utm_source=news&utm_campaign=x&page=2)."
+        out = extractor._slim_urls(text, None)
+        assert out == "See [the guide](https://a.example/g?page=2)."
+
+    def test_non_utm_tracking_params_are_stripped(self, extractor):
+        text = "[x](https://a.example/p?gclid=Cj0KCQ&fbclid=IwAR&id=7)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?id=7)"
+
+    def test_same_origin_links_fold_to_a_path(self, extractor):
+        text = "[next](https://docs.example.com/guide/start)"
+        out = extractor._slim_urls(text, "https://docs.example.com/index.html")
+        assert out == "[next](/guide/start)"
+
+    def test_cross_origin_links_keep_their_origin(self, extractor):
+        text = "[out](https://other.example/page)"
+        out = extractor._slim_urls(text, "https://docs.example.com/index.html")
+        assert out == "[out](https://other.example/page)"
+
+    def test_non_http_targets_are_untouched(self, extractor):
+        for target in ("mailto:a@b.com", "#anchor", "/already/relative", "tel:+15551234"):
+            text = f"[x]({target})"
+            assert extractor._slim_urls(text, "https://a.example/p") == text
+
+    def test_never_emits_an_empty_target(self, extractor):
+        """A bare `]()` is a broken link — strictly worse than the bytes saved."""
+        text = "[home](https://a.example)"
+        out = extractor._slim_urls(text, "https://a.example/p")
+        assert "]()" not in out
+        assert out == "[home](/)"
+
+    def test_link_text_is_never_touched(self, extractor):
+        text = "[utm_source is a tracking param](https://a.example/p?utm_source=x)"
+        out = extractor._slim_urls(text, None)
+        assert out.startswith("[utm_source is a tracking param]")
+
+    def test_slimming_can_be_turned_off(self):
+        e = HTMLExtractor(
+            HTMLExtractorConfig(strip_tracking_params=False, relativize_same_origin_links=False)
+        )
+        text = "[x](https://a.example/p?utm_source=news)"
+        assert e._slim_urls(text, "https://a.example/q") == text
+
+    def test_links_are_still_present_after_extraction(self, extractor):
+        """The whole point: links survive, they are just shorter."""
+        html = """
+        <html><body><article>
+        <p>Read the documentation for details about the compression pipeline
+        and how the router dispatches each content type to its compressor.</p>
+        <p>See <a href="https://docs.example.com/guide?utm_source=nav&amp;v=2">the guide</a>
+        for the full walkthrough of every stage in the pipeline.</p>
+        </article></body></html>
+        """
+        result = extractor.extract(html, url="https://docs.example.com/index.html")
+        if "](" in result.extracted:  # trafilatura kept the link
+            assert "utm_source" not in result.extracted
+            assert "/guide" in result.extracted
+
+
+class TestURLSlimmingIsConservative:
+    """PR #16 review: slimming must never be able to break a link.
+
+    The router forwards only the *extracted* text and never keeps the original
+    HTML in CCR, so a URL this transform breaks is permanently broken. Two
+    hazards the first cut had:
+
+    (a) it rebuilt the whole query through ``parse_qsl``/``urlencode``, which
+        re-encodes bytes even when no parameter is dropped — enough on its own
+        to invalidate a signature computed over the original query string;
+    (b) it dropped tracking-*looking* keys (`ref_url`, `spm`) that some
+        destinations give real meaning to.
+
+    Plus a third, in the origin fold: a same-origin path that itself starts
+    with ``//`` becomes a scheme-relative URL — a *different host* — when the
+    origin is removed.
+    """
+
+    @pytest.fixture
+    def extractor(self):
+        return HTMLExtractor()
+
+    # -- (a) never re-encode bytes we did not intend to change --------------
+
+    def test_kept_params_keep_their_exact_bytes(self, extractor):
+        """`parse_qsl`/`urlencode` would rewrite `%20` to `+` and `%2B` to
+        `%252B`. Kept parameters must survive byte-for-byte."""
+        text = "[x](https://a.example/s?q=a%2Bb%20c&utm_source=news)"
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://a.example/s?q=a%2Bb%20c)"
+
+    def test_signed_query_is_left_completely_alone(self, extractor):
+        """An AWS-style presigned URL: the MAC covers the original query, so
+        even dropping an unrelated `utm_source` invalidates it."""
+        url = (
+            "https://b.example/f.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Credential=AKIA%2F20260101%2Fus-east-1%2Fs3%2Faws4_request"
+            "&X-Amz-Signature=deadbeef&utm_source=news"
+        )
+        text = f"[dl]({url})"
+        assert extractor._slim_urls(text, None) == text
+
+    @pytest.mark.parametrize(
+        "signed_pair",
+        [
+            "sig=abc123",
+            "signature=abc123",
+            "token=abc123",
+            "access_token=abc123",
+            "auth_key=abc123",
+            "auth-key=abc123",
+            "auth.key=abc123",
+            "authKey=abc123",
+            "authorization=Bearer",
+            "hmac=abc123",
+            "expires=1893456000",
+            "X-Goog-Signature=abc123",
+            "policy=eyJ0",
+        ],
+    )
+    def test_signature_shaped_keys_disable_slimming(self, extractor, signed_pair):
+        text = f"[x](https://a.example/f?{signed_pair}&utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_auth_and_key_substrings_do_not_disable_slimming(self, extractor):
+        text = "[x](https://a.example/f?author=ada&keyboard=qwerty&utm_source=news)"
+        assert (
+            extractor._slim_urls(text, None)
+            == "[x](https://a.example/f?author=ada&keyboard=qwerty)"
+        )
+
+    def test_valueless_segment_disables_slimming(self, extractor):
+        """A bare segment can itself be a signature blob; we cannot tell."""
+        text = "[x](https://a.example/f?ZXlKMGVYQWlP&utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_legacy_semicolon_separator_disables_slimming(self, extractor):
+        text = "[x](https://a.example/f?a=1;utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_question_mark_inside_a_fragment_is_not_a_query(self, extractor):
+        text = "[x](https://a.example/p#section?utm_source=news)"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_fragment_survives_a_dropped_param(self, extractor):
+        text = "[x](https://a.example/p?utm_source=news&a=1#frag)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?a=1#frag)"
+
+    def test_all_tracking_query_drops_the_question_mark(self, extractor):
+        text = "[x](https://a.example/p?utm_source=news)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p)"
+
+    # -- (b) tracking-looking keys the destination may actually use ---------
+
+    def test_ref_url_is_preserved(self, extractor):
+        """`ref_url` is the real destination on some redirectors; dropping it
+        turns the link into a different page."""
+        text = "[x](https://a.example/r?ref_url=https%3A%2F%2Fx.example%2Fp&utm_source=n)"
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://a.example/r?ref_url=https%3A%2F%2Fx.example%2Fp)"
+
+    def test_spm_is_preserved(self, extractor):
+        text = "[x](https://a.example/i?spm=a2h0k.1&id=9&utm_medium=cpc)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/i?spm=a2h0k.1&id=9)"
+
+    # -- unambiguous vendor click IDs still go ------------------------------
+
+    def test_opaque_click_ids_are_still_stripped(self, extractor):
+        text = "[x](https://a.example/p?gclid=Cj0KCQ&fbclid=IwAR&utm_source=n&id=7)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?id=7)"
+
+    # -- (c) same-origin `//` paths ----------------------------------------
+
+    def test_same_origin_double_slash_path_keeps_its_origin(self, extractor):
+        """`https://example.com//cdn.example.net/file` folded to
+        `//cdn.example.net/file` is read by Markdown clients as
+        `https://cdn.example.net/file` — a different host."""
+        text = "[x](https://example.com//cdn.example.net/file)"
+        out = extractor._slim_urls(text, "https://example.com/page")
+        assert out == text
+        assert "](//" not in out
+
+    def test_ordinary_same_origin_paths_still_fold(self, extractor):
+        text = "[x](https://example.com/cdn/file)"
+        out = extractor._slim_urls(text, "https://example.com/page")
+        assert out == "[x](/cdn/file)"
+
+
+class TestPercentEncodedQueryKeys:
+    """PR #16 review round 3: classify query keys by what a server *reads*.
+
+    The signed-query guard used to test the raw key bytes, so a signature
+    parameter whose name was percent-encoded — `?%73ignature=…`, which is
+    `?signature=…` to anything that decodes before dispatching — slipped past
+    it, and the tracking parameter beside it was removed. That invalidates the
+    MAC, and extraction output is not recoverable, so the link stays broken.
+
+    Keys are now decoded *into a copy* purely to classify them; the emitted URL
+    always keeps its original bytes. Two rules follow:
+
+    * every reading of a key (raw, and each decoding pass) must clear the
+      signed-query guard, and a key that never decodes to plain text bails out
+      of the whole URL;
+    * a key must be *literal* to be deleted — an encoded `%75tm_source` is
+      `utm_source` only to a server that decodes, and we do not know that this
+      one does.
+    """
+
+    @pytest.fixture
+    def extractor(self):
+        return HTMLExtractor()
+
+    # -- the guard must see through the encoding ----------------------------
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # Codex's first example: a single encoded leading byte.
+            "%73ignature=abc&utm_source=x",
+            # Codex's second example.
+            "X%2DAmz%2DSignature=abc&gclid=x",
+            # Mixed case in the escape: `%2d` and `%2D` decode identically.
+            "X%2damz%2dsignature=abc&gclid=x",
+            # Encoding inside the word, so no literal `signature` substring
+            # survives in the raw key to catch it by accident.
+            "X%2DAmz%2DSignat%75re=abc&gclid=x",
+            "X%2DGoog%2DSignat%75re=abc&utm_source=x",
+            # Decodes to `x-amz-sig`: caught by the vendor prefix, not by any
+            # substring, so only the decoded reading can see it.
+            "X%2DAmz%2DSig=abc&gclid=x",
+            # Double-encoded: one pass yields `%73ignature`, two yield
+            # `signature`. Every pass is classified, not just the first.
+            "%2573ignature=abc&utm_source=x",
+            # Other credential-shaped keys behind an encoded byte.
+            "%73ig=abc&utm_source=x",
+            "%74oken=eyJhbGciOi&utm_medium=email",
+            "e%78pires=1893456000&utm_source=x",
+            "%6Bey=abc&utm_source=x",
+            "%6bey%2Dpair%2Did=APKAI&utm_source=x",
+            "%70olicy=eyJ0&utm_source=x",
+            # Uppercase revealed by decoding (`%53` -> `S`): readings are
+            # lowercased after each pass, not only before the first.
+            "%53ignature=abc&utm_source=x",
+        ],
+    )
+    def test_encoded_signature_keys_disable_slimming(self, extractor, query):
+        text = f"[dl](https://files.example.com/f.zip?{query})"
+        assert extractor._slim_urls(text, None) == text
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # Non-standard `%uXXXX` form: `unquote` leaves it alone, so the
+            # key never resolves and we must not guess.
+            "%u0073ignature=abc&utm_source=x",
+            # Escape with non-hex digits.
+            "%zzsignatur%65=abc&utm_source=x",
+            # Truncated escape at the end of the key.
+            "toke%6=abc&utm_source=x",
+            # Nested deeper than the decode pass limit.
+            "%25252573ignature=abc&utm_source=x",
+        ],
+    )
+    def test_undecodable_keys_disable_slimming(self, extractor, query):
+        """A `%` surviving every pass means we cannot read the key at all —
+        and an unreadable key is exactly where a signature hides."""
+        text = f"[dl](https://files.example.com/f.zip?{query})"
+        assert extractor._slim_urls(text, None) == text
+
+    def test_encoded_key_is_judged_like_its_decoded_equivalent(self, extractor):
+        """The invariant: encoding a key never makes slimming *more* willing
+        to touch the URL than the plain spelling would."""
+        for encoded, plain in [
+            ("%73ignature", "signature"),
+            ("X%2DAmz%2DSig", "X-Amz-Sig"),
+            ("%74oken", "token"),
+            ("%6Bey%2Dpair%2Did", "key-pair-id"),
+            ("e%78pires", "expires"),
+        ]:
+            enc_url = f"https://a.example/f?{encoded}=v&utm_source=n"
+            plain_url = f"https://a.example/f?{plain}=v&utm_source=n"
+            enc_untouched = extractor._slim_urls(f"[l]({enc_url})", None) == f"[l]({enc_url})"
+            plain_untouched = extractor._slim_urls(f"[l]({plain_url})", None) == f"[l]({plain_url})"
+            assert enc_untouched is plain_untouched is True, encoded
+
+    # -- an encoded key is never *deleted* ----------------------------------
+
+    def test_encoded_tracking_key_is_not_stripped(self, extractor):
+        """`%75tm_source` is `utm_source` only to a server that decodes. We do
+        not know that this one does, so the parameter stays — while a literal
+        `gclid` beside it is still dropped."""
+        text = (
+            "[x](https://redir.example.com/h?%75tm_source=https%3A%2F%2Freal.example%2Fp&gclid=y)"
+        )
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://redir.example.com/h?%75tm_source=https%3A%2F%2Freal.example%2Fp)"
+
+    def test_encoded_click_id_is_not_stripped(self, extractor):
+        text = "[x](https://a.example/p?%67clid=realvalue&utm_source=n&id=4)"
+        assert extractor._slim_urls(text, None) == "[x](https://a.example/p?%67clid=realvalue&id=4)"
+
+    def test_plus_in_a_key_is_kept_and_read_as_a_space(self, extractor):
+        """`+` is a space under form encoding, so `a+b` is not a literal key;
+        it survives, but a literal tracking key beside it still goes."""
+        text = "[x](https://legacy.example.com/q?first+name=ada&utm_campaign=x)"
+        assert (
+            extractor._slim_urls(text, None) == "[x](https://legacy.example.com/q?first+name=ada)"
+        )
+
+    # -- but encoding a key does not switch slimming off entirely -----------
+
+    def test_benign_encoded_keys_still_allow_slimming(self, extractor):
+        """Non-ASCII query keys are ordinary on JP/CN/RU sites. They are kept
+        byte-for-byte, and the campaign tag beside them is still dropped."""
+        text = (
+            "[x](https://search.example.jp/s?%E3%82%AF%E3%82%A8%E3%83%AA=%E5%9C%A7&utm_source=nav)"
+        )
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://search.example.jp/s?%E3%82%AF%E3%82%A8%E3%83%AA=%E5%9C%A7)"
+
+    def test_encoded_keys_keep_their_exact_bytes(self, extractor):
+        """Classification decodes a *copy*; the emitted key is never
+        re-encoded, re-cased, or normalised."""
+        text = "[x](https://a.example/p?%E3%82%AF%2Da%2Db=1&%D1%86=2&utm_source=n)"
+        out = extractor._slim_urls(text, None)
+        assert out == "[x](https://a.example/p?%E3%82%AF%2Da%2Db=1&%D1%86=2)"

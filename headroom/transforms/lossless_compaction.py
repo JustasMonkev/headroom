@@ -38,14 +38,43 @@ __all__ = [
 # non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# syslog-style run-collapse marker. The count is captured for exact inversion.
-_RUN_MARKER_RE = re.compile(r"^\.\.\. \(repeated (\d+) times\)$")
+# Syslog-style run-collapse markers. `…x5` is the current spelling; readers
+# also accept the legacy `... (repeated 5 times)` spelling so already-compacted
+# content remains reversible. Both mean the preceding line appears 5 times in
+# total.
+#
+# The emitted marker is deliberately terse. Its English predecessor
+# (``... (repeated 5 times)``) cost ~7 tokens, which is more than the run it
+# replaces on any short line — the whole reason `collapse_runs` needed the
+# per-fold net-win guard below. Digits are bounded so the pattern can never
+# blow up on a pathological line, and every emitter/parser pair here lives
+# beside its regex so the two can only change together.
+_RUN_MARKER_RE = re.compile(
+    r"^(?:…x(?P<current>[0-9]{1,9})|\.\.\. \(repeated (?P<legacy>[0-9]{1,9}) times\))$"
+)
 
-# multi-line block back-reference marker. Length and distance (both in lines,
-# in ORIGINAL coordinates) are captured for exact inversion: everything before
-# a marker expands to the exact original prefix, so `distance` lines back in
-# the expanded output is the block's first occurrence.
-_BLOCK_MARKER_RE = re.compile(r"^\.\.\. \(repeats (\d+) lines from (\d+) lines back\)$")
+# Multi-line block back-reference markers. `…12@-40` is the current spelling;
+# readers also accept the legacy `... (repeats 12 lines from 40 lines back)`.
+# Length and distance (both in lines, in ORIGINAL coordinates) are captured
+# for exact inversion: everything before a marker expands to the exact original
+# prefix, so `distance` lines back in the expanded output is the block's first
+# occurrence.
+_BLOCK_MARKER_RE = re.compile(
+    r"^(?:"
+    r"…(?P<current_length>[0-9]{1,9})@-(?P<current_distance>[0-9]{1,9})"
+    r"|\.\.\. \(repeats (?P<legacy_length>[0-9]{1,9}) lines from "
+    r"(?P<legacy_distance>[0-9]{1,9}) lines back\)"
+    r")$"
+)
+
+
+def _run_marker(count: int) -> str:
+    return f"…x{count}"
+
+
+def _block_marker(length: int, distance: int) -> str:
+    return f"…{length}@-{distance}"
+
 
 # fold_repeated_blocks search bounds: minimum/maximum block length worth a
 # marker, candidate anchors per line, and an input size cap so the scan stays
@@ -96,7 +125,15 @@ def collapse_runs(text: str) -> str:
     """Collapse runs of >=2 identical consecutive lines (syslog convention).
 
     A run of N (N>=2) identical lines becomes the line once followed by
-    ``... (repeated N times)``. Exact inverse: :func:`expand_runs`.
+    ``…xN``. Exact inverse: :func:`expand_runs`.
+
+    Each fold carries its own net-win guard, exactly like
+    :func:`fold_repeated_blocks`. A marker is not free: replacing a run of two
+    8-char lines with a line plus a marker *grows* the payload. Only
+    :func:`compact_lossless`'s global size check stood between that and the
+    wire, so on an input where one long run wins, every short run rode along
+    as pure loss. A run is now collapsed only when the marker costs strictly
+    fewer characters than the duplicate lines it replaces.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
@@ -109,11 +146,15 @@ def collapse_runs(text: str) -> str:
         while j + 1 < n and lines[j + 1] == lines[i]:
             j += 1
         run_len = j - i + 1
+        out.append(lines[i])
         if run_len >= 2:
-            out.append(lines[i])
-            out.append(f"... (repeated {run_len} times)")
-        else:
-            out.append(lines[i])
+            marker = _run_marker(run_len)
+            # Dropped: (run_len - 1) copies of the line, each with its newline.
+            # Added: the marker plus its newline.
+            if (run_len - 1) * (len(lines[i]) + 1) > len(marker) + 1:
+                out.append(marker)
+            else:
+                out.extend(lines[i] for _ in range(run_len - 1))
         i = j + 1
     return _join(out, had_trailing)
 
@@ -131,7 +172,7 @@ def expand_runs(text: str) -> str:
         if i + 1 < n:
             m = _RUN_MARKER_RE.match(lines[i + 1])
             if m:
-                count = int(m.group(1))
+                count = int(m.group("current") or m.group("legacy"))
                 out.extend([line] * count)
                 i += 2
                 continue
@@ -153,7 +194,7 @@ def fold_repeated_blocks(text: str) -> str:
 
     The block-level generalization of :func:`collapse_runs`: a run of K
     consecutive lines (K >= 3) that exactly reproduces K lines seen D lines
-    earlier becomes ``... (repeats K lines from D lines back)``. The repeats
+    earlier becomes ``…K@-D`` ("K lines, from D lines back"). The repeats
     need not be adjacent, which is what config payloads actually look like —
     k8s container stanzas repeat with only the ``name:`` line differing, so
     their identical tails fold even though no two whole stanzas are
@@ -181,7 +222,7 @@ def fold_repeated_blocks(text: str) -> str:
                 best_len = length
                 best_dist = i - q
         if best_len >= _FOLD_MIN_BLOCK:
-            marker = f"... (repeats {best_len} lines from {best_dist} lines back)"
+            marker = _block_marker(best_len, best_dist)
             block_chars = sum(len(lines[i + k]) + 1 for k in range(best_len))
             if block_chars > len(marker) + 1:
                 out.append(marker)
@@ -212,7 +253,8 @@ def unfold_repeated_blocks(text: str) -> str:
     for line in lines:
         m = _BLOCK_MARKER_RE.match(line)
         if m:
-            length, dist = int(m.group(1)), int(m.group(2))
+            length = int(m.group("current_length") or m.group("legacy_length"))
+            dist = int(m.group("current_distance") or m.group("legacy_distance"))
             start = len(out) - dist
             if start >= 0 and length <= dist:
                 out.extend(out[start : start + length])
@@ -323,6 +365,40 @@ def search_dir_heading(text: str) -> str:
             out.append(line)
             current_dir = None
     return _join(out, had_trailing)
+
+
+def _search_repetition_axes(text: str) -> tuple[bool, bool]:
+    """``(file_axis, dir_axis)`` — which repetitions the folds could exploit.
+
+    Both single-axis folds factor *consecutive* runs only, so a path that
+    repeats but never adjacently is not a repetition either fold can use;
+    this scan applies the same adjacency rule. One pass, no allocation beyond
+    the regex match, and it short-circuits as soon as both axes are seen.
+    """
+    file_axis = False
+    dir_axis = False
+    prev_path: str | None = None
+    for line in text.split("\n"):
+        m = _GREP_ROW_RE.match(line)
+        if m is None:
+            # Any non-row line ends the run, exactly as the folds treat it.
+            prev_path = None
+            continue
+        path = m.group("path")
+        if prev_path is None:
+            pass
+        elif path == prev_path:
+            file_axis = True
+        else:
+            # Same dir-part test `search_dir_heading` uses: everything up to
+            # and including the last `/`, and only for paths that have one.
+            cut, prev_cut = path.rfind("/"), prev_path.rfind("/")
+            if cut >= 0 and prev_cut >= 0 and path[: cut + 1] == prev_path[: prev_cut + 1]:
+                dir_axis = True
+        if file_axis and dir_axis:
+            return True, True
+        prev_path = path
+    return file_axis, dir_axis
 
 
 def search_dir_unheading(text: str) -> str:
@@ -949,12 +1025,38 @@ def compact_lossless(content: str, kind: str) -> str:
             # most real result sets. The first two stay as candidates because
             # they are strictly more permissive about what counts as a data row,
             # and so still round-trip on inputs the tree fold declines.
-            best = content
-            for fold, inverse in (
+            # A fourth candidate COMPOSES the two single-axis folds: real
+            # `grep -rn` output repeats a directory across files AND a file
+            # across its own matches, and picking whichever single fold is
+            # smaller alone leaves the other axis unfolded. Folding by
+            # directory first and by file second (with the inverses applied in
+            # the opposite order) captures both on the inputs where the tree
+            # fold declines. The round-trip check below makes it safe: a
+            # composition that doesn't invert exactly simply doesn't win.
+            #
+            # It is GATED on the content actually having both axes. Composing
+            # costs two folds (and, when it wins, two inverses) but can only
+            # beat the single-axis folds when there is something on each axis
+            # to fold; on one-axis or non-search content it was pure overhead
+            # paid on every block that reaches here — and `_has_lossless_fold`
+            # brings *every* block here. `_search_repetition_axes` answers the
+            # question in one allocation-free pass.
+            def _search_dir_then_file(text: str) -> str:
+                return search_heading(search_dir_heading(text))
+
+            def _search_file_then_dir(text: str) -> str:
+                return search_dir_unheading(search_unheading(text))
+
+            candidates = [
                 (search_tree_heading, search_tree_unheading),
                 (search_heading, search_unheading),
                 (search_dir_heading, search_dir_unheading),
-            ):
+            ]
+            if all(_search_repetition_axes(content)):
+                candidates.insert(1, (_search_dir_then_file, _search_file_then_dir))
+
+            best = content
+            for fold, inverse in candidates:
                 # Size first: verifying costs about as much as folding, and a
                 # candidate that isn't smaller than the incumbent can't win no
                 # matter how it verifies. The tree fold leads because it is the

@@ -43,7 +43,7 @@ exists only for unit testing.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, cast
 
@@ -142,6 +142,102 @@ class LogCompressionResult:
 
 
 # ─── LogCompressor (Rust-backed) ────────────────────────────────────────────
+
+
+def _represented_count(
+    line: LogLine,
+    original_by_line: dict[int, LogLine],
+    identical_counts: dict[tuple[LogLevel, str], int],
+) -> int:
+    """How many original lines a SELECTED line stands for.
+
+    Mirrors Rust `represented_count`. Identical-line folding collapses N
+    byte-identical lines into one survivor suffixed ` ×N`. That survivor is one
+    entry in ``selected`` but represents N in ``all_lines``, so a plain
+    ``all - selected`` subtraction reports the other N-1 as omitted — a footer
+    claiming ``4 ERROR`` compressed away directly under a body line reading
+    ``ERROR request failed ×5``. The two contradict each other and the phantom
+    count can trigger a retrieval for errors already on screen.
+
+    Generated `` ×N`` line folds must match the exact source multiplicity.
+    Generated `` [same trace ×N]`` heads may represent a subset of identical
+    openers split across different trace bodies, so their count need only fit
+    within the source multiplicity. In both cases the source line itself must
+    be unannotated, which keeps literal marker lookalikes from claiming credit.
+    """
+    trace_original, trace_sep, trace_tail = line.content.removesuffix("]").rpartition(
+        " [same trace ×"
+    )
+    if trace_sep and trace_tail.isdigit():
+        count = int(trace_tail)
+        source = original_by_line.get(line.line_number)
+        if (
+            count > 1
+            and source is not None
+            and source.level == line.level
+            and source.content == trace_original
+            and identical_counts.get((line.level, trace_original), 0) >= count
+        ):
+            return count
+
+    original, sep, tail = line.content.rpartition(" ×")
+    if not sep or not tail.isdigit():
+        return 1
+    count = int(tail)
+    source = original_by_line.get(line.line_number)
+    if (
+        count > 1
+        and source is not None
+        and source.level == line.level
+        and source.content == original
+        and identical_counts.get((line.level, original)) == count
+    ):
+        return count
+    return 1
+
+
+def _is_exception_token(token: str) -> bool:
+    """Mirror of Rust `is_exception_token`.
+
+    A single dotted identifier whose last segment ends in ``Error``,
+    ``Exception`` or ``Panic`` — ``ValueError``, ``AssertionError``,
+    ``django.db.IntegrityError``.
+    """
+    if not token or len(token) > 96:
+        return False
+    if not all(c.isascii() and (c.isalnum() or c in "_.") for c in token):
+        return False
+    last = token.rsplit(".", 1)[-1]
+    if len(last) <= 5:
+        # `Error` on its own is a word, not a type name; require a prefix.
+        return False
+    return last.endswith(("Error", "Exception", "Panic"))
+
+
+def _is_failure_detail(content: str) -> bool:
+    """Mirror of Rust `is_failure_detail`.
+
+    Lines that say *why* something failed, as opposed to *that* it failed.
+    The level classifier is keyword + word-boundary based, so it sees
+    ``FAILED``/``ERROR`` but never ``AssertionError: expected True`` (no word
+    boundary inside ``AssertionError``) nor pytest's ``E   `` assertion
+    continuations. Those used to survive only as *context* around a nearby
+    FAIL line; with the narrowed context window they are selected directly.
+    """
+    line = content.lstrip()
+    if not line:
+        return False
+    if line.startswith("E"):
+        rest = line[1:]
+        if rest.startswith("  ") and rest.strip():
+            return True
+    if line.startswith(("assert ", "assert(")):
+        return True
+    if "assertion failed" in line or "assertion `" in line:
+        return True
+    if _is_exception_token(line.split(":", 1)[0]):
+        return True
+    return _is_exception_token(line.rsplit(": ", 1)[-1].rstrip())
 
 
 def _format_from_str(name: str) -> LogFormat:
@@ -280,6 +376,11 @@ class LogCompressor:
         summary_patterns = [
             re.compile(r"^={3,}"),
             re.compile(r"^-{3,}"),
+            # pytest's per-failure header (`____ test_invoice_totals ____`).
+            # It is the only place the failing test's name appears next to its
+            # assertion text, so without it the surviving `E   assert 690 ==
+            # 700` is unattributed. See Rust `is_summary_line`.
+            re.compile(r"^_{3,}"),
             re.compile(r"^\d+ (passed|failed|skipped|error|warning)"),
             re.compile(r"^(?:Tests?|Suites?):?\s+\d+"),
             re.compile(r"^(?:TOTAL|Total|Summary)"),
@@ -332,6 +433,11 @@ class LogCompressor:
             LogLevel.UNKNOWN: 0.1,
         }
         score = level_scores.get(log_line.level, 0.1)
+        # Mirrors Rust `score_log_line`: failure detail scores like an error,
+        # so the global `max_total_lines` cap never evicts the *reason* while
+        # keeping the line that merely names the failing test.
+        if score < 1.0 and _is_failure_detail(log_line.content):
+            score = 1.0
         if log_line.is_stack_trace:
             score += 0.3
         if log_line.is_summary:
@@ -350,6 +456,7 @@ class LogCompressor:
         errors: list[LogLine] = []
         fails: list[LogLine] = []
         warnings: list[LogLine] = []
+        failure_details: list[LogLine] = []
         stack_traces: list[list[LogLine]] = []
         summaries: list[LogLine] = []
         current_stack: list[LogLine] = []
@@ -361,6 +468,10 @@ class LogCompressor:
                 fails.append(log_line)
             elif log_line.level == LogLevel.WARN:
                 warnings.append(log_line)
+            elif _is_failure_detail(log_line.content):
+                # Only lines the level classifier did not already claim, so a
+                # line is never folded (and `×N`-annotated) in two buckets.
+                failure_details.append(log_line)
             if log_line.is_stack_trace:
                 current_stack.append(log_line)
             elif current_stack:
@@ -372,20 +483,39 @@ class LogCompressor:
             stack_traces.append(current_stack)
 
         selected: list[LogLine] = []
+        # Byte-identical dedup for errors/fails — see `_dedupe_identical`. The
+        # occurrence map carries the folded duplicates' positions so context is
+        # expanded around EACH of them, not just the survivor. Failure detail is
+        # never context expanded, so it tracks no occurrences (cap 0).
+        errors, suppressed, dup_occurrences = self._dedupe_identical(errors, self.config.max_errors)
+        fails, fail_suppressed, fail_occurrences = self._dedupe_identical(
+            fails, self.config.max_errors
+        )
+        failure_details, detail_suppressed, _ = self._dedupe_identical(failure_details, 0)
+        suppressed |= fail_suppressed
+        suppressed |= detail_suppressed
+        dup_occurrences.update(fail_occurrences)
         if errors:
             selected.extend(self._select_with_first_last(errors, self.config.max_errors))
         if fails:
             selected.extend(self._select_with_first_last(fails, self.config.max_errors))
+        if failure_details:
+            # Own budget, not shared with `max_errors` for ERROR/FAIL: *what*
+            # failed and *why* answer different questions, and a run with 10
+            # failures would otherwise keep 10 names and no reason.
+            selected.extend(self._select_with_first_last(failure_details, self.config.max_errors))
         if warnings:
             if self.config.dedupe_warnings:
                 warnings = self._dedupe_similar(warnings)
             selected.extend(warnings[: self.config.max_warnings])
+        stack_traces, trace_suppressed = self._dedupe_identical_traces(stack_traces)
+        suppressed |= trace_suppressed
         for stack in stack_traces[: self.config.max_stack_traces]:
             selected.extend(stack[: self.config.stack_trace_max_lines])
         if self.config.keep_summary_lines:
             selected.extend(summaries)
 
-        selected = self._add_context(log_lines, selected)
+        selected = self._add_context(log_lines, selected, suppressed, dup_occurrences)
         selected = sorted(set(selected), key=lambda x: x.line_number)
 
         if len(selected) > adaptive_max:
@@ -442,19 +572,125 @@ class LogCompressor:
                 deduped.append(line)
         return deduped
 
-    def _add_context(self, all_lines: list[LogLine], selected: list[LogLine]) -> list[LogLine]:
+    def _dedupe_identical(
+        self, lines: list[LogLine], max_occurrences: int
+    ) -> tuple[list[LogLine], set[int], dict[int, list[int]]]:
+        """Fold BYTE-IDENTICAL lines: keep the first, append ``×N`` to it.
+
+        Mirrors Rust `dedupe_identical`. Deliberately NOT `_dedupe_similar`:
+        that normaliser blanks digits, hex and paths in the trailing region,
+        which on errors is exactly the part that says *which* input failed —
+        ``test_apply[case-3] FAILED`` and ``test_apply[case-9] FAILED`` would
+        become one entry. Only exact repeats are folded.
+
+        Returns ``(kept, suppressed_line_numbers, occurrences)``. The suppressed
+        numbers are excluded from context expansion so a folded duplicate can't
+        ride back in verbatim. ``occurrences`` maps a KEPT line's number to the
+        line numbers of the duplicates folded into it (first-seen order, at most
+        ``max_occurrences`` each).
+
+        That map is the fix for a real loss: equality of the error LINE is not
+        equality of the failure. Two identical ``ERROR request failed`` lines can
+        be followed by completely different diagnostics, and ``_add_context``
+        widens a window around ERROR/FAIL entries. Widening only around the
+        survivor kept the first occurrence's neighbours and dropped every later
+        one's, so the second request's reason left the window altogether — one
+        ``×2`` line plus the database detail, with the permission detail gone.
+        The cap bounds the pathological case (one error repeated 500 times must
+        not open 500 windows); buckets that are never context-expanded pass 0.
+        """
+        first_at: dict[str, int] = {}
+        counts: list[int] = []
+        kept: list[LogLine] = []
+        suppressed: set[int] = set()
+        occurrences: dict[int, list[int]] = {}
+        for line in lines:
+            pos = first_at.get(line.content)
+            if pos is None:
+                first_at[line.content] = len(kept)
+                counts.append(1)
+                kept.append(replace(line))
+            else:
+                counts[pos] += 1
+                suppressed.add(line.line_number)
+                if max_occurrences > 0:
+                    slot = occurrences.setdefault(kept[pos].line_number, [])
+                    if len(slot) < max_occurrences:
+                        slot.append(line.line_number)
+        for line, count in zip(kept, counts, strict=True):
+            if count > 1:
+                line.content = f"{line.content} ×{count}"
+        return kept, suppressed, occurrences
+
+    def _dedupe_identical_traces(
+        self, traces: list[list[LogLine]]
+    ) -> tuple[list[list[LogLine]], set[int]]:
+        """Fold stack traces whose frame lists are byte-identical.
+
+        Mirrors Rust `dedupe_identical_traces` + its `[same trace ×N]` head
+        annotation. One differing frame — a single line number — keeps both.
+        """
+        first_at: dict[str, int] = {}
+        kept: list[list[LogLine]] = []
+        counts: list[int] = []
+        suppressed: set[int] = set()
+        for trace in traces:
+            key = "\n".join(line.content for line in trace)
+            pos = first_at.get(key)
+            if pos is None:
+                first_at[key] = len(kept)
+                kept.append([replace(line) for line in trace])
+                counts.append(1)
+            else:
+                counts[pos] += 1
+                suppressed.update(line.line_number for line in trace)
+        for trace, count in zip(kept, counts, strict=True):
+            if count > 1 and trace:
+                trace[0].content = f"{trace[0].content} [same trace ×{count}]"
+        return kept, suppressed
+
+    def _add_context(
+        self,
+        all_lines: list[LogLine],
+        selected: list[LogLine],
+        suppressed: set[int] | None = None,
+        dup_occurrences: dict[int, list[int]] | None = None,
+    ) -> list[LogLine]:
+        """Expand context around selected ERROR/FAIL/WARN lines only.
+
+        Mirrors Rust `select_lines`. This used to expand around *every*
+        selected line — summaries and trace frames included — so
+        pytest's ``====`` banners (all of which match the summary patterns)
+        dragged in up to ~120 low-value neighbours against a 100-line budget.
+        The window is asymmetric because what follows an error explains it
+        while the line before is usually just the last thing that went right:
+        1 before / 2 after at the default ``error_context_lines = 3``.
+
+        The window is opened around EVERY occurrence of a selected error
+        (``dup_occurrences``, from `_dedupe_identical`), not only the one that
+        survived the ``×N`` fold: identical error text with different
+        surrounding diagnostics is two different failures, and widening only
+        around the survivor dropped the later ones' reasons. The occurrence
+        lists are already capped, so this cannot expand without bound.
+        """
+        suppressed = suppressed or set()
+        dup_occurrences = dup_occurrences or {}
+        before = -(-self.config.error_context_lines // 3)
+        after = -(-(2 * self.config.error_context_lines) // 3)
         selected_indices = {line.line_number for line in selected}
         context_indices: set[int] = set()
-        for idx in selected_indices:
-            for i in range(max(0, idx - self.config.error_context_lines), idx):
-                context_indices.add(i)
-            for i in range(
-                idx + 1,
-                min(len(all_lines), idx + self.config.error_context_lines + 1),
-            ):
-                context_indices.add(i)
-        for idx in context_indices:
-            if idx not in selected_indices and idx < len(all_lines):
+        for line in selected:
+            if line.level not in (LogLevel.ERROR, LogLevel.FAIL, LogLevel.WARN):
+                continue
+            line_before = 0 if line.level == LogLevel.WARN else before
+            line_after = self.config.error_context_lines if line.level == LogLevel.WARN else after
+            for idx in (line.line_number, *dup_occurrences.get(line.line_number, ())):
+                for i in range(max(0, idx - line_before), idx):
+                    context_indices.add(i)
+                for i in range(idx + 1, min(len(all_lines), idx + line_after + 1)):
+                    context_indices.add(i)
+        for idx in sorted(context_indices):
+            if idx not in selected_indices and idx not in suppressed and idx < len(all_lines):
                 selected.append(all_lines[idx])
         return selected
 
@@ -470,21 +706,59 @@ class LogCompressor:
             "selected": len(selected),
         }
         output_lines = [line.content for line in selected]
-        omitted = len(all_lines) - len(selected)
-        if omitted > 0:
-            summary_parts: list[str] = []
-            for label, key in (
-                ("ERROR", "errors"),
-                ("FAIL", "fails"),
-                ("WARN", "warnings"),
-                ("INFO", "info"),
-            ):
-                count = stats[key]
-                if count > 0:
-                    summary_parts.append(f"{count} {label}")
-            if summary_parts:
-                output_lines.append(f"[{omitted} lines omitted: {', '.join(summary_parts)}]")
+        footer = self._omission_summary(selected, all_lines)
+        if footer:
+            output_lines.append(f"[{footer}]")
         return "\n".join(output_lines), stats
+
+    @staticmethod
+    def _omission_summary(selected: list[LogLine], all_lines: list[LogLine]) -> str | None:
+        """Inner text of the omission footer (no brackets), or None.
+
+        Mirrors Rust `omission_summary`. Two fixes over the original:
+
+        * The counts are of what was OMITTED, not of the whole log. A run with
+          12 errors of which 10 were kept used to advertise ``12 ERROR`` in a
+          line whose subject is what got dropped — sending the model to
+          retrieve for errors printed directly above it.
+        * INFO is not listed. It is the largest term and the least actionable;
+          nobody retrieves a log to read its INFO lines.
+
+        The caller fuses this with the CCR hash so the two used to be
+        double-annotated lines become one.
+        """
+        omitted = len(all_lines) - len(selected)
+        if omitted <= 0:
+            return None
+        original_by_line = {line.line_number: line for line in all_lines}
+        identical_counts: dict[tuple[LogLevel, str], int] = {}
+        for line in all_lines:
+            if line.level not in (LogLevel.ERROR, LogLevel.FAIL, LogLevel.WARN):
+                continue
+            key = (line.level, line.content)
+            identical_counts[key] = identical_counts.get(key, 0) + 1
+        parts: list[str] = []
+        for label, level in (
+            ("ERROR", LogLevel.ERROR),
+            ("FAIL", LogLevel.FAIL),
+            ("WARN", LogLevel.WARN),
+        ):
+            dropped = sum(1 for line in all_lines if line.level == level) - sum(
+                _represented_count(line, original_by_line, identical_counts)
+                for line in selected
+                if line.level == level
+            )
+            if dropped > 0:
+                parts.append(f"{dropped} {label}")
+        # "compressed away", not "omitted". The word ``compressed`` is
+        # load-bearing: ``ccr/tool_injection.py``'s marker scanner only
+        # recognises a bracket marker containing it, and after the merge this
+        # line is the ONLY place the retrieval hash appears. A footer saying
+        # "omitted" would leave the model holding a hash the retrieve tool was
+        # never injected for (#1006).
+        if not parts:
+            return f"{omitted} lines compressed away"
+        return f"{omitted} lines compressed away: {', '.join(parts)}"
 
     def _store_in_ccr(self, original: str, compressed: str, original_count: int) -> str | None:
         """Backwards-compat shim — the legacy callsite name. Now

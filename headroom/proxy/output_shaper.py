@@ -267,17 +267,31 @@ def route_openai_reasoning_effort(
     return []
 
 
-def _native_output_controls_available(body: dict[str, Any]) -> bool:
+def _native_output_controls_available(
+    body: dict[str, Any],
+    *,
+    first_party_target: bool = False,
+) -> bool:
     """Whether this request can be shaped via native OpenAI output controls.
 
-    True when ``text.verbosity`` can safely be created for the model, or when
-    the client already sent a recognized ``text.verbosity`` value (presence
-    proves the target model accepts the parameter). Requests with native
-    controls skip the instruction-steering paragraph entirely: the native
-    knob shapes output without spending input tokens, and never appending
-    keeps ``instructions`` byte-stable across every turn of the conversation.
+    True when ``text.verbosity`` can safely be created for this
+    model/upstream pair, or when the client already sent a recognized
+    ``text.verbosity`` value (presence proves the target accepts the
+    parameter, whoever the target is). Requests with native controls skip the
+    instruction-steering paragraph entirely: the native knob shapes output
+    without spending input tokens, and never appending keeps ``instructions``
+    byte-stable across every turn of the conversation.
+
+    The corollary of the upstream gate in
+    :func:`can_create_openai_text_verbosity` is that a non-first-party
+    upstream falls back here to the portable steering paragraph, so output
+    shaping still happens on gateways — it just uses the lever that works
+    everywhere.
     """
-    if can_create_openai_text_verbosity(body.get("model")):
+    if can_create_openai_text_verbosity(
+        body.get("model"),
+        first_party_target=first_party_target,
+    ):
         return True
     text_config = body.get("text")
     if isinstance(text_config, dict):
@@ -286,18 +300,32 @@ def _native_output_controls_available(body: dict[str, Any]) -> bool:
     return False
 
 
-def route_openai_text_verbosity(body: dict[str, Any], kind: TurnKind) -> list[str]:
+def route_openai_text_verbosity(
+    body: dict[str, Any],
+    kind: TurnKind,
+    *,
+    first_party_target: bool = False,
+) -> list[str]:
     """Set or lower OpenAI ``text.verbosity`` on mechanical continuations only.
 
     New user asks and error continuations keep their original verbosity —
     forcing ``low`` onto a fresh question degrades answers the user actually
     wants to read. ``text`` is a per-request parameter, not prompt prefix, so
     varying it by turn kind has no prefix-cache cost.
+
+    ``first_party_target`` gates only *creating* the field (see
+    :func:`can_create_openai_text_verbosity`). Lowering a verbosity the client
+    itself supplied is never upstream-gated: the client already proved the
+    target accepts ``text.verbosity`` by sending it, so the saving is free and
+    available on every gateway.
     """
     if kind is not TurnKind.MECHANICAL_CONTINUATION:
         return []
     text_config = body.get("text")
-    can_create = can_create_openai_text_verbosity(body.get("model"))
+    can_create = can_create_openai_text_verbosity(
+        body.get("model"),
+        first_party_target=first_party_target,
+    )
     if text_config is None:
         if not can_create:
             return []
@@ -323,8 +351,16 @@ def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
     level_override: int | None = None,
+    *,
+    first_party_target: bool = False,
 ) -> ShapeResult:
-    """Apply OpenAI Responses output-shaping levers in place."""
+    """Apply OpenAI Responses output-shaping levers in place.
+
+    ``first_party_target`` is the verified identity of the *effective upstream*
+    for this request (``is_first_party_openai_target(resolved_url)``), not the
+    request dialect. It gates creation of the OpenAI-native ``text.verbosity``
+    field only; every other lever here is portable and runs regardless.
+    """
     if settings is None:
         settings = OutputShaperSettings.from_env()
     result = ShapeResult()
@@ -334,7 +370,10 @@ def shape_openai_responses_request(
     assert result.labels is not None  # __post_init__ guarantees
 
     kind = classify_openai_responses_input(body.get("input"))
-    native_controls = _native_output_controls_available(body)
+    native_controls = _native_output_controls_available(
+        body,
+        first_party_target=first_party_target,
+    )
 
     # Steering paragraph and native output controls are alternatives, not a
     # stack (F5): when the model supports text.verbosity, the native knob
@@ -357,7 +396,11 @@ def shape_openai_responses_request(
             result.labels.extend(labels)
             logger.debug("OpenAIOutputShaper: turn=%s mutations=%s", kind.value, labels)
 
-    labels = route_openai_text_verbosity(body, kind)
+    labels = route_openai_text_verbosity(
+        body,
+        kind,
+        first_party_target=first_party_target,
+    )
     if labels:
         result.changed = True
         result.labels.extend(labels)

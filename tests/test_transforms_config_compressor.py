@@ -200,7 +200,7 @@ def test_flat_yaml_without_structure_not_claimed() -> None:
 def test_fold_round_trip_k8s() -> None:
     folded = fold_repeated_blocks(K8S_MANIFEST)
     assert len(folded) < len(K8S_MANIFEST)
-    assert "lines back)" in folded
+    assert "@-" in folded  # `…K@-D` back-reference marker
     assert unfold_repeated_blocks(folded) == K8S_MANIFEST
 
 
@@ -224,7 +224,7 @@ def test_fold_skips_when_marker_not_smaller() -> None:
 
 
 def test_unfold_leaves_invalid_marker_untouched() -> None:
-    text = "line one\n... (repeats 5 lines from 2 lines back)\n"
+    text = "line one\n…5@-2\n"
     # length > distance: not a marker fold_repeated_blocks could have emitted.
     assert unfold_repeated_blocks(text) == text
 
@@ -240,7 +240,7 @@ def test_compact_lossless_config_bails_on_marker_collision() -> None:
     # so the self-check must return the original unchanged.
     lines = [f"item: {i}" for i in range(3)]
     block = "\n".join(lines)
-    text = block + "\n... (repeats 3 lines from 3 lines back)\n" + block + "\n" + block + "\n"
+    text = block + "\n…3@-3\n" + block + "\n" + block + "\n"
     assert compact_lossless(text, "config") == text
 
 
@@ -530,8 +530,13 @@ def test_tier3_toml_with_datetime_folds(monkeypatch) -> None:
         f'[[event]]\nname = "e{i}"\nwhen = 2026-07-04T09:30:00\nactive = true' for i in range(20)
     )
     comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    # The schema fold itself handles the datetimes...
+    assert comp._schema_fold(toml, "toml", "", 1.0) is not None
+    # ...though end-to-end the pure-lossless text tier is smaller still on this
+    # payload (the block back-reference marker is now ~6 chars), so that is what
+    # `compress` ships. Either way the datetime value survives verbatim.
     result = comp.compress(toml)
-    assert result.strategy == "config_schema_fold"
+    assert result.strategy in {"config", "config_schema_fold"}
     assert "2026-07-04T09:30:00" in result.compressed
 
 

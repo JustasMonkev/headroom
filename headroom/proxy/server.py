@@ -868,6 +868,19 @@ class HeadroomProxy(
             router_config.ccr_inject_marker = False
             if hasattr(config, "ccr_inject_tool"):
                 config.ccr_inject_tool = False
+            # Tool-input compaction is CCR-backed by construction: it replaces
+            # arguments with a `hash=` marker that is only redeemable through
+            # `headroom_retrieve`. Lossless mode has just switched that tool
+            # OFF (and suppressed every marker), so leaving the pass enabled
+            # would strand the arguments — a lossy outcome in the mode whose
+            # entire contract is losslessness. Gate it off explicitly rather
+            # than relying on the pass being opt-in.
+            if router_config.tool_input_compaction.enabled:
+                logger.info(
+                    "lossless mode: disabling tool-input compaction "
+                    "(its CCR retrieval tool is suppressed in this mode)"
+                )
+                router_config.tool_input_compaction = ToolInputCompactionConfig(enabled=False)
         if config.disable_kompress:
             router_config.enable_kompress = False
             # Opt-in restore of the legacy behaviour: send fall-through content

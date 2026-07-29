@@ -55,7 +55,7 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
     outcomes: list[Any] = []
 
     payload = {
-        "model": "gpt-5",
+        "model": "gpt-5.5",
         "input": [
             {
                 "type": "function_call_output",
@@ -90,7 +90,8 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
 
     assert response.status_code == 200
     sent = captured["body"]
-    # gpt-5 has native output controls, so the steering paragraph is NOT
+    # gpt-5.5 is at/above MIN_GPT_FEATURE_VERSION, so it has native output
+    # controls and the steering paragraph is NOT
     # appended (F5) — text.verbosity carries the output shaping instead.
     assert "instructions" not in sent
     assert sent["reasoning"]["effort"] == "low"
@@ -162,3 +163,91 @@ def test_http_responses_output_shaper_holdout_labels_without_rewrite(monkeypatch
     transforms = outcomes[-1].transforms_applied
     assert any(t.startswith("output_shaper:control:") for t in transforms)
     assert "output_shaper:verbosity:L2" not in transforms
+
+
+# --- Native text.verbosity is scoped to a verified first-party upstream -----
+#
+# A `/v1/responses` turn routed through `x-headroom-base-url` still speaks the
+# OpenAI wire format, but the upstream is an arbitrary compatible gateway that
+# may not implement `text.verbosity`. Creating the field there can 400 a
+# request that previously received only portable instruction steering.
+
+_MECHANICAL_TURN = [
+    {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+]
+
+
+def _run_responses_shaping(
+    monkeypatch,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
+    captured: dict[str, Any] = {}
+
+    with _make_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(*args: Any, **kwargs: Any) -> httpx.Response:
+            captured["url"] = args[1]
+            captured["body"] = copy.deepcopy(args[3])
+            return await _ok_response(*args, **kwargs)
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer test-key", **headers},
+            json=payload,
+        )
+
+    assert response.status_code == 200
+    return captured
+
+
+def test_gateway_upstream_does_not_gain_a_created_text_verbosity(monkeypatch):
+    # Vendor-prefixed id clears the model cutoff, but the upstream is a
+    # gateway — no native field may be created there.
+    captured = _run_responses_shaping(
+        monkeypatch,
+        payload={"model": "openai/gpt-5.5", "input": list(_MECHANICAL_TURN)},
+        headers={"x-headroom-base-url": "https://gateway.example/v1"},
+    )
+    sent = captured["body"]
+    assert "gateway.example" in captured["url"]
+    assert "text" not in sent
+    # Output shaping is not lost — it falls back to the portable lever.
+    assert "instructions" in sent
+
+
+def test_first_party_upstream_still_gains_text_verbosity(monkeypatch):
+    captured = _run_responses_shaping(
+        monkeypatch,
+        payload={"model": "openai/gpt-5.5", "input": list(_MECHANICAL_TURN)},
+        headers={},
+    )
+    sent = captured["body"]
+    assert "api.openai.com" in captured["url"]
+    assert sent["text"] == {"verbosity": "low"}
+    # Native knob replaces steering (F5), so no instruction bytes are spent.
+    assert "instructions" not in sent
+
+
+def test_client_supplied_verbosity_is_still_lowered_on_a_gateway(monkeypatch):
+    # The client sending the field proves the gateway accepts it, so lowering
+    # stays available on every upstream.
+    captured = _run_responses_shaping(
+        monkeypatch,
+        payload={
+            "model": "openai/gpt-5.5",
+            "input": list(_MECHANICAL_TURN),
+            "text": {"verbosity": "high"},
+        },
+        headers={"x-headroom-base-url": "https://gateway.example/v1"},
+    )
+    sent = captured["body"]
+    assert sent["text"]["verbosity"] == "low"
+    assert "instructions" not in sent

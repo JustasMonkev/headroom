@@ -946,6 +946,7 @@ class TestExcludeTools:
         # MCP wrapper aliases can still be excluded by their bare tool name.
         assert is_tool_excluded("mcp_HeadroomZai_headroom_retrieve", {"headroom_retrieve"})
         assert is_tool_excluded("mcp__Headroom__headroom_retrieve", {"headroom_retrieve"})
+        assert is_tool_excluded("mcp_my_fs_read_file", {"read_file"})
         # Empty set never excludes.
         assert not is_tool_excluded("Read", set())
 
@@ -1235,7 +1236,17 @@ class TestExcludeTools:
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
         # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep outputs)
-        for tool in ("Read", "Glob", "Grep", "Write", "Edit"):
+        for tool in (
+            "Read",
+            "ReadFile",
+            "read_file",
+            "NotebookRead",
+            "notebook_read",
+            "Glob",
+            "Grep",
+            "Write",
+            "Edit",
+        ):
             assert tool in DEFAULT_EXCLUDE_TOOLS, f"{tool} should be in DEFAULT_EXCLUDE_TOOLS"
             assert tool.lower() in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool.lower()} should be in DEFAULT_EXCLUDE_TOOLS"

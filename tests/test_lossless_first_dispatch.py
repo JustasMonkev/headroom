@@ -9,6 +9,8 @@ its byte-exact fold — the lossless floor is never discarded by a later lossy
 stage.
 """
 
+from types import SimpleNamespace
+
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.lossless_compaction import search_fold_recovers
 
@@ -147,3 +149,35 @@ def test_lossless_mode_non_foldable_is_lossless_noop_not_ratio_too_high():
     assert was is False
     assert rc.get("lossless_noop", 0) >= 1
     assert rc.get("ratio_too_high", 0) == 0
+
+
+def test_token_larger_lossless_chain_cannot_fall_through_or_poison_cache():
+    router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False))
+    original, candidate = "original", "candidate"
+    router._runtime_tokenizer = SimpleNamespace(
+        count_text=lambda text: {original: 10, candidate: 11}[text]
+    )
+    router.compress = lambda *args, **kwargs: SimpleNamespace(
+        compressed=candidate,
+        strategy_chain=["lossless_log", "kompress"],
+        strategy_used=SimpleNamespace(value="log"),
+        compression_ratio=0.1,
+    )
+
+    for _ in range(2):
+        transforms: list[str] = []
+        out, was = router._compress_block_content(
+            original,
+            hash(original),
+            "",
+            1.0,
+            1.0,
+            None,
+            transforms,
+            {},
+            [],
+            "tool_result",
+            "tool",
+            True,
+        )
+        assert (out, was, transforms) == (None, False, [])

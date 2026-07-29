@@ -1165,8 +1165,21 @@ def _shape_openai_responses_for_output(
     input_tokens: int,
     model: str,
     conversation_key: str | None = None,
+    upstream_base_url: str | None = None,
 ) -> Any:
-    """Apply OpenAI Responses output shaping and attach holdout labels."""
+    """Apply OpenAI Responses output shaping and attach holdout labels.
+
+    ``upstream_base_url`` is the *effective upstream* this payload will be
+    forwarded to (per-request ``x-headroom-base-url`` override, ChatGPT/Codex
+    backend, Copilot, or the configured OpenAI target). Only the
+    OpenAI-native ``text.verbosity`` lever consults it — creating that field
+    against a compatible gateway that does not implement it would 400 a
+    request that previously got only portable steering. Unknown/unresolvable
+    upstream fails closed (no field creation); the portable
+    instruction-steering lever still applies, and an already client-supplied
+    verbosity is still lowered.
+    """
+    from headroom.proxy.helpers import is_first_party_openai_target
     from headroom.proxy.output_savings import (
         assign_arm,
         conversation_key_from_body,
@@ -1205,6 +1218,7 @@ def _shape_openai_responses_for_output(
         payload,
         settings=settings,
         level_override=level,
+        first_party_target=is_first_party_openai_target(upstream_base_url),
     )
     shaped.labels = [*result.labels, *(shaped.labels or [])]
     return shaped
@@ -1248,7 +1262,16 @@ def _shape_openai_response_create_frame(
     *,
     input_tokens: int,
     conversation_key: str | None = None,
+    upstream_base_url: str | None = None,
 ) -> tuple[str, bool, list[str], str | None]:
+    """Shape a Codex WebSocket ``response.create`` frame in place.
+
+    ``upstream_base_url`` is the already-resolved upstream WebSocket URL for
+    this session (``wss://chatgpt.com/…`` for ChatGPT session auth, otherwise
+    the configured/overridden OpenAI base rewritten to ``wss://``); it is the
+    same value the compression path receives, and it is what scopes native
+    ``text.verbosity`` creation to a verified first-party target.
+    """
     try:
         parsed = json.loads(raw_msg)
     except json.JSONDecodeError:
@@ -1266,6 +1289,7 @@ def _shape_openai_response_create_frame(
         input_tokens=input_tokens,
         model=str(payload.get("model") or ""),
         conversation_key=conversation_key,
+        upstream_base_url=upstream_base_url,
     )
     labels = list(result.labels or [])
     if not result.changed:
@@ -1827,6 +1851,7 @@ class OpenAIHandlerMixin:
                         )
                     continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
+                    tool_name = function_name_by_call_id.get(call_id, "")
                     if call_id in verbatim_excluded_call_ids:
                         if debug_enabled:
                             extraction_debug.append(
@@ -1848,6 +1873,7 @@ class OpenAIHandlerMixin:
                     # individually using ("output_part", index) slots to preserve the
                     # array structure (non-text parts like images are left untouched).
                     raw_output = item.get("output")
+                    folded = False
                     if isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
                             if (
@@ -1856,15 +1882,21 @@ class OpenAIHandlerMixin:
                                 and isinstance(part.get("text"), str)
                             ):
                                 part_text = part["text"]
-                                pf = router._lossless_compact_excluded(part_text)
+                                pf = router._lossless_compact_excluded(part_text, tool_name)
                                 if pf is not None:
+                                    folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
                     else:
                         excl_out = _responses_part_text(raw_output)
-                        fold = router._lossless_compact_excluded(excl_out) if excl_out else None
+                        fold = (
+                            router._lossless_compact_excluded(excl_out, tool_name)
+                            if excl_out
+                            else None
+                        )
                         if fold is not None:
+                            folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
@@ -1873,7 +1905,7 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": (
                                     "exclude_tools_lossless_fold"
-                                    if fold is not None
+                                    if folded
                                     else "exclude_tools_protected"
                                 ),
                                 "item_type": item_type,
@@ -2325,6 +2357,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timing: dict[str, float] | None = None,
+        upstream_base_url: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2332,6 +2365,12 @@ class OpenAIHandlerMixin:
         function is envelope-agnostic: it extracts Responses text slots into
         provider-neutral compression units, lets ContentRouter choose the
         compressor, then splices accepted replacements back into the payload.
+
+        ``upstream_base_url`` is the *effective upstream* this payload will be
+        forwarded to (per-request ``x-headroom-base-url`` override, ChatGPT/Codex
+        backend, or passthrough target); it falls back to the configured
+        ``OPENAI_API_URL``. Only OpenAI-shape-specific injection (tool-search
+        deferral) consults it — see ``is_first_party_openai_target``.
         """
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -2377,6 +2416,29 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         reason: str | None = None
 
+        # F11: the tool-schema savings are measured STAGE BY STAGE. Both layers
+        # below shrink `working["tools"]`, so diffing each one against the
+        # untouched `payload["tools"]` counted layer 1's reduction twice (once
+        # in its own delta, once inside layer 2's). `_tools_savings_baseline`
+        # always holds the tools as they looked BEFORE the stage being measured.
+        _tools_savings_baseline: Any = payload.get("tools")
+
+        def _add_tool_schema_savings() -> int:
+            """Tokens saved by the most recent tools rewrite, vs the prior stage."""
+            nonlocal _tools_savings_baseline
+            before = _tools_savings_baseline
+            after = working.get("tools")
+            _tools_savings_baseline = after
+            try:
+                tok = self.openai_provider.get_token_counter(model)
+                return max(
+                    0,
+                    tok.count_text(_json_debug_dumps(before))
+                    - tok.count_text(_json_debug_dumps(after)),
+                )
+            except Exception:
+                return 0
+
         tool_compaction_started = time.perf_counter()
         compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
             _compact_openai_responses_tools(working)
@@ -2389,12 +2451,7 @@ class OpenAIHandlerMixin:
             transforms.append("openai:responses:tool_schema_compaction")
             try:
                 tool_token_started = time.perf_counter()
-                tokenizer = self.openai_provider.get_token_counter(model)
-                tokens_saved += max(
-                    0,
-                    tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                    - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
-                )
+                tokens_saved += _add_tool_schema_savings()
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
                 pass
@@ -2430,12 +2487,10 @@ class OpenAIHandlerMixin:
                     modified = True
                     transforms.append("openai:responses:tool_desc_compaction")
                     try:
-                        tokenizer = self.openai_provider.get_token_counter(model)
-                        tokens_saved += max(
-                            0,
-                            tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                            - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
-                        )
+                        # Measured against the post-layer-1 tools, not the
+                        # original payload (F11) — else layer 1's reduction is
+                        # counted a second time here.
+                        tokens_saved += _add_tool_schema_savings()
                     except Exception:
                         pass
                     if debug_enabled:
@@ -2460,9 +2515,30 @@ class OpenAIHandlerMixin:
         # deferred defs still ride in the request body (OpenAI needs them to load
         # on demand), so this is a provider-side context saving, not a request-byte
         # one — hence a transform tag but no tokens_saved claim.
-        from headroom.proxy.helpers import inject_tool_search_deferral_openai
+        #
+        # FIRST-PARTY OPENAI ONLY (automatic path): `tool_search` +
+        # `defer_loading` are OpenAI Responses-specific fields. A `/v1/responses`
+        # request routed through `x-headroom-base-url` (or to Copilot) still
+        # looks like an OpenAI request — same wire format, and the shared model
+        # parser now accepts the vendor-prefixed ids gateways use
+        # (`openai/gpt-5.5`) — while the upstream may not implement tool search
+        # at all, and would reject a request that previously passed through.
+        # So scope automatic injection to a verified OpenAI/ChatGPT host; the
+        # explicit HEADROOM_TOOL_SEARCH / HEADROOM_OPENAI_TOOL_SEARCH_MODELS
+        # overrides remain the way to opt a compatible gateway back in. Mirrors
+        # the Anthropic path's is_first_party_anthropic_target gate.
+        from headroom.proxy.helpers import (
+            inject_tool_search_deferral_openai,
+            is_first_party_openai_target,
+        )
 
-        _deferred_tools = inject_tool_search_deferral_openai(working.get("tools"), model)
+        _deferred_tools = inject_tool_search_deferral_openai(
+            working.get("tools"),
+            model,
+            first_party_target=is_first_party_openai_target(
+                upstream_base_url or getattr(self, "OPENAI_API_URL", None)
+            ),
+        )
         if _deferred_tools is not working.get("tools"):
             if working is payload:
                 working = copy.deepcopy(payload)
@@ -2584,7 +2660,16 @@ class OpenAIHandlerMixin:
         _add_timing("compression_transform_dedupe", dedupe_started)
 
         output_serialization_started = time.perf_counter()
-        output_bytes = json.dumps(working).encode("utf-8")
+        # F10: when nothing was modified, `working` is still the *same object*
+        # as `payload` (every mutating stage deep-copies before writing), so a
+        # second full serialization is guaranteed byte-identical to
+        # `input_bytes`. Reuse it instead — on a large Codex payload that is a
+        # whole redundant `json.dumps` of the entire request on every pass that
+        # found nothing to compress, which is the common case.
+        if working is payload:
+            output_bytes = input_bytes
+        else:
+            output_bytes = json.dumps(working).encode("utf-8")
         _add_timing("compression_output_json_dump", output_serialization_started)
         output_context_budget = _openai_responses_context_budget(working) if debug_enabled else None
         # One-line summary at INFO — the single event a human reading
@@ -2664,6 +2749,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
+        upstream_base_url: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2678,21 +2764,30 @@ class OpenAIHandlerMixin:
             shape_labels, shape_mutated = _shape_openai_responses_payload(
                 payload, model=model, request_id=request_id
             )
-            try:
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                    timing=timing,
-                )
-            except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
-                    raise
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                )
+            # Optional kwargs are peeled off one at a time so a patched/stubbed
+            # `_compress_openai_responses_payload` (tests, provider adapters)
+            # that predates them still works. Only the exact optional kwarg
+            # names are tolerated — any other TypeError propagates.
+            _optional: dict[str, Any] = {"timing": timing}
+            if upstream_base_url is not None:
+                _optional["upstream_base_url"] = upstream_base_url
+            while True:
+                try:
+                    result = self._compress_openai_responses_payload(
+                        payload,
+                        model=model,
+                        request_id=request_id,
+                        **_optional,
+                    )
+                    break
+                except TypeError as exc:
+                    dropped = next(
+                        (k for k in _optional if f"unexpected keyword argument '{k}'" in str(exc)),
+                        None,
+                    )
+                    if dropped is None:
+                        raise
+                    _optional.pop(dropped)
             if shape_labels:
                 # Carry the shaper labels on the transforms channel so the
                 # outcome funnel feeds the output-savings ledger
@@ -3404,6 +3499,31 @@ class OpenAIHandlerMixin:
                 inject_system_instructions=self.config.ccr_inject_system_instructions,
             )
             injector.scan_for_markers(optimized_messages)
+            # `scan_for_markers` reads message TEXT and tool-result content
+            # only. The tool-input compaction pass (F3) writes its marker into
+            # `tool_calls[].function.arguments`, which the scanner never
+            # visits — so on the first compaction of a session
+            # `detected_hashes` is empty, the sticky injection is skipped, and
+            # the stored original is unreachable. Merge in hashes still present
+            # in the forwarded tool arguments (order-stable, de-duplicated).
+            #
+            # Derive every hash from the final messages, after cache overlay
+            # and inflation rollback. A pipeline result may report a marker
+            # that the inflation guard discarded; carrying that stale hash
+            # forward would inject a retrieval tool for content never sent.
+            from headroom.transforms.tool_input_compactor import (
+                ccr_hashes_in_tool_arguments,
+                merge_pipeline_ccr_hashes,
+            )
+
+            _detected_hashes = merge_pipeline_ccr_hashes(
+                injector.detected_hashes,
+                ccr_hashes_in_tool_arguments(optimized_messages),
+            )
+            # Same split as the Anthropic path: `has_compressed_content` reads
+            # the injector's own list, so a marker that only ever lived in a
+            # tool-call input would skip system-instruction injection entirely.
+            injector.adopt_hashes(_detected_hashes)
             if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
 
@@ -3419,7 +3539,7 @@ class OpenAIHandlerMixin:
                 # *tools* cache segment (undoing the overlay's messages-prefix
                 # cache-safety).
                 has_new_compressed_content = has_new_ccr_markers(
-                    current_detected_hashes=injector.detected_hashes,
+                    current_detected_hashes=_detected_hashes,
                     previous_forwarded_messages=openai_prefix_tracker.get_last_forwarded_messages(),
                     provider="openai",
                 )
@@ -3434,7 +3554,7 @@ class OpenAIHandlerMixin:
                     logger.debug(
                         f"[{request_id}] CCR: tool registered (session={openai_session_id}, "
                         f"compressed_this_turn={injector.has_compressed_content}, "
-                        f"hashes_seen={len(injector.detected_hashes)})"
+                        f"hashes_seen={len(_detected_hashes)})"
                     )
 
         if is_cache_mode(self.config.mode):
@@ -5033,6 +5153,11 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    # The already-resolved upstream for THIS request (ChatGPT
+                    # backend, x-headroom-base-url override, Copilot, or the
+                    # configured OpenAI target) — the tool-search deferral gate
+                    # needs the real destination, not the request dialect.
+                    upstream_base_url=url,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -5123,6 +5248,12 @@ class OpenAIHandlerMixin:
                     if _http_conversation_key
                     else None
                 ),
+                # Already-resolved destination for THIS request (ChatGPT
+                # backend, x-headroom-base-url override, Copilot, or the
+                # configured OpenAI target) — same value the compression call
+                # above receives. Native text.verbosity creation needs the
+                # real upstream, not the request dialect.
+                upstream_base_url=url,
             )
             _append_unique_transforms(transforms_applied, _shape_result.labels)
             if _shape_result.changed:
@@ -6740,28 +6871,15 @@ class OpenAIHandlerMixin:
                     if mem_injected:
                         ws_response_body["tools"] = ws_tools
 
-                        # Add memory instruction so the model uses
-                        # memory tools as persistent cross-session knowledge.
-                        mem_instruction = (
-                            "\n\n## Memory\n"
-                            "You have persistent memory via memory_search and "
-                            "memory_save tools. Memory stores knowledge across "
-                            "sessions — user info, project details, org context, "
-                            "decisions, architecture, conventions, anything worth "
-                            "remembering.\n\n"
-                            "- ALWAYS call memory_search BEFORE searching files "
-                            "when the user asks a question that could be answered "
-                            "from prior knowledge.\n"
-                            "- Call memory_save to store important facts, decisions, "
-                            "or context that would be useful in future sessions.\n"
-                            "- Memory is your first source of truth for anything "
-                            "not visible in the current conversation."
-                        )
-                        existing_instr = ws_response_body.get("instructions") or ""
-                        ws_response_body["instructions"] = existing_instr + mem_instruction
-                        logger.info(
-                            f"[{request_id}] WS Memory: Injected memory tools + instruction"
-                        )
+                        # NOTE: no `## Memory` instruction block is appended here.
+                        # It duplicated guidance the injected tool descriptions
+                        # already carry (~150 tokens per request, and it mutated
+                        # `instructions`, which is otherwise byte-stable). Its one
+                        # novel clause — "search memory before searching files" —
+                        # now lives in MEMORY_SEARCH_DESCRIPTION
+                        # (headroom/memory/tools.py). See
+                        # docs/token-efficiency-review.md A6.
+                        logger.info(f"[{request_id}] WS Memory: Injected memory tools")
 
                     # Write back into envelope if it was wrapped
                     if "response" in frame_body and isinstance(frame_body["response"], dict):
@@ -6845,6 +6963,10 @@ class OpenAIHandlerMixin:
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
+                                # Resolved above: wss://chatgpt.com for ChatGPT
+                                # session auth, else the configured OpenAI /
+                                # Copilot target. Gates tool-search deferral.
+                                upstream_base_url=upstream_url,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -7017,6 +7139,10 @@ class OpenAIHandlerMixin:
                         self.openai_provider,
                     ),
                     conversation_key=f"ws:{session_id}",
+                    # Same resolved destination the compression path gets —
+                    # native text.verbosity is scoped to a verified OpenAI
+                    # upstream, not to the Responses wire format.
+                    upstream_base_url=upstream_url,
                 )
                 _append_unique_transforms(transforms_applied, _shape_labels)
                 if _shape_modified:
@@ -7190,6 +7316,8 @@ class OpenAIHandlerMixin:
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
+                                    # Same resolved upstream as the first frame.
+                                    upstream_base_url=upstream_url,
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -7438,6 +7566,7 @@ class OpenAIHandlerMixin:
                                             self.openai_provider,
                                         ),
                                         conversation_key=f"ws:{session_id}",
+                                        upstream_base_url=upstream_url,
                                     )
                                     _append_unique_transforms(
                                         transforms_applied,
@@ -8827,13 +8956,19 @@ class OpenAIHandlerMixin:
                 },
             )
 
-    async def _maybe_compress_passthrough_responses(self, body: bytes) -> bytes:
+    async def _maybe_compress_passthrough_responses(
+        self, body: bytes, *, upstream_base_url: str | None = None
+    ) -> bytes:
         """Compress an OpenAI Responses-shaped passthrough body, fail-open.
 
         Reuses the native `/v1/responses` compression path so custom
         wrapper-proxy routes get the same ContentRouter/Kompress treatment.
         Any parse/compression failure returns the original body unchanged so a
         catch-all request is never dropped by opting into compression.
+
+        ``upstream_base_url`` is the catch-all route's forwarding target; it
+        gates OpenAI-shape-specific injection (tool-search deferral), which must
+        not fire at an unverified gateway.
         """
         try:
             payload = json.loads(body)
@@ -8854,6 +8989,7 @@ class OpenAIHandlerMixin:
                 payload,
                 model=model,
                 request_id=request_id,
+                upstream_base_url=upstream_base_url,
             )
         except Exception as exc:  # noqa: BLE001 — fail-open on any compressor error
             logger.warning(
@@ -8969,7 +9105,9 @@ class OpenAIHandlerMixin:
             and path.rstrip("/").endswith("/responses")
             and body
         ):
-            compressed = await self._maybe_compress_passthrough_responses(body)
+            compressed = await self._maybe_compress_passthrough_responses(
+                body, upstream_base_url=base_url
+            )
             if compressed != body:
                 body = compressed
                 # Body size changed — let httpx recompute Content-Length.

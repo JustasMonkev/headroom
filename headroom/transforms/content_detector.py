@@ -271,7 +271,7 @@ def normalize_concatenated_json(content: str) -> str | None:
         return None
     items = _decode_concatenated_json(stripped)
     if items and len(items) >= 2 and all(isinstance(item, dict) for item in items):
-        return json.dumps(items)
+        return json.dumps(items, separators=(",", ":"), ensure_ascii=False)
     return None
 
 

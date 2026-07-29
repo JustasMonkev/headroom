@@ -21,9 +21,15 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 
 from headroom import paths as _paths
 from headroom._subprocess import run
+from headroom.config import (
+    MIN_CLAUDE_FEATURE_VERSION,
+    model_supports_gated_features,
+    parse_model_family_version,
+)
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -109,7 +115,7 @@ from headroom.proxy.tool_injection_logging import (
     log_tool_injection_decision as _log_tool_injection_decision,
 )
 from headroom.proxy.tool_injection_tracker import SessionToolTracker as _SessionToolTracker
-from headroom.proxy.tool_name_policy import extract_tool_name
+from headroom.proxy.tool_name_policy import extract_tool_name, normalize_headroom_tool_name
 
 if TYPE_CHECKING:
     import httpx
@@ -2059,7 +2065,12 @@ def apply_session_sticky_memory_tools(
     for t in tools_out:
         n = _extract_tool_name(t)
         if n:
-            existing_names.add(n)
+            # `headroom wrap` surfaces these same tools as
+            # `mcp__headroom-memory__memory_save` etc., which would never
+            # compare equal to the bare names below — injecting the whole
+            # ~1k-token memory block a second time. Normalize only the
+            # labels Headroom itself registers (A2).
+            existing_names.add(normalize_headroom_tool_name(n))
 
     # Diagnostic / rollback path.
     if get_tool_injection_sticky_mode() == "disabled":
@@ -2341,7 +2352,13 @@ def apply_session_sticky_ccr_tool(
     for t in tools_out:
         n = _extract_tool_name(t)
         if n:
-            existing_names.add(n)
+            # A2: `headroom wrap` registers our own MCP server, so the client
+            # surfaces the tool as `mcp__headroom__headroom_retrieve` — never
+            # equal to `headroom_retrieve`, so this guard used to miss and we
+            # appended a second, near-identical definition every request.
+            # Only Headroom-owned server labels are normalized: an unrelated
+            # server's `mcp__other__headroom_retrieve` is a different tool.
+            existing_names.add(normalize_headroom_tool_name(n))
 
     # Client (or MCP) already provided a tool by this name — don't double up.
     if CCR_TOOL_NAME in existing_names:
@@ -2857,6 +2874,16 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "webfetch",
         "question",
         "skill",
+        # Resident because its DESCRIPTION is load-bearing, not because it is
+        # frequent. The `## Memory` system block was removed to save ~150
+        # tokens per request and its one novel clause — "search memory before
+        # searching files" — folded into MEMORY_SEARCH_DESCRIPTION
+        # (token-efficiency-review A6). Deferring this tool hides that sentence
+        # until after the model has already decided to search, and with Read
+        # and Grep sitting resident it will simply search files instead,
+        # bypassing memory for the whole session. Roughly 30 tokens to keep the
+        # memory feature reachable at all.
+        "memory_search",
     }
 )
 
@@ -2882,6 +2909,124 @@ _TOOL_SEARCH_CORE_TOOLS_NORMALIZED = frozenset(
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
+
+# --- F1: tool-search deferral is default-ON (`auto`) for first-party Anthropic.
+#
+# The deferral is deterministic (same input tools -> same output bytes), so the
+# tools prefix still prompt-caches, and it already no-ops for small tool sets
+# and for clients that ship their own tool_search tool. The remaining risk is
+# purely model support: older Claude models 400 on `defer_loading` /
+# `tool_search_tool_*`. Hence a version gate plus two escape hatches. The
+# threshold is the shared one (`MIN_CLAUDE_FEATURE_VERSION`, Claude >= 4.8) —
+# every model-specific optimization engages at the same generation.
+_ANTHROPIC_TOOL_SEARCH_MIN_VERSION = MIN_CLAUDE_FEATURE_VERSION
+_TOOL_SEARCH_ON_VALUES = frozenset({"1", "true", "yes", "on"})
+_TOOL_SEARCH_OFF_VALUES = frozenset({"0", "false", "no", "off", "none", "disabled"})
+
+
+def tool_search_mode() -> str:
+    """Resolve ``HEADROOM_TOOL_SEARCH`` to ``"on"`` / ``"off"`` / ``"auto"``.
+
+    Unset (or ``auto``) means auto: inject for first-party Anthropic models at
+    or above the shared feature cutoff (Claude >= 4.8).
+    ``0``/``off``/``false``/``no`` is the explicit opt-out.
+    ``1``/``on``/``true``/``yes`` forces injection even when the version gate
+    does not recognise the model name (escape hatch for model IDs newer than
+    this code).
+    """
+    raw = os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
+    if not raw or raw == "auto":
+        return "auto"
+    if raw in _TOOL_SEARCH_OFF_VALUES:
+        return "off"
+    if raw in _TOOL_SEARCH_ON_VALUES:
+        return "on"
+    # Unrecognized value: treat as auto rather than silently disabling a
+    # default-on feature (or force-enabling it on an unsupported model).
+    return "auto"
+
+
+def _model_supports_anthropic_tool_search(model: str | None) -> bool:
+    """True when a Claude model supports the server-side Tool Search Tool.
+
+    Default gate: the shared model-feature cutoff, Claude generation >=
+    ``MIN_CLAUDE_FEATURE_VERSION`` (4.8) — ``claude-opus-4-8``,
+    ``claude-*-5*``, …; ``claude-sonnet-4-5``/``4-6`` and ``claude-haiku-4-5``
+    are below it. A regex in ``HEADROOM_TOOL_SEARCH_MODELS`` (matched against
+    the model name) wins when set; a malformed pattern falls back to the
+    version gate rather than crashing. Conservative / fail-closed: an
+    unparseable model name returns False, which costs only missed savings (the
+    explicit ``HEADROOM_TOOL_SEARCH=1`` escape hatch overrides it).
+    """
+    if not model:
+        return False
+    override = os.environ.get("HEADROOM_TOOL_SEARCH_MODELS", "").strip()
+    if override:
+        try:
+            return re.search(override, model) is not None
+        except re.error:
+            pass  # malformed override -> fall back to the version gate
+    return model_supports_gated_features(model, family="claude")
+
+
+# Hosts that serve the first-party Claude API shape, i.e. the only upstreams
+# known to implement `tool_search_tool_*` + `defer_loading`. Anything else —
+# an OpenAI-compatible gateway, an enterprise relay, a per-request
+# `x-headroom-base-url` target — may speak the Messages wire format without
+# implementing Tool Search, and would 400 on the injected fields.
+_FIRST_PARTY_ANTHROPIC_HOST_SUFFIX = ".anthropic.com"
+
+
+def is_first_party_anthropic_target(base_url: str | None) -> bool:
+    """True when ``base_url`` is a first-party Anthropic API host.
+
+    ``provider_name`` alone does not answer this: ``/v1/messages`` routed
+    through ``x-headroom-base-url`` keeps ``provider_name == "anthropic"``
+    (the client speaks the Anthropic wire format) while the upstream is an
+    arbitrary gateway. Automatic, model-shape-specific injection must be scoped
+    to a *verified* Anthropic target, not merely to the request dialect.
+
+    **Fails closed**: an empty, malformed or hostless URL returns False.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    candidate = base_url.strip()
+    if "//" not in candidate:  # bare "api.anthropic.com[/path]" — give urlsplit a netloc
+        candidate = "//" + candidate
+    try:
+        host = urlsplit(candidate).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    return host == "api.anthropic.com" or host.endswith(_FIRST_PARTY_ANTHROPIC_HOST_SUFFIX)
+
+
+def anthropic_tool_search_enabled(model: str | None, *, first_party_target: bool = True) -> bool:
+    """Whether to inject Anthropic's tool-search deferral for ``model``.
+
+    Combines :func:`tool_search_mode` with :func:`_model_supports_anthropic_tool_search`.
+    Provider/backend scoping (never Bedrock, never Vertex) stays at the call
+    site, which is where that context lives.
+
+    ``first_party_target`` carries the *upstream* identity (see
+    :func:`is_first_party_anthropic_target`). Automatic (``auto``) injection
+    requires it: a compatible gateway reached via ``x-headroom-base-url`` may
+    not implement Anthropic Tool Search, and requests that used to pass through
+    would start 400ing on ``defer_loading`` / ``tool_search_tool_*``. An
+    explicit ``HEADROOM_TOOL_SEARCH=1`` still forces injection — that is the
+    operator saying "my upstream supports it", and it is what the pre-default-on
+    opt-in did.
+    """
+    mode = tool_search_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return first_party_target and _model_supports_anthropic_tool_search(model)
+
+
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
 # guidance: standard calling is better under ~10 tools).
 _TOOL_SEARCH_MIN_TOOLS = 12
@@ -2903,8 +3048,8 @@ def inject_tool_search_deferral(
     Invariants enforced (else Anthropic 400s): the search tool is never deferred;
     at least one tool stays non-deferred; a deferred tool never carries
     ``cache_control`` — if the client's tools cache breakpoint sat on a now-deferred
-    tool, it is moved to the last non-deferred real tool so the (smaller) tools
-    prefix still caches.
+    tool, that tool stays resident. A breakpoint is a client-chosen prefix
+    boundary, so moving or coalescing it can change both cache coverage and TTL.
     """
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
@@ -2917,9 +3062,6 @@ def inject_tool_search_deferral(
     search_tool = {"type": search_type, "name": search_name}
     out: list[Any] = [search_tool]
     deferred = 0
-    dropped_cache_control = False
-    last_resident_real_idx: int | None = None
-    resident_has_cache_control = False
     # Match core tools case- and separator-insensitively; see _normalize_tool_name.
     core_normalized = (
         _TOOL_SEARCH_CORE_TOOLS_NORMALIZED
@@ -2936,36 +3078,19 @@ def inject_tool_search_deferral(
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
-            if isinstance(tool, dict) and not tool.get("type"):
-                last_resident_real_idx = len(out) - 1
-                resident_has_cache_control = resident_has_cache_control or bool(
-                    tool.get("cache_control")
-                )
+            continue
+        if "cache_control" in tool:
+            # A breakpoint marks a client-chosen prefix boundary. Keep its tool
+            # resident rather than coalescing multiple boundaries or TTLs.
+            out.append(tool)
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
-            dropped_cache_control = True
         out.append(new_tool)
         deferred += 1
 
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the cache prefix
-    # Preserve a tools cache breakpoint: if we stripped cache_control off a
-    # deferred tool and no resident tool carries one, move it to the last
-    # resident real tool (never the search tool, to keep its shape canonical).
-    if (
-        dropped_cache_control
-        and not resident_has_cache_control
-        and last_resident_real_idx is not None
-    ):
-        # Copy before writing: resident tools are appended by reference, so an
-        # in-place write would mutate the caller's list — and the tools that
-        # reach here can be the process-global schema-compaction cache entry,
-        # which is shared across every session with the same tools digest.
-        patched = dict(out[last_resident_real_idx])
-        patched["cache_control"] = {"type": "ephemeral"}
-        out[last_resident_real_idx] = patched
     return out
 
 
@@ -2987,41 +3112,134 @@ def inject_tool_search_deferral(
 #     ``function`` (non-core) and ``mcp`` tools and keep OTHER typed/hosted tools
 #     (web_search, file_search, code_interpreter, computer, image_generation, and
 #     the search tool itself) resident.
-#   * Model-gated: only gpt-5.4+ support it; older models 400 on the fields.
+#   * Model-gated: only GPT 5.4+ supports it; older models 400 on the fields.
 #   * No ``cache_control`` (OpenAI caches automatically), so no breakpoint move.
 # ---------------------------------------------------------------------------
 
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-# gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
-# gated by default; overridable per deployment via a regex in
-# HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
-# model families can be enabled without a code edit + release.
+# Overridable per deployment via a regex in HEADROOM_OPENAI_TOOL_SEARCH_MODELS
+# (matched against the model name) so new model families can be enabled without
+# a code edit + release.
 _OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
 
 
 def _model_supports_openai_tool_search(model: str | None) -> bool:
     """True when an OpenAI model supports the Responses ``tool_search`` feature.
 
-    Default gate: ``gpt-<major>.<minor>`` >= 5.4. A regex in
+    Default gate: ``gpt-<major>.<minor>`` >= 5.4, so earlier GPT-5 models are
+    below it. A regex in
     ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (matched against the model name) wins
     when set; a malformed pattern falls back to the version gate rather than
-    crashing.
+    crashing. Fail-closed on an unparseable model id.
     """
     if not model:
         return False
-    override = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
-    if override:
-        try:
-            return re.search(override, model) is not None
-        except re.error:
-            pass  # malformed override → fall back to the version gate
-    match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
-    if not match:
+    override = _openai_model_override_verdict(model)
+    if override is not None:
+        return override
+    parsed = parse_model_family_version(model)
+    return bool(parsed and parsed[0] == "gpt" and parsed[1] >= _OPENAI_TOOL_SEARCH_MIN_VERSION)
+
+
+def _openai_model_override_verdict(model: str | None) -> bool | None:
+    """Whether ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` decides this model.
+
+    ``None`` means the override did not decide anything — it is unset, empty,
+    or a malformed regex. A malformed pattern must be indistinguishable from an
+    absent one for EVERY consumer: it is not an operator assertion about
+    anything, so it can neither enable a model nor authorize a custom upstream.
+    Returning ``None`` (rather than ``False``) keeps the version gate as the
+    fallback while denying the override any authority it did not earn.
+    """
+    pattern = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
+    if not pattern or not model:
+        return None
+    try:
+        return re.search(pattern, model) is not None
+    except re.error:
+        return None
+
+
+# Hosts that serve the first-party OpenAI Responses API shape, i.e. the only
+# upstreams known to implement `{"type": "tool_search"}` + `defer_loading`.
+# Anything else — an OpenAI-compatible gateway, GitHub Copilot, an enterprise
+# relay, a per-request `x-headroom-base-url` target — may speak the Responses
+# wire format without implementing tool search, and would reject the injected
+# fields. ``chatgpt.com`` is included because ChatGPT-session (codex login)
+# Responses traffic is OpenAI's own Codex backend, not a third-party gateway.
+_FIRST_PARTY_OPENAI_HOST_SUFFIXES = (".openai.com", ".chatgpt.com")
+_FIRST_PARTY_OPENAI_HOSTS = frozenset({"openai.com", "chatgpt.com"})
+
+
+def is_first_party_openai_target(base_url: str | None) -> bool:
+    """True when ``base_url`` is a first-party OpenAI (or ChatGPT/Codex) host.
+
+    The OpenAI analogue of :func:`is_first_party_anthropic_target`, and it exists
+    for the same reason: ``/v1/responses`` routed through ``x-headroom-base-url``
+    still looks like an OpenAI request (the CLIENT speaks the Responses wire
+    format) while the UPSTREAM is an arbitrary compatible gateway. That matters
+    more now than it used to, because the shared model parser accepts
+    vendor-prefixed ids such as ``openai/gpt-5.5`` — exactly the ids gateways
+    use — where the old anchored ``gpt-…`` regex rejected them. Automatic,
+    OpenAI-shape-specific injection must be scoped to a *verified* OpenAI
+    target, not merely to the request dialect.
+
+    Accepts ``http``/``https``/``ws``/``wss`` URLs and bare hosts alike (the WS
+    Responses path resolves a ``wss://`` upstream).
+
+    **Fails closed**: an empty, malformed or hostless URL returns False.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
         return False
-    major, minor = int(match.group(1)), int(match.group(2) or 0)
-    return (major, minor) >= _OPENAI_TOOL_SEARCH_MIN_VERSION
+    candidate = base_url.strip()
+    if "//" not in candidate:  # bare "api.openai.com[/path]" — give urlsplit a netloc
+        candidate = "//" + candidate
+    try:
+        host = urlsplit(candidate).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    return host in _FIRST_PARTY_OPENAI_HOSTS or host.endswith(_FIRST_PARTY_OPENAI_HOST_SUFFIXES)
+
+
+def openai_tool_search_enabled(model: str | None, *, first_party_target: bool = True) -> bool:
+    """Whether to inject OpenAI's Responses tool-search deferral for ``model``.
+
+    The OpenAI analogue of :func:`anthropic_tool_search_enabled`, with one
+    deliberate difference: the MODEL gate is never bypassed. ``tool_search`` /
+    ``defer_loading`` are hard 400s on pre-5.4 Responses models, and unlike the
+    Anthropic path this one already ships a dedicated model escape hatch
+    (``HEADROOM_OPENAI_TOOL_SEARCH_MODELS``) for ids newer than this code — so
+    ``HEADROOM_TOOL_SEARCH=1`` overrides the *upstream* gate, not the model one.
+
+    ``first_party_target`` carries the *upstream* identity (see
+    :func:`is_first_party_openai_target`). Automatic injection requires it: a
+    compatible gateway reached via ``x-headroom-base-url`` (or Copilot) may not
+    implement ``tool_search`` / ``defer_loading``, and requests that used to
+    pass through would start failing. Operators running a gateway that DOES
+    implement them keep two explicit opt-ins: ``HEADROOM_TOOL_SEARCH=1`` ("my
+    upstream supports it") and ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (a model-id
+    regex asserting "these models, on my deployment, support tool search").
+    ``HEADROOM_TOOL_SEARCH=0``/``off`` is the kill switch for both paths.
+    """
+    mode = tool_search_mode()
+    if mode == "off":
+        return False
+    if not _model_supports_openai_tool_search(model):
+        return False
+    if first_party_target or mode == "on":
+        return True
+    # Not a verified first-party target: only an explicit per-deployment model
+    # override counts as the operator asserting gateway support — and only one
+    # that actually compiled AND matched this model. A malformed regex is a
+    # typo, not an assertion that some gateway implements tool search; treating
+    # any nonempty value as authorization would hand `tool_search` /
+    # `defer_loading` to every custom upstream on a single bad character.
+    return _openai_model_override_verdict(model) is True
 
 
 def inject_tool_search_deferral_openai(
@@ -3029,20 +3247,26 @@ def inject_tool_search_deferral_openai(
     model: str | None,
     *,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    first_party_target: bool = True,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
-    is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
-    tool_search tool is already present (client already defers), or nothing would
-    be deferred. Core coding tools and hosted/typed tools (web_search,
-    file_search, code_interpreter, computer, …) stay resident and unchanged, so
-    routine edit/read/run loops never pay a search round-trip and the request
-    stays valid; the injected search tool is itself resident.
+    No-op when: tool search is disabled for this model/upstream combination (see
+    :func:`openai_tool_search_enabled`), ``tools`` is not a list, there are fewer
+    than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a tool_search tool is already present
+    (client already defers), or nothing would be deferred. Core coding tools and
+    hosted/typed tools (web_search, file_search, code_interpreter, computer, …)
+    stay resident and unchanged, so routine edit/read/run loops never pay a
+    search round-trip and the request stays valid; the injected search tool is
+    itself resident.
+
+    ``first_party_target`` must be the verified identity of the *effective
+    upstream* for this request (``is_first_party_openai_target(upstream_base_url
+    or self.OPENAI_API_URL)``), not the request dialect.
     """
-    if not _model_supports_openai_tool_search(model):
+    if not openai_tool_search_enabled(model, first_party_target=first_party_target):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
         return tools

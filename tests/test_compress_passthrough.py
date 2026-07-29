@@ -32,8 +32,12 @@ def _make_handler(compress_impl):
     return handler
 
 
-def _shrinking_compressor(marker: str = "[C]"):
-    async def _impl(payload, *, model, request_id):
+def _shrinking_compressor(marker: str = "[C]", seen: dict | None = None):
+    # `**kwargs` absorbs the optional gating kwargs the real signature grew
+    # (e.g. `upstream_base_url`); this stub only cares about the rewrite.
+    async def _impl(payload, *, model, request_id, **kwargs):
+        if seen is not None:
+            seen.update(kwargs)
         new = dict(payload)
         new["input"] = marker
         return (new, True, 5, ["kompress"], None, 100, 40, 5, {})
@@ -49,6 +53,25 @@ async def test_compresses_responses_shaped_body() -> None:
 
     assert out != body
     assert json.loads(out)["input"] == "[C]"
+
+
+async def test_passthrough_forwards_its_upstream_to_the_compressor() -> None:
+    """The catch-all route's target must reach the OpenAI-only feature gates.
+
+    ``handle_passthrough`` forwards to an arbitrary wrapper-proxy target. Without
+    the upstream identity, tool-search deferral would fall back to the configured
+    first-party OPENAI_API_URL and inject ``tool_search``/``defer_loading`` into
+    a gateway that may reject them.
+    """
+    seen: dict = {}
+    handler = _make_handler(_shrinking_compressor(seen=seen))
+    body = json.dumps({"model": "gpt-5.4", "input": [{"role": "user"}]}).encode()
+
+    await handler._maybe_compress_passthrough_responses(
+        body, upstream_base_url="https://gateway.example.com"
+    )
+
+    assert seen.get("upstream_base_url") == "https://gateway.example.com"
 
 
 async def test_non_json_body_passes_through() -> None:
