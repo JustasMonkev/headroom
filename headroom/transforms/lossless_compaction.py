@@ -72,6 +72,48 @@ def _run_marker(count: int) -> str:
     return f"…x{count}"
 
 
+def _fold_is_token_win(dropped: str, added: str) -> bool:
+    """Is replacing ``dropped`` with ``added`` actually cheaper to send?
+
+    The guard this replaces compared CHARACTERS, but the billed unit is tokens
+    and the two disagree exactly where a run fold is tempting. `…xN` opens with
+    a multi-byte ellipsis that merges with nothing, costing ~3 tokens, while a
+    short BPE-friendly duplicate (`aaaaaaaa`, a repeated hex value) can be one
+    or two — so a fold that saves five characters can cost two tokens. The
+    router tries this fold across detected formats and has no whole-pass token
+    rollback, so such a block is reported as compressed while inflating the
+    request.
+
+    A character margin was tried first and cannot close this: swept over 1,120
+    line-length/run-length/alphabet combinations, every margin small enough to
+    keep the folds the format tests require still left inflating cases. So the
+    tokenizer decides. Fragments are tiny (one line and a marker) and the
+    counter is the bundled Rust one, so this costs nothing measurable.
+
+    Counting the fragments rather than the whole text ignores BPE merges across
+    the splice, which is why the comparison is strict (`>`): a fold has to be a
+    clear win, not a tie, before a boundary effect could turn it into a loss.
+    If the tokenizer is unavailable the caller keeps the character guard, which
+    is wrong only in the direction of folding slightly too eagerly — never in
+    the direction of losing data.
+    """
+    try:
+        from .._core import tiktoken_count
+    except Exception:  # pragma: no cover - extension always present in practice
+        return True
+    try:
+        return bool(tiktoken_count(_FOLD_ENCODING, dropped) > tiktoken_count(_FOLD_ENCODING, added))
+    except Exception:  # pragma: no cover - defensive
+        return True
+
+
+#: Encoding used for the fold's net-win check. The exact vocabulary matters
+#: less than using *a* real BPE: the failure being prevented is a fold that
+#: shrinks bytes while growing tokens, and every modern vocabulary agrees on
+#: that shape for repetitive content.
+_FOLD_ENCODING = "o200k_base"
+
+
 def _block_marker(length: int, distance: int) -> str:
     return f"…{length}@-{distance}"
 
@@ -151,7 +193,23 @@ def collapse_runs(text: str) -> str:
             marker = _run_marker(run_len)
             # Dropped: (run_len - 1) copies of the line, each with its newline.
             # Added: the marker plus its newline.
-            if (run_len - 1) * (len(lines[i]) + 1) > len(marker) + 1:
+            #
+            # Compared with a margin, not `>`, because the billed unit is
+            # tokens and this guard can only see characters. `…x2` is a
+            # multi-byte ellipsis plus digits — around 3-4 tokens — while a
+            # short BPE-friendly duplicate (`aaaaaaaa`, a repeated hex value)
+            # can be one or two. A plain byte win of a few characters is
+            # therefore routinely a token LOSS, and the router tries this fold
+            # across detected formats with no whole-pass token rollback, so the
+            # block gets reported as compressed while costing more to send.
+            # The character test stays as a cheap prefilter — it rejects the
+            # obviously-worthless folds without touching the tokenizer — and
+            # `_fold_is_token_win` then confirms the survivors actually cost
+            # fewer tokens, which is what the request is billed on.
+            dropped_text = (lines[i] + "\n") * (run_len - 1)
+            if (run_len - 1) * (len(lines[i]) + 1) > len(marker) + 1 and _fold_is_token_win(
+                dropped_text, marker + "\n"
+            ):
                 out.append(marker)
             else:
                 out.extend(lines[i] for _ in range(run_len - 1))

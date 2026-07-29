@@ -1108,3 +1108,4 @@ def test_remote_mutation_payload_is_never_compacted(args: str) -> None:
     assert result.compacted_count == 0
     assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == args
     assert store.stored == []
+

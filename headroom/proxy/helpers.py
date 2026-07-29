@@ -2874,6 +2874,15 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "webfetch",
         "question",
         "skill",
+        # Resident because its DESCRIPTION is load-bearing, not because it is
+        # frequent. The `## Memory` system block was removed to save ~150
+        # tokens per request and its one novel clause — "search memory before
+        # searching files" — folded into MEMORY_SEARCH_DESCRIPTION
+        # (token-efficiency-review A6). Deferring this tool hides that sentence
+        # until after the model has already decided to search, and with Read
+        # and Grep sitting resident it will simply search files instead,
+        # bypassing memory for the whole session. Roughly 30 tokens to keep the
+        # memory feature reachable at all.
         "memory_search",
     }
 )

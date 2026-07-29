@@ -300,3 +300,42 @@ def test_no_breakpoint_means_everything_is_still_deferred() -> None:
     out = inject_tool_search_deferral(tools)
     assert sum(1 for t in out if isinstance(t, dict) and t.get("defer_loading")) == 14
     assert not any(isinstance(t, dict) and t.get("cache_control") for t in out)
+
+
+def test_memory_search_stays_resident_when_tools_are_deferred() -> None:
+    """Deferring memory_search hides the instruction that triggers it.
+
+    The `## Memory` system block was removed to save ~150 tokens per request,
+    and its one novel clause — "search memory before searching files" — folded
+    into MEMORY_SEARCH_DESCRIPTION (token-efficiency-review A6). If the tool
+    carrying that sentence is deferred, the guidance is only visible after the
+    model has already gone looking for the tool; with Read and Grep resident it
+    will search files instead and never touch memory for the whole session.
+    """
+    from headroom.memory.tools import MEMORY_SEARCH_DESCRIPTION
+    from headroom.proxy.helpers import inject_tool_search_deferral
+
+    names = [
+        "Read", "Grep", "Edit", "Bash", "memory_search", "memory_save",
+        "slack_post", "linear_issue", "sentry_list", "notion_page",
+        "snowflake_query", "jira_create", "gh_pr", "datadog_query",
+    ]
+    tools = [
+        {
+            "name": n,
+            "description": MEMORY_SEARCH_DESCRIPTION if n == "memory_search" else n,
+            "input_schema": {"type": "object"},
+        }
+        for n in names
+    ]
+
+    out = inject_tool_search_deferral(tools)
+    by_name = {t["name"]: t for t in out if t.get("name")}
+
+    assert not by_name["memory_search"].get("defer_loading")
+    # The guidance is actually present in what stays resident.
+    resident = [t for t in out if t.get("name") and not t.get("defer_loading")]
+    assert any(MEMORY_SEARCH_DESCRIPTION in (t.get("description") or "") for t in resident)
+    # Deferral is still doing its job on the genuinely peripheral tools.
+    assert by_name["slack_post"].get("defer_loading")
+    assert by_name["memory_save"].get("defer_loading")
