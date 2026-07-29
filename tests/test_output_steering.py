@@ -190,15 +190,21 @@ def test_structured_prompts_collapse_legacy_and_current_blocks() -> None:
     assert body["system"] == [{"type": "text", "text": steering_text(4)}]
 
 
-def test_structured_prompt_moves_cache_control_off_removed_duplicate() -> None:
-    cache_control = {"type": "ephemeral", "ttl": "1h"}
+def test_structured_prompt_moves_cache_control_to_nearest_retained_predecessor() -> None:
+    owner_cache_control = {"type": "ephemeral", "ttl": "5m"}
+    duplicate_cache_control = {"type": "ephemeral", "ttl": "1h"}
     body = {
         "system": [
-            {"type": "text", "text": _LEGACY_BLOCK},
+            {
+                "type": "text",
+                "text": _LEGACY_BLOCK,
+                "cache_control": owner_cache_control,
+            },
+            {"type": "text", "text": "Later retained system context."},
             {
                 "type": "text",
                 "text": steering_text(1),
-                "cache_control": cache_control,
+                "cache_control": duplicate_cache_control,
             },
         ]
     }
@@ -208,8 +214,78 @@ def test_structured_prompt_moves_cache_control_off_removed_duplicate() -> None:
         {
             "type": "text",
             "text": steering_text(4),
-            "cache_control": cache_control,
+            "cache_control": owner_cache_control,
+        },
+        {
+            "type": "text",
+            "text": "Later retained system context.",
+            "cache_control": duplicate_cache_control,
+        },
+    ]
+
+
+def test_structured_prompt_later_cache_control_overwrites_owner_when_adjacent() -> None:
+    body = {
+        "system": [
+            {
+                "type": "text",
+                "text": _LEGACY_BLOCK,
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            },
+            {
+                "type": "text",
+                "text": steering_text(1),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+        ]
+    }
+
+    assert apply_verbosity_steering(body, 4) is True
+    assert body["system"] == [
+        {
+            "type": "text",
+            "text": steering_text(4),
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
+    ]
+
+
+def test_structured_prompt_moves_each_duplicate_breakpoint_independently() -> None:
+    body = {
+        "system": [
+            {"type": "text", "text": _LEGACY_BLOCK},
+            {"type": "text", "text": "first retained"},
+            {
+                "type": "text",
+                "text": steering_text(1),
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            },
+            {
+                "type": "text",
+                "text": "second retained",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            },
+            {
+                "type": "text",
+                "text": _LEGACY_BLOCK,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+        ]
+    }
+
+    assert apply_verbosity_steering(body, 4) is True
+    assert body["system"] == [
+        {"type": "text", "text": steering_text(4)},
+        {
+            "type": "text",
+            "text": "first retained",
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        },
+        {
+            "type": "text",
+            "text": "second retained",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
     ]
 
 
@@ -247,6 +323,37 @@ def test_openai_content_parts_collapse_legacy_and_current_blocks() -> None:
 
     assert apply_openai_chat_verbosity_steering(body, 4) is True
     assert body["messages"][0]["content"] == [{"type": "text", "text": steering_text(4)}]
+
+
+def test_openai_content_parts_preserve_duplicate_breakpoint_position() -> None:
+    from headroom.proxy.output_steering import apply_openai_chat_verbosity_steering
+
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": _LEGACY_BLOCK},
+                    {"type": "text", "text": "retained"},
+                    {
+                        "type": "text",
+                        "text": steering_text(1),
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    },
+                ],
+            }
+        ]
+    }
+
+    assert apply_openai_chat_verbosity_steering(body, 4) is True
+    assert body["messages"][0]["content"] == [
+        {"type": "text", "text": steering_text(4)},
+        {
+            "type": "text",
+            "text": "retained",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+    ]
 
 
 def test_structured_steering_ignores_unrelated_hr_shape_tag_in_prompt() -> None:

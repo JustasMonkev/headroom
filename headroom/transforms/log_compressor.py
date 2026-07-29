@@ -43,7 +43,7 @@ exists only for unit testing.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, cast
 
@@ -144,7 +144,11 @@ class LogCompressionResult:
 # ─── LogCompressor (Rust-backed) ────────────────────────────────────────────
 
 
-def _represented_count(line: LogLine) -> int:
+def _represented_count(
+    line: LogLine,
+    original_by_line: dict[int, LogLine],
+    identical_counts: dict[tuple[LogLevel, str], int],
+) -> int:
     """How many original lines a SELECTED line stands for.
 
     Mirrors Rust `represented_count`. Identical-line folding collapses N
@@ -155,14 +159,23 @@ def _represented_count(line: LogLine) -> int:
     ``ERROR request failed ×5``. The two contradict each other and the phantom
     count can trigger a retrieval for errors already on screen.
 
-    Parsing the suffix back is exact because the fold is its only writer. A
-    source line genuinely ending in ` ×N` reads as a fold, costing at most a
-    slightly low omitted count — never a wrong survivor.
+    A `` ×N`` suffix counts only when it matches the original survivor and the
+    number of byte-identical source lines.
     """
-    head, sep, tail = line.content.rpartition(" ×")
+    original, sep, tail = line.content.rpartition(" ×")
     if not sep or not tail.isdigit():
         return 1
-    return n if (n := int(tail)) > 1 else 1
+    count = int(tail)
+    source = original_by_line.get(line.line_number)
+    if (
+        count > 1
+        and source is not None
+        and source.level == line.level
+        and source.content == original
+        and identical_counts.get((line.level, original)) == count
+    ):
+        return count
+    return 1
 
 
 def _is_exception_token(token: str) -> bool:
@@ -578,7 +591,7 @@ class LogCompressor:
             if pos is None:
                 first_at[line.content] = len(kept)
                 counts.append(1)
-                kept.append(line)
+                kept.append(replace(line))
             else:
                 counts[pos] += 1
                 suppressed.add(line.line_number)
@@ -699,6 +712,11 @@ class LogCompressor:
         omitted = len(all_lines) - len(selected)
         if omitted <= 0:
             return None
+        original_by_line = {line.line_number: line for line in all_lines}
+        identical_counts: dict[tuple[LogLevel, str], int] = {}
+        for line in all_lines:
+            key = (line.level, line.content)
+            identical_counts[key] = identical_counts.get(key, 0) + 1
         parts: list[str] = []
         for label, level in (
             ("ERROR", LogLevel.ERROR),
@@ -706,7 +724,9 @@ class LogCompressor:
             ("WARN", LogLevel.WARN),
         ):
             dropped = sum(1 for line in all_lines if line.level == level) - sum(
-                _represented_count(line) for line in selected if line.level == level
+                _represented_count(line, original_by_line, identical_counts)
+                for line in selected
+                if line.level == level
             )
             if dropped > 0:
                 parts.append(f"{dropped} {label}")

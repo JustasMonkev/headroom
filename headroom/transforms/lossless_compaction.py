@@ -38,23 +38,34 @@ __all__ = [
 # non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# syslog-style run-collapse marker: `…x5` means the preceding line appears 5
-# times in total. The count is captured for exact inversion.
+# Syslog-style run-collapse markers. `…x5` is the current spelling; readers
+# also accept the legacy `... (repeated 5 times)` spelling so already-compacted
+# content remains reversible. Both mean the preceding line appears 5 times in
+# total.
 #
-# The marker is deliberately terse. Its English predecessor
+# The emitted marker is deliberately terse. Its English predecessor
 # (``... (repeated 5 times)``) cost ~7 tokens, which is more than the run it
 # replaces on any short line — the whole reason `collapse_runs` needed the
 # per-fold net-win guard below. Digits are bounded so the pattern can never
 # blow up on a pathological line, and every emitter/parser pair here lives
 # beside its regex so the two can only change together.
-_RUN_MARKER_RE = re.compile(r"^…x([0-9]{1,9})$")
+_RUN_MARKER_RE = re.compile(
+    r"^(?:…x(?P<current>[0-9]{1,9})|\.\.\. \(repeated (?P<legacy>[0-9]{1,9}) times\))$"
+)
 
-# multi-line block back-reference marker: `…12@-40` means "the 12 lines
-# starting 40 lines back". Length and distance (both in lines, in ORIGINAL
-# coordinates) are captured for exact inversion: everything before a marker
-# expands to the exact original prefix, so `distance` lines back in the
-# expanded output is the block's first occurrence.
-_BLOCK_MARKER_RE = re.compile(r"^…([0-9]{1,9})@-([0-9]{1,9})$")
+# Multi-line block back-reference markers. `…12@-40` is the current spelling;
+# readers also accept the legacy `... (repeats 12 lines from 40 lines back)`.
+# Length and distance (both in lines, in ORIGINAL coordinates) are captured
+# for exact inversion: everything before a marker expands to the exact original
+# prefix, so `distance` lines back in the expanded output is the block's first
+# occurrence.
+_BLOCK_MARKER_RE = re.compile(
+    r"^(?:"
+    r"…(?P<current_length>[0-9]{1,9})@-(?P<current_distance>[0-9]{1,9})"
+    r"|\.\.\. \(repeats (?P<legacy_length>[0-9]{1,9}) lines from "
+    r"(?P<legacy_distance>[0-9]{1,9}) lines back\)"
+    r")$"
+)
 
 
 def _run_marker(count: int) -> str:
@@ -161,7 +172,7 @@ def expand_runs(text: str) -> str:
         if i + 1 < n:
             m = _RUN_MARKER_RE.match(lines[i + 1])
             if m:
-                count = int(m.group(1))
+                count = int(m.group("current") or m.group("legacy"))
                 out.extend([line] * count)
                 i += 2
                 continue
@@ -242,7 +253,8 @@ def unfold_repeated_blocks(text: str) -> str:
     for line in lines:
         m = _BLOCK_MARKER_RE.match(line)
         if m:
-            length, dist = int(m.group(1)), int(m.group(2))
+            length = int(m.group("current_length") or m.group("legacy_length"))
+            dist = int(m.group("current_distance") or m.group("legacy_distance"))
             start = len(out) - dist
             if start >= 0 and length <= dist:
                 out.extend(out[start : start + length])

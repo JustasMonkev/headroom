@@ -716,6 +716,11 @@ class TestURLSlimmingIsConservative:
             "signature=abc123",
             "token=abc123",
             "access_token=abc123",
+            "auth_key=abc123",
+            "auth-key=abc123",
+            "auth.key=abc123",
+            "authKey=abc123",
+            "authorization=Bearer",
             "hmac=abc123",
             "expires=1893456000",
             "X-Goog-Signature=abc123",
@@ -725,6 +730,13 @@ class TestURLSlimmingIsConservative:
     def test_signature_shaped_keys_disable_slimming(self, extractor, signed_pair):
         text = f"[x](https://a.example/f?{signed_pair}&utm_source=news)"
         assert extractor._slim_urls(text, None) == text
+
+    def test_auth_and_key_substrings_do_not_disable_slimming(self, extractor):
+        text = "[x](https://a.example/f?author=ada&keyboard=qwerty&utm_source=news)"
+        assert (
+            extractor._slim_urls(text, None)
+            == "[x](https://a.example/f?author=ada&keyboard=qwerty)"
+        )
 
     def test_valueless_segment_disables_slimming(self, extractor):
         """A bare segment can itself be a signature blob; we cannot tell."""

@@ -49,7 +49,7 @@ import weakref
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -1935,13 +1935,10 @@ class _RequestScoped:
         self._store(obj)[self._name] = value
 
 
-def _open_router_request_scope(router: Any) -> None:
+def _open_router_request_scope(
+    router: Any,
+) -> Token[dict[int, tuple[weakref.ref[Any], dict[str, Any]]]]:
     """Install a fresh routing scope for ``router`` on the current context.
-
-    Deliberately NOT reset on exit: the scope lives in the current thread's /
-    task's context, every ``apply()`` replaces this router's slot wholesale, and
-    leaving it in place keeps the routing decisions inspectable after
-    ``apply()`` returns (tests and the savings reporter rely on that).
 
     The outer map is COPIED and re-``set()`` rather than mutated in place. A
     context is propagated by SHALLOW copy (``copy_context()``, and therefore
@@ -1964,7 +1961,32 @@ def _open_router_request_scope(router: Any) -> None:
         # recycled ``id()`` a stale store).
         scope = {rid: entry for rid, entry in inherited.items() if entry[0]() is not None}
     scope[id(router)] = (weakref.ref(router), {})
-    _REQUEST_SCOPE.set(scope)
+    return _REQUEST_SCOPE.set(scope)
+
+
+def _close_router_request_scope(
+    router: Any,
+    token: Token[dict[int, tuple[weakref.ref[Any], dict[str, Any]]]],
+) -> None:
+    """Reset request state, retaining only small post-call diagnostics."""
+    scope = _REQUEST_SCOPE.get(None)
+    entry = scope.get(id(router)) if scope is not None else None
+    diagnostics: dict[str, Any] = {}
+    if entry is not None and entry[0]() is router:
+        store = entry[1]
+        for name in (
+            "_runtime_target_ratio",
+            "_runtime_force_kompress",
+            "_runtime_skip_kompress",
+            "_runtime_kompress_model",
+            "_runtime_compression_policy",
+        ):
+            if name in store:
+                diagnostics[name] = store[name]
+
+    _REQUEST_SCOPE.reset(token)
+    fallback = router.__dict__.setdefault(_SCOPE_FALLBACK_ATTR, {})
+    fallback.update(diagnostics)
 
 
 class ContentRouter(Transform):
@@ -4682,7 +4704,20 @@ class ContentRouter(Transform):
         tokenizer: Tokenizer,
         **kwargs: Any,
     ) -> TransformResult:
-        """Apply intelligent routing to messages.
+        """Apply intelligent routing with request-local state."""
+        scope_token = _open_router_request_scope(self)
+        try:
+            return self._apply_in_request_scope(messages, tokenizer, **kwargs)
+        finally:
+            _close_router_request_scope(self, scope_token)
+
+    def _apply_in_request_scope(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        **kwargs: Any,
+    ) -> TransformResult:
+        """Apply intelligent routing to messages inside an open scope.
 
         Args:
             messages: Messages to transform.
@@ -4692,11 +4727,6 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
-        # F6: isolate this request's routing context from every other request
-        # sharing this router. Must be the first statement — everything below
-        # assigns into the scope. See `_RequestScoped` / `_open_router_request_scope`.
-        _open_router_request_scope(self)
-
         # Shared CCR store for the pre-processing passes below. is None (not
         # truthiness) so falsy test doubles are honored; guarded import keeps
         # the passes running in stripped builds.

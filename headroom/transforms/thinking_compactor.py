@@ -34,6 +34,8 @@ import hashlib
 import logging
 from collections import OrderedDict
 from collections.abc import Callable
+from concurrent.futures import Future
+from threading import Lock
 from typing import Any
 
 from headroom.config import parse_model_family_version
@@ -46,6 +48,8 @@ log = logging.getLogger(__name__)
 # is byte-identical anyway. ponytail: crude LRU cap, fine given determinism.
 _COMPACT_CACHE: OrderedDict[str, str] = OrderedDict()
 _CACHE_CAP = 8192
+_CACHE_LOCK = Lock()
+_COMPACTING: dict[str, Future[str | None]] = {}
 
 # Prefix on the emitted text block so the compaction is legible to the model
 # (and greppable in logs). Kept short; the token cost is negligible vs the block.
@@ -71,24 +75,40 @@ def bills_prior_thinking(model: str) -> bool:
 def _memo_compact(text: str, kompress: Any) -> str | None:
     """Deterministically compact ``text`` via Kompress; None if no gain/failure."""
     key = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
-    cached = _COMPACT_CACHE.get(key)
-    if cached is not None:
-        _COMPACT_CACHE.move_to_end(key)
-        return cached
+    with _CACHE_LOCK:
+        cached = _COMPACT_CACHE.get(key)
+        if cached is not None:
+            _COMPACT_CACHE.move_to_end(key)
+            return cached
+        pending = _COMPACTING.get(key)
+        if pending is None:
+            pending = Future()
+            _COMPACTING[key] = pending
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        return pending.result()
+
+    compacted: str | None = None
     try:
         # allow_download=False: never block the request thread on a cold model
         # (mirrors the proxy convention in ContentRouter._get_kompress callers).
         result = kompress.compress(text, allow_download=False)
-        compacted = result.compressed
+        candidate = result.compressed
+        if isinstance(candidate, str) and candidate:
+            compacted = candidate
     except Exception as e:  # fail OPEN — never break the proxy on a bad compressor
         log.warning("thinking compaction failed (%s); leaving block untouched", e)
-        return None
-    if not isinstance(compacted, str) or not compacted:
-        return None
-    _COMPACT_CACHE[key] = compacted
-    _COMPACT_CACHE.move_to_end(key)
-    while len(_COMPACT_CACHE) > _CACHE_CAP:
-        _COMPACT_CACHE.popitem(last=False)
+    finally:
+        with _CACHE_LOCK:
+            if compacted is not None:
+                _COMPACT_CACHE[key] = compacted
+                _COMPACT_CACHE.move_to_end(key)
+                while len(_COMPACT_CACHE) > _CACHE_CAP:
+                    _COMPACT_CACHE.popitem(last=False)
+            pending.set_result(compacted)
+            _COMPACTING.pop(key)
     return compacted
 
 

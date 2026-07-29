@@ -15,6 +15,8 @@ from the Anthropic handler, but only when BOTH hold:
 from __future__ import annotations
 
 import inspect
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event, Lock
 from typing import Any
 
 import pytest
@@ -22,6 +24,7 @@ import pytest
 from headroom.config import model_supports_gated_features
 from headroom.proxy.handlers import anthropic as anthropic_handler
 from headroom.transforms.thinking_compactor import (
+    _memo_compact,
     bills_prior_thinking,
     compact_thinking_to_text,
 )
@@ -157,6 +160,60 @@ def test_compaction_is_byte_stable_across_turns() -> None:
     first, _ = compact_thinking_to_text(_messages(), kompress=k, keep_last_turns=1)
     second, _ = compact_thinking_to_text(_messages(), kompress=k, keep_last_turns=1)
     assert first[1]["content"][0] == second[1]["content"][0]
+
+
+def test_concurrent_same_block_is_compacted_once_to_identical_bytes() -> None:
+    workers = 8
+    start = Barrier(workers)
+    entered = Event()
+    release = Event()
+
+    class _RacingKompress:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.lock = Lock()
+
+        def compress(self, text: str, allow_download: bool = True) -> Any:  # noqa: ARG002
+            with self.lock:
+                self.calls += 1
+                call = self.calls
+            entered.set()
+            assert release.wait(timeout=5)
+            return type("R", (), {"compressed": f"summary from call {call}"})()
+
+    kompress = _RacingKompress()
+    text = "concurrent thinking block unique to the memo regression"
+
+    def _compact() -> str | None:
+        start.wait(timeout=5)
+        return _memo_compact(text, kompress)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_compact) for _ in range(workers)]
+        try:
+            assert entered.wait(timeout=5)
+        finally:
+            release.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    assert results == ["summary from call 1"] * workers
+    assert kompress.calls == 1
+
+
+def test_concurrent_distinct_blocks_are_not_serialized() -> None:
+    rendezvous = Barrier(2)
+
+    class _ParallelKompress:
+        def compress(self, text: str, allow_download: bool = True) -> Any:  # noqa: ARG002
+            rendezvous.wait(timeout=5)
+            return type("R", (), {"compressed": f"summary for {text}"})()
+
+    kompress = _ParallelKompress()
+    texts = ["distinct concurrent thinking alpha", "distinct concurrent thinking beta"]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda text: _memo_compact(text, kompress), texts))
+
+    assert results == [f"summary for {text}" for text in texts]
 
 
 def test_no_kompress_is_a_noop() -> None:

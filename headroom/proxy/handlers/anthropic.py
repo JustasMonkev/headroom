@@ -2400,8 +2400,7 @@ class AnthropicHandlerMixin:
                 injector.adopt_hashes(_detected_hashes)
 
                 if inject_system_instructions and injector.has_compressed_content:
-                    _ccr_system = injector.inject_into_system_message(_ccr_system)
-                    body["system"] = _ccr_system[0]["content"]
+                    body["system"] = injector.inject_into_system_prompt(body.get("system"))
 
                 if configured_inject_tool and _system_ccr_hashes:
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool

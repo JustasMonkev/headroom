@@ -28,7 +28,6 @@ def _resteer_content_parts(
     found = False
     changed = False
     kept: list[Any] = []
-    owner: dict[str, Any] | None = None
     for part in parts:
         value = part.get(key) if isinstance(part, dict) else None
         if (
@@ -39,8 +38,6 @@ def _resteer_content_parts(
             kept.append(part)
             continue
         updated, part_changed = replace_or_append_steering_block(value, text if not found else "")
-        if not found:
-            owner = part
         found = True
         changed = changed or part_changed
         if updated:
@@ -48,8 +45,13 @@ def _resteer_content_parts(
                 part[key] = updated
             kept.append(part)
         else:
-            if owner is not None and "cache_control" in part and "cache_control" not in owner:
-                owner["cache_control"] = part["cache_control"]
+            if "cache_control" in part:
+                # Keep the removed part's later cache boundary at the nearest
+                # surviving predecessor; its TTL supersedes any older marker there.
+                for predecessor in reversed(kept):
+                    if isinstance(predecessor, dict):
+                        predecessor["cache_control"] = part["cache_control"]
+                        break
             changed = True
     if not found:
         return None

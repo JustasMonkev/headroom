@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextvars import Context
 from typing import Any
 
 from headroom.tokenizer import Tokenizer
@@ -190,13 +191,12 @@ def test_inherited_scope_is_not_mutated_by_concurrent_workers(monkeypatch) -> No
             tags.name = None
 
     async def main() -> None:
-        # 1. A direct apply() on THIS context installs a scope here…
-        router.apply(
-            _conversation("toolu_seed", "seed_pattern"),
-            tokenizer,
-            model_limit=100_000,
-            target_ratio=0.5,
-        )
+        from headroom.transforms.content_router import _open_router_request_scope
+
+        # Plant an inherited caller scope explicitly. Normal apply() calls now
+        # reset their scope on exit.
+        _open_router_request_scope(router)
+        router._runtime_target_ratio = 0.5
         # 2. …which both to_thread workers now inherit, shallow-copied.
         monkeypatch.setattr(ContentRouter, "_build_tool_name_map", probing_build)
         await asyncio.gather(
@@ -236,17 +236,49 @@ def test_opening_a_scope_does_not_disturb_other_routers_in_the_caller(monkeypatc
     assert second._runtime_target_ratio == 0.77
 
 
-def test_state_is_readable_after_apply_returns() -> None:
-    """Post-`apply()` inspection (tests, savings reporting) still works."""
+def test_apply_resets_scope_and_keeps_only_small_diagnostics() -> None:
+    """Executor threads must not retain full tool arguments after apply()."""
+    from headroom.transforms.content_router import _REQUEST_SCOPE
+
     router = ContentRouter(ContentRouterConfig())
-    router.apply(
-        _conversation("toolu_1", "needle"),
-        _tokenizer(),
-        model_limit=100_000,
-        target_ratio=0.42,
-    )
-    assert router._runtime_target_ratio == 0.42
-    assert "needle" in str(router._tool_call_args)
+
+    def run() -> None:
+        router.apply(
+            _conversation("toolu_1", "needle"),
+            _tokenizer(),
+            model_limit=100_000,
+            target_ratio=0.42,
+        )
+        assert _REQUEST_SCOPE.get(None) is None
+        assert router._runtime_target_ratio == 0.42
+        assert router._tool_call_args == {}
+        assert router._tool_call_commands == {}
+
+    Context().run(run)
+
+
+def test_apply_resets_scope_after_an_error(monkeypatch) -> None:
+    from headroom.transforms.content_router import _REQUEST_SCOPE
+
+    router = ContentRouter(ContentRouterConfig())
+
+    def fail(_messages: Any) -> Any:
+        raise RuntimeError("routing failed")
+
+    monkeypatch.setattr(router, "_build_tool_name_map", fail)
+
+    def run() -> None:
+        try:
+            router.apply(_conversation("toolu_1", "needle"), _tokenizer())
+        except RuntimeError:
+            pass
+        else:  # pragma: no cover - the monkeypatch must fail
+            raise AssertionError("expected routing failure")
+        assert _REQUEST_SCOPE.get(None) is None
+        assert router._tool_call_args == {}
+        assert router._tool_call_commands == {}
+
+    Context().run(run)
 
 
 def test_a_recycled_id_does_not_inherit_a_dead_routers_store() -> None:

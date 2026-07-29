@@ -22,9 +22,6 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote_plus, urlsplit
 
-import trafilatura
-from trafilatura.settings import use_config
-
 # Markdown link target: the `](...)` part of `[text](target)`. Targets never
 # contain an unescaped `)`, which is what makes the non-greedy class safe.
 _MD_LINK_TARGET_RE = re.compile(r"\]\((?P<target>[^()\s]*)\)")
@@ -89,6 +86,11 @@ _SIGNED_QUERY_KEYS = frozenset(
         "apikey",
         "api_key",
         "auth",
+        "auth_key",
+        "auth-key",
+        "auth.key",
+        "authkey",
+        "authorization",
         "jwt",
         "verify",
         "awsaccesskeyid",
@@ -327,6 +329,8 @@ class HTMLExtractor:
 
     def _build_trafilatura_config(self) -> Any:
         """Build trafilatura configuration from our config."""
+        from trafilatura.settings import use_config
+
         config = use_config()
 
         # Set extraction parameters
@@ -345,6 +349,8 @@ class HTMLExtractor:
         Returns:
             HTMLExtractionResult with extracted content and metadata.
         """
+        import trafilatura
+
         original_length = len(html)
 
         if not html or not html.strip():

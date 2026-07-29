@@ -20,11 +20,13 @@ from headroom.transforms.lossless_compaction import (
     compact_lossless,
     diff_strip_index,
     expand_runs,
+    fold_repeated_blocks,
     is_run_collapsed,
     search_fold_recovers,
     search_heading,
     search_unheading,
     strip_ansi,
+    unfold_repeated_blocks,
 )
 
 
@@ -146,6 +148,32 @@ def test_run_marker_is_short() -> None:
     collapsed = collapse_runs(log)
     assert collapsed == "conn refused\n…x2\n"
     assert expand_runs(collapsed) == log
+
+
+def test_run_marker_reader_accepts_legacy_spelling_but_emits_only_current() -> None:
+    legacy = "conn refused\n... (repeated 3 times)\ndone\n"
+    expanded = "conn refused\nconn refused\nconn refused\ndone\n"
+
+    assert is_run_collapsed(legacy)
+    assert expand_runs(legacy) == expanded
+    assert collapse_runs(expanded) == "conn refused\n…x3\ndone\n"
+
+
+def test_legacy_run_and_block_markers_compose_but_emitters_stay_current() -> None:
+    legacy = (
+        "same\n"
+        "... (repeated 3 times)\n"
+        "alpha\n"
+        "beta\n"
+        "gamma\n"
+        "... (repeats 3 lines from 3 lines back)\n"
+    )
+    expanded = "same\nsame\nsame\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\n"
+
+    assert expand_runs(unfold_repeated_blocks(legacy)) == expanded
+    current = fold_repeated_blocks(collapse_runs(expanded))
+    assert current == "same\n…x3\nalpha\nbeta\ngamma\n…3@-3\n"
+    assert "... (" not in current
 
 
 # --------------------------------------------------------------------------
