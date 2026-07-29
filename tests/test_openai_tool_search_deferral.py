@@ -366,3 +366,31 @@ def test_handler_threads_the_upstream_through_the_executor_wrapper():
     assert "upstream_base_url" in sig.parameters
     src = inspect.getsource(OpenAIHandlerMixin.handle_openai_responses)
     assert "upstream_base_url=url" in src, "/v1/responses does not pass its resolved upstream"
+
+
+def test_malformed_model_override_does_not_authorize_a_gateway(monkeypatch):
+    """A bad regex is a typo, not an operator assertion about any upstream.
+
+    `_model_supports_openai_tool_search` swallows `re.error` and falls back to
+    the version gate, so a malformed pattern used to leave a nonempty env value
+    behind that the custom-upstream check read as authorization — handing
+    `tool_search`/`defer_loading` to every gateway on a single bad character.
+    """
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "gpt-5.5[")
+    assert openai_tool_search_enabled("gpt-5.5", first_party_target=False) is False
+    # A valid, matching override still opts the gateway in.
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", r"gpt-5\.5")
+    assert openai_tool_search_enabled("gpt-5.5", first_party_target=False) is True
+
+
+def test_malformed_model_override_still_falls_back_to_the_version_gate(monkeypatch):
+    """Falling back is the documented behaviour and must not regress.
+
+    On a first-party target the malformed pattern is ignored and the version
+    gate decides — admitting 5.5+ and still refusing older models.
+    """
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "gpt-5.5[")
+    assert openai_tool_search_enabled("gpt-5.5", first_party_target=True) is True
+    assert openai_tool_search_enabled("gpt-4o", first_party_target=True) is False
+    assert _model_supports_openai_tool_search("gpt-5.5") is True
+    assert _model_supports_openai_tool_search("gpt-5.4") is False

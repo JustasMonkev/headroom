@@ -3176,13 +3176,29 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     """
     if not model:
         return False
-    override = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
-    if override:
-        try:
-            return re.search(override, model) is not None
-        except re.error:
-            pass  # malformed override → fall back to the version gate
+    override = _openai_model_override_verdict(model)
+    if override is not None:
+        return override
     return model_supports_gated_features(model, family="gpt")
+
+
+def _openai_model_override_verdict(model: str) -> bool | None:
+    """Whether ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` decides this model.
+
+    ``None`` means the override did not decide anything — it is unset, empty,
+    or a malformed regex. A malformed pattern must be indistinguishable from an
+    absent one for EVERY consumer: it is not an operator assertion about
+    anything, so it can neither enable a model nor authorize a custom upstream.
+    Returning ``None`` (rather than ``False``) keeps the version gate as the
+    fallback while denying the override any authority it did not earn.
+    """
+    pattern = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
+    if not pattern:
+        return None
+    try:
+        return re.search(pattern, model) is not None
+    except re.error:
+        return None
 
 
 # Hosts that serve the first-party OpenAI Responses API shape, i.e. the only
@@ -3257,8 +3273,12 @@ def openai_tool_search_enabled(model: str | None, *, first_party_target: bool = 
     if first_party_target or mode == "on":
         return True
     # Not a verified first-party target: only an explicit per-deployment model
-    # override counts as the operator asserting gateway support.
-    return bool(os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip())
+    # override counts as the operator asserting gateway support — and only one
+    # that actually compiled AND matched this model. A malformed regex is a
+    # typo, not an assertion that some gateway implements tool search; treating
+    # any nonempty value as authorization would hand `tool_search` /
+    # `defer_loading` to every custom upstream on a single bad character.
+    return _openai_model_override_verdict(model) is True
 
 
 def inject_tool_search_deferral_openai(

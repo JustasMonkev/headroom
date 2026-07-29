@@ -3,7 +3,7 @@
   "tools": [
     {
       "name": "memory_save",
-      "description": "Save durable information to long-term memory: user preferences, personal and project facts, decisions and their rationale, entity relationships, technical insights. Do not save transient chat state, secrets, or duplicates — search first. Pre-extracting facts / extracted_entities / extracted_relationships skips an extraction call in the storage backend.",
+      "description": "Save durable information to long-term memory: user preferences, personal and project facts, decisions and their rationale, entity relationships, technical insights. Do not save transient chat state, secrets, duplicates (search first), or anything the user asks you not to remember. Pre-extracting facts / extracted_entities / extracted_relationships skips an extraction call in the storage backend.",
       "input_schema": {
         "type": "object",
         "properties": {

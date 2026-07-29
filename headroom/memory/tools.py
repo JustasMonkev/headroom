@@ -36,7 +36,8 @@ from typing import Any
 MEMORY_SAVE_DESCRIPTION = (
     "Save durable information to long-term memory: user preferences, personal and "
     "project facts, decisions and their rationale, entity relationships, technical "
-    "insights. Do not save transient chat state, secrets, or duplicates — search first."
+    "insights. Do not save transient chat state, secrets, duplicates (search first), "
+    "or anything the user asks you not to remember."
 )
 
 # The "search memory before searching files" clause used to live in a separate
