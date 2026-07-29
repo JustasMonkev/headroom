@@ -520,6 +520,53 @@ MUTATING_COMMANDS = [
     "cat <<EOF > f\\nbody\\nEOF",
     "cat <<'EOF'\nbody\nEOF",
     "python - <<-PY\nprint(1)\nPY",
+    # ---------------------------------------------------------------
+    # Embedded code execution (Codex P2). Every probe above matches a
+    # mutation written in SHELL; a write performed inside an interpreter's
+    # inline program contains no shell write token at all, so the arguments
+    # were classified read-only and the only exact record of the write became
+    # eligible for an expiring CCR marker. The interpreter+inline-program
+    # SHAPE is what is matched — not the write API — because the set of ways
+    # an arbitrary program can write is not enumerable.
+    # ---------------------------------------------------------------
+    # The three examples from the finding, verbatim.
+    "python -c \"Path('out').write_text(payload)\"",
+    "node -e \"fs.writeFileSync('out', payload)\"",
+    "ruby -e \"File.write('out', payload)\"",
+    # Same shape, other write APIs the enumeration approach would have to
+    # chase: none of these is spelled out anywhere in the implementation.
+    "python3 -c \"open('out','w').write(payload)\"",
+    'python -c "import shutil; shutil.copy(a, b)"',
+    'python -c "import os; os.replace(a, b)"',
+    "node -e \"require('fs').promises.writeFile(p, d)\"",
+    'ruby -e "IO.write(p, d)"',
+    # Escape hatches that no write-API list can cover.
+    'python -c "import os; os.system(cmd)"',
+    'python -c "exec(base64.b64decode(blob))"',
+    'python -c "conn.execute(stmt)"',
+    # Other interpreters / flag spellings.
+    ".venv/bin/python -c 'print(1)'",
+    "python -E -c 'print(1)'",
+    "perl -ne 'print' f.txt",
+    "php -r 'file_put_contents($f, $d);'",
+    "lua -e 'x()'",
+    "julia -e 'x()'",
+    "Rscript -e 'writeLines(x, f)'",
+    "osascript -e 'do shell script \"x\"'",
+    "tclsh -c 'x'",
+    "node --eval 'x()'",
+    "deno eval 'Deno.writeTextFile(p, d)'",
+    "bun eval 'x()'",
+    "sh -c 'x'",
+    "bash -c 'x'",
+    "bash -lc 'x'",
+    "zsh -c 'x'",
+    "pwsh -Command 'x'",
+    # Program supplied on stdin. `python - <<'PY' 2>&1 | tail` is NOT caught by
+    # the heredoc probe (the delimiter is followed by a redirect, not by a
+    # newline), and a piped program has no heredoc at all.
+    "timeout 300 .venv/bin/python - <<'PY' 2>&1 | tail -20",
+    "curl -s http://x/script.py | python -",
 ]
 
 NON_MUTATING_COMMANDS = [
@@ -540,6 +587,19 @@ NON_MUTATING_COMMANDS = [
     "grep -rn 'touch' docs/",
     "rg 'patch' src/",
     "ls -l installers/",
+    # The code-execution rule is anchored on interpreter + inline-program flag,
+    # so merely NAMING an interpreter — or running one with an ordinary,
+    # non-program argument — stays compactable. This is what keeps the closed
+    # rule from swallowing the whole Bash tool.
+    "python --version",
+    "node --version",
+    "which python3",
+    "ls scripts/*.sh",
+    ".venv/bin/python -m pytest -q --tb=line -p no:cacheprovider tests/test_x.py",
+    ".venv/bin/python -m ruff check headroom/transforms/",
+    "python -m mypy headroom",
+    "head -50 run.sh",
+    "wc -l tests/*.py",
 ]
 
 
@@ -590,6 +650,13 @@ NON_MUTATING_SQL = [
 OVER_CONSERVATIVE_INPUTS = [
     ("Bash", "python -c 'print(1 >> 2)'"),
     ("query", "EXPLAIN SELECT a FROM t WHERE a > 5"),
+    # The code-execution rule is text-based, like every other probe here, so an
+    # input that merely QUOTES an interpreter invocation is read as one. Same
+    # direction the existing probes already take (`grep -rn 'rm -rf' docs/` has
+    # always been classified mutating by `_FILEOP_RE`): missed savings, never a
+    # lost record.
+    ("Bash", 'grep -rn "python -c" docs/analysis/'),
+    ("Agent", "Explain to the user why `node -e` payloads are risky."),
 ]
 
 
@@ -614,6 +681,61 @@ def test_read_only_sql_stays_compactable(sql: str) -> None:
     assert is_mutating_tool_input("query", json.dumps({"sql": sql})) is False, sql
 
 
+EMBEDDED_RUNTIME_WRITES = [
+    # Codex P2, verbatim: a completed Bash/exec_command call that writes through
+    # an embedded runtime. No shell write token appears anywhere in the command.
+    ("Bash", "python -c \"from pathlib import Path; Path('out').write_text(body)\""),
+    ("Bash", "node -e \"fs.writeFileSync('out', body)\""),
+    ("exec_command", "ruby -e \"File.write('out', body)\""),
+]
+
+
+@pytest.mark.parametrize(("tool", "command"), EMBEDDED_RUNTIME_WRITES)
+def test_embedded_runtime_write_is_never_compacted(tool: str, command: str) -> None:
+    """The arguments are the ONLY record of the write, so they must survive.
+
+    Without the code-execution rule all three classified as read-only: the
+    command contains no `>`, no heredoc, no `sed -i`, no destructive verb — the
+    write lives entirely inside the interpreter's inline program. Above
+    `min_chars` the sole exact record of the change would be replaced by a CCR
+    marker that expires after `CCRConfig.ttl_seconds` (default 1,800s).
+    """
+    store = _FakeStore()
+    # Padded past min_chars the way a real inline script is: the payload being
+    # written is what makes these calls large in the first place.
+    args = json.dumps({"command": command, "payload": "x" * 2000})
+    assert is_mutating_tool_input(tool, args) is True, command
+
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": tool, "arguments": args}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+    result = ToolInputCompactor(_cfg(), compression_store=store).apply(messages)
+    assert result.compacted_count == 0
+    assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == args
+    assert store.stored == []
+
+
+def test_embedded_runtime_write_survives_padding() -> None:
+    """The safety property must not be defeated by burying the call in padding."""
+    from headroom.transforms.tool_input_compactor import is_mutating_tool_input
+
+    padding = ("grep -rn 'a -> b' src/ " * 3000)[:65536]
+    assert is_mutating_tool_input("Bash", padding) is False
+    for command, _ in ((c, t) for t, c in EMBEDDED_RUNTIME_WRITES):
+        assert is_mutating_tool_input("Bash", padding + " ; " + command) is True, command
+    assert is_mutating_tool_input("Bash", padding + ' ; bash -c "$SCRIPT"') is True
+    assert is_mutating_tool_input("Bash", padding + " ; deno eval 'x()'") is True
+
+
 def test_mutation_detection_is_bounded_on_a_hostile_blob() -> None:
     """The scan must stay linear on adversarial input.
 
@@ -631,6 +753,14 @@ def test_mutation_detection_is_bounded_on_a_hostile_blob() -> None:
         ("sed 's/foo/bar/' file.txt && " * 2400)[:65536],
         ("grep -rn 'a -> b' src/ " * 3000)[:65536],  # `->`-dense, redirect branch
         ("perl print scalar keys " * 3000)[:65536],
+        # Code-execution branch: interpreter-dense text where the inline-source
+        # flag is always just out of reach. The gap between the interpreter and
+        # the flag is bounded to one short option precisely so these cannot
+        # degrade into a scan-to-end-of-string from every occurrence.
+        ("python -m pytest -q --tb=line tests/ " * 1800)[:65536],
+        ("the shell should show a finished dashboard " * 1600)[:65536],
+        ("node modules ruby gems perl modules php files " * 1400)[:65536],
+        ("python3 nonsense ruby gemfile perl module " * 1600)[:65536],
     ]
     for blob in blobs:
         start = time.perf_counter()

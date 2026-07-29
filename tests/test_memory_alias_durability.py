@@ -38,6 +38,20 @@ two sections pin the repaired behaviour:
    cannot list at all — raises instead of guessing.
 8. A backend that can answer the prefix question itself short-circuits the
    enumeration entirely.
+
+The third finding in the same scheme: backend IDs are opaque and may begin with
+``m:`` themselves, and ``_alias_for_memory`` emits short IDs verbatim, so such
+an ID reaches the model looking exactly like an alias. Reading it as one — strip
+the sigil, prefix-match the remainder — rejected the real record, or resolved to
+a *different* record whose ID began with the remainder and mutated it. So
+resolution is no longer prefix matching: it collects every stored memory that
+would have been *rendered* as the token (its native id, or its alias) and still
+insists on exactly one. The last section pins that:
+
+9. A native id beginning with ``m:`` round-trips through update and delete to
+   itself; a short one that is byte-identical to another memory's alias is
+   reported as ambiguous instead of picking one; and neither reading is
+   prefix-matched.
 """
 
 from __future__ import annotations
@@ -502,3 +516,213 @@ def test_backend_prefix_hook_still_fails_loudly_on_ambiguity() -> None:
     alias = handler._alias_for_memory("dupprefix-1111-4aaa-8bbb-000000000001")
     with pytest.raises(MemoryAliasError, match="ambiguous"):
         asyncio.run(handler._resolve_memory_alias(backend, "u", alias))
+
+
+# ---------------------------------------------------------------------------
+# Native IDs that themselves begin with the alias sigil (PR #16 review, P2)
+#
+# Backend IDs are opaque strings; nothing stops one from starting with ``m:``.
+# ``memory_search`` / ``memory_list`` report native IDs verbatim, and
+# ``_alias_for_memory`` hands short ones straight back, so such an ID reaches
+# the model looking exactly like an alias. Reading it as one unconditionally —
+# strip the sigil, prefix-match the rest — either rejected the real record or,
+# when a *different* ID happened to start with the remainder, resolved to that
+# other record and mutated it. That is the same failure mode as the two earlier
+# defects in this scheme, so resolution now asks which memories would have been
+# *rendered* as the token (native id or alias) and insists the answer is unique.
+# ---------------------------------------------------------------------------
+
+# A short native ID that is indistinguishable from an alias: exactly the shape
+# ``_alias_for_memory`` emits, and short enough that it is emitted verbatim.
+SIGIL_SHORT = f"{MEMORY_ALIAS_PREFIX}beef1234"
+# A long native ID that also happens to start with the sigil.
+SIGIL_LONG = f"{MEMORY_ALIAS_PREFIX}abc12345-1111-4aaa-8bbb-000000000003"
+# A decoy whose ID begins with SIGIL_SHORT's *body*: the record the old
+# strip-and-prefix-match resolver would have hit instead.
+DECOY = "beef1234-0000-4000-8000-000000000002"
+# The same trap for SIGIL_LONG: a *different* memory whose ID is exactly the
+# sigil-stripped remainder, so the old resolver found it as the unique prefix
+# match and edited it in place of the record actually addressed.
+LONG_DECOY = SIGIL_LONG[len(MEMORY_ALIAS_PREFIX) :]
+
+
+def test_sigil_leading_short_id_is_rendered_verbatim() -> None:
+    """The self-collision the review names: the alias function returns a short
+    ``m:``-leading ID as itself, so it comes back looking like an alias."""
+    assert MemoryHandler._alias_for_memory(SIGIL_SHORT) == SIGIL_SHORT
+
+
+def test_native_id_beginning_with_sigil_resolves_to_itself() -> None:
+    backend = _Backend(
+        [_Memory(id=SIGIL_SHORT, content="native short"), _Memory(id=UUID_A, content="unrelated")]
+    )
+    handler = _handler(backend)
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", SIGIL_SHORT)) == SIGIL_SHORT
+
+
+def test_long_native_id_beginning_with_sigil_resolves_to_itself() -> None:
+    backend = _Backend(
+        [_Memory(id=SIGIL_LONG, content="native long"), _Memory(id=UUID_A, content="unrelated")]
+    )
+    handler = _handler(backend)
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", SIGIL_LONG)) == SIGIL_LONG
+
+
+def test_long_sigil_id_resolves_to_itself_not_its_stripped_twin() -> None:
+    """The sharpest form of the finding, and it is not merely a failed lookup.
+
+    ``m:abc12345-…`` and ``abc12345-…`` are two different memories. Stripping
+    the sigil turns the first reference into the second, and the second was the
+    unique prefix match, so ``memory_update`` silently rewrote the wrong record.
+    Render-equality has only one candidate here, so this resolves *correctly*
+    rather than merely refusing.
+    """
+    backend = _Backend(
+        [
+            _Memory(id=SIGIL_LONG, content="the addressed one"),
+            _Memory(id=LONG_DECOY, content="the stripped twin"),
+        ]
+    )
+    handler = _handler(backend)
+
+    raw = asyncio.run(
+        handler._execute_update({"memory_id": SIGIL_LONG, "new_content": "edited"}, "u")
+    )
+    assert json.loads(raw)["status"] == "updated"
+    assert backend.updated == [(SIGIL_LONG, "edited")]
+    assert [m.content for m in backend.memories] == ["edited", "the stripped twin"]
+
+
+def test_update_with_sigil_leading_native_id_hits_that_record() -> None:
+    """Round-trip: memory_list hands back ``m:beef1234``, memory_update must
+    edit *that* memory."""
+    backend = _Backend(
+        [
+            _Memory(id=SIGIL_SHORT, content="native short"),
+            _Memory(id=UUID_A, content="unrelated"),
+        ]
+    )
+    handler = _handler(backend)
+
+    raw = asyncio.run(
+        handler._execute_update({"memory_id": SIGIL_SHORT, "new_content": "edited"}, "u")
+    )
+    assert json.loads(raw)["status"] == "updated"
+    assert backend.updated == [(SIGIL_SHORT, "edited")]
+    assert [m.content for m in backend.memories] == ["edited", "unrelated"]
+
+
+def test_delete_with_sigil_leading_native_id_hits_that_record() -> None:
+    backend = _Backend(
+        [
+            _Memory(id=SIGIL_LONG, content="native long"),
+            _Memory(id=UUID_A, content="unrelated"),
+        ]
+    )
+    handler = _handler(backend)
+
+    raw = asyncio.run(handler._execute_delete({"memory_id": SIGIL_LONG}, "u"))
+    payload = json.loads(raw)
+    assert payload["status"] == "deleted"
+    assert payload["memory_id"] == SIGIL_LONG
+    assert backend.deleted == [SIGIL_LONG]
+    assert [m.id for m in backend.memories] == [UUID_A]
+
+
+def test_sigil_leading_native_id_never_mutates_the_prefix_neighbour() -> None:
+    """THE regression test for the review finding.
+
+    ``m:beef1234`` is a real memory, and ``beef1234-…`` is a *different* real
+    memory whose ID starts with the sigil-stripped remainder. The old resolver
+    found exactly one prefix match — the neighbour — and silently updated it.
+    Both readings are legitimate here, so the only correct answer is to refuse.
+    """
+    backend = _Backend(
+        [
+            _Memory(id=SIGIL_SHORT, content="native short"),
+            _Memory(id=DECOY, content="innocent bystander"),
+        ]
+    )
+    handler = _handler(backend)
+
+    raw = asyncio.run(
+        handler._execute_update({"memory_id": SIGIL_SHORT, "new_content": "clobbered"}, "u")
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "error"
+    assert "ambiguous" in payload["error"]
+    assert backend.updated == []
+    assert [m.content for m in backend.memories] == ["native short", "innocent bystander"]
+
+
+def test_sigil_leading_native_id_never_deletes_the_prefix_neighbour() -> None:
+    backend = _Backend(
+        [
+            _Memory(id=SIGIL_SHORT, content="native short"),
+            _Memory(id=DECOY, content="innocent bystander"),
+        ]
+    )
+    handler = _handler(backend)
+
+    raw = asyncio.run(handler._execute_delete({"memory_id": SIGIL_SHORT}, "u"))
+    payload = json.loads(raw)
+    assert payload["status"] == "error"
+    assert "ambiguous" in payload["error"]
+    assert backend.deleted == []
+    assert len(backend.memories) == 2
+
+
+def test_alias_still_wins_when_no_native_id_claims_the_token() -> None:
+    """The neighbour alone is unambiguous: the token is only its alias."""
+    backend = _Backend([_Memory(id=DECOY, content="the only claimant")])
+    handler = _handler(backend)
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", SIGIL_SHORT)) == DECOY
+
+
+def test_prefix_hook_finds_a_sigil_leading_native_id() -> None:
+    """The backend-side short-circuit must probe both readings too, or it
+    reintroduces the bug for backends that implement the hook."""
+    backend = _PrefixCapableBackend(
+        [_Memory(id=SIGIL_SHORT, content="native"), _Memory(id=UUID_A, content="unrelated")]
+    )
+    handler = _handler(backend)
+    assert asyncio.run(handler._resolve_memory_alias(backend, "u", SIGIL_SHORT)) == SIGIL_SHORT
+    assert backend.enumerated is False
+
+
+def test_prefix_hook_refuses_when_both_readings_claim_the_token() -> None:
+    backend = _PrefixCapableBackend(
+        [_Memory(id=SIGIL_SHORT, content="native"), _Memory(id=DECOY, content="neighbour")]
+    )
+    handler = _handler(backend)
+    with pytest.raises(MemoryAliasError, match="ambiguous"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", SIGIL_SHORT))
+
+
+def test_partial_alias_is_not_prefix_matched() -> None:
+    """Resolution is render-equality, not prefix matching.
+
+    Every minted alias is exactly ``m:`` + 8 characters, so a shorter token was
+    never rendered by us; prefix-matching it would be a guess, and guessing is
+    how the previous two defects mutated the wrong record.
+    """
+    backend = _fresh_backend()
+    handler = _handler(backend)
+    with pytest.raises(MemoryAliasError, match="No memory matches"):
+        asyncio.run(handler._resolve_memory_alias(backend, "u", f"{MEMORY_ALIAS_PREFIX}a1b2"))
+
+
+def test_sigil_leading_native_id_is_unaddressable_but_never_wrong_on_opaque_backends() -> None:
+    """A backend that cannot enumerate cannot prove which reading is meant.
+
+    Passing the token through verbatim would "work" most of the time and hit
+    the wrong record the rest — the exact trade the alias scheme refuses.
+    """
+
+    class _Opaque:
+        async def delete_memory(self, memory_id: str) -> bool:
+            raise AssertionError("must not be reached")
+
+    handler = _handler(_fresh_backend())
+    with pytest.raises(MemoryAliasError, match="cannot"):
+        asyncio.run(handler._resolve_memory_alias(_Opaque(), "u", SIGIL_SHORT))

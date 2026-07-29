@@ -19,7 +19,9 @@ Safety rules (each prevents a concrete failure mode):
 - **Reproducible/read-only inputs only.** A call is compacted only when
   neither its tool name nor its serialized arguments look *mutating*
   (``Write``/``apply_patch``-family tools, SQL DML/DDL, shell heredocs,
-  shell write-redirection / in-place edits). For a mutating call the tool
+  shell write-redirection / in-place edits, and any interpreter handed an
+  arbitrary embedded program — ``python -c``, ``node -e``, ``ruby -e`` —
+  whose effects cannot be read off the command line). For a mutating call the tool
   result is usually a bare acknowledgement ("File written"), so the
   arguments are the ONLY exact record of what changed — and the CCR entry
   expires (``CCRConfig.ttl_seconds``, default 1,800s), after which that
@@ -296,6 +298,122 @@ def _has_shell_mutation(text: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Embedded code execution (Codex P2).
+#
+# Every probe above matches a mutation written in SHELL. A completed
+# `Bash`/`exec_command` call can just as easily write through an embedded
+# runtime, where the shell text contains no write token at all:
+#
+#     python -c "Path('out').write_text(body)"
+#     node -e "fs.writeFileSync('out', body)"
+#     ruby -e "File.write('out', body)"
+#
+# All three classified as read-only, so arguments over `min_chars` — the sole
+# exact record of the write — were eligible for a CCR marker that expires after
+# `CCRConfig.ttl_seconds`.
+#
+# WHY THE WHOLE SHAPE, NOT THE WRITE APIS. The obvious fix is to also recognize
+# `write_text` / `writeFileSync` / `File.write` / `open(...,'w')` / `IO.write` /
+# `fs.promises.writeFile` / `shutil.*` / `os.replace` / … That enumeration is
+# OPEN-ENDED and unclosable: each interpreter admitted by a `-c`/`-e` flag
+# brings its own standard library, its own aliases (`import os as o`), its own
+# escape hatches (`os.system`, `subprocess`, `ctypes`, `sqlite3`, an HTTP POST),
+# and a program can be assembled at runtime from strings this scanner will never
+# resolve. Every miss is an unrecoverable record — the asymmetry THE RULE exists
+# to respect. So the CONTAINER is what gets recognized: an interpreter handed an
+# arbitrary program is opaque, and opaque is treated as mutating.
+#
+# THE RULE STATED CRISPLY: if the serialized arguments invoke a general-purpose
+# interpreter with its program supplied inline (`-c`, `-e`, `--eval`, `eval`,
+# `-r`, `-ne`, …) or on stdin (`python - <<PY`), the call is mutating.
+#
+# COST, MEASURED (real agent transcripts: 3,911 tool calls, 2.73 MB of
+# serialized inputs). 676 calls exceed the 800-char `min_chars` threshold, and
+# only 11 of those were compactable at all — the name denylist and the shell
+# probes already claim the other 665. This rule removes 4 of the 11: 4,801 of
+# 12,889 compactable chars, i.e. 0.18% of all tool-input bytes. The whole
+# compaction opportunity on this corpus is 0.47% of tool-input bytes; the rule
+# takes it to 0.30%. A read-only inline program that ALSO exceeds 800 characters
+# and ALSO avoids every other probe is a narrow target, and every one of the 4
+# lost calls here is an inline Python script — precisely the shape whose effects
+# cannot be read off the command line. Trading 0.18% of bytes for a closed rule
+# instead of an unclosable enumeration is the right side of THE RULE's
+# asymmetry.
+# ---------------------------------------------------------------------------
+
+#: Interpreters that will execute a program handed to them as an argument.
+#: Deliberately case-sensitive: an all-caps `PYTHON -c` does not occur in
+#: practice, and case-folding would mean allocating a lowercased copy of a blob
+#: that is routinely tens of KB (see "Cost discipline" above).
+_CODE_EXEC_RE = re.compile(
+    r"\b(?:python[0-9.]*|pypy[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|lua|julia|"
+    r"[Rr]script|osascript|tclsh|sh|bash|zsh|ksh|dash|fish|pwsh|powershell)\b"
+    r"(?:"
+    # Subcommand form: `deno eval 'src'`, `bun eval 'src'`.
+    r"[ \t]+eval\b"
+    # Inline-source flag: `python -c`, `node --eval`, `perl -ne`, `php -r`,
+    # `bash -lc`, `pwsh -Command`. At most ONE intervening short option keeps
+    # the gap bounded (`python -E -c …` still matches) while `python -m pytest
+    # -c setup.cfg` — a config flag five tokens away — does not. A bounded gap
+    # is required: an unbounded one would scan to end-of-string from every
+    # interpreter occurrence, the quadratic shape `_has_inplace_edit` exists to
+    # avoid.
+    r"|(?:[ \t]+-[A-Za-z0-9]{1,3})?[ \t]+(?:-{1,2}(?:eval|exec|[Cc]ommand)|-[A-Za-z]{0,3}[cerE])\b"
+    # Program on stdin: `python - <<PY`, `bash -s`. The heredoc probe misses
+    # `python - <<'PY' 2>&1 | tail` (the delimiter is followed by a redirect,
+    # not a newline), and a piped program has no heredoc at all.
+    r"|[ \t]+-(?=[\s\"'\\]|$)"
+    r")"
+)
+
+#: Necessary substrings for :data:`_CODE_EXEC_RE` — one per interpreter
+#: alternative, minus the ones another entry already implies (`python3` contains
+#: `python`, and `bash`/`zsh`/`ksh`/`dash`/`fish`/`pwsh`/`powershell`/`tclsh`
+#: all contain `sh`). `sh` is a weak gate — plenty of English words contain it —
+#: but a weak gate is still a correct one, and the regex it admits is linear.
+_CODE_EXEC_LITERALS: tuple[str, ...] = (
+    "python",
+    "pypy",
+    "node",
+    "deno",
+    "bun",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "julia",
+    "script",
+    "sh",
+)
+
+#: Second, *more selective* necessary condition. Every alternative of
+#: :data:`_CODE_EXEC_RE` separates the interpreter from what follows with
+#: ``[ \t]+`` and then requires either ``-`` or ``eval`` — hence one of these
+#: four two-character-ish literals must be present. Deliberately the reason the
+#: gap is spelled ``[ \t]+`` rather than ``\s+``: a strictly-necessary literal
+#: is only derivable when the separator class is known, and ``sh`` alone is far
+#: too weak a gate (it occurs in "should", "shell", "finished", …). Checked
+#: FIRST because ordinary prose — which contains ``sh`` constantly — almost
+#: never contains " -".
+_CODE_EXEC_SEPARATORS: tuple[str, ...] = (" -", "\t-", " eval", "\teval")
+
+
+def _has_code_execution(text: str) -> bool:
+    """An interpreter invoked with an arbitrary embedded program.
+
+    Conservative by construction: what the embedded program does is not
+    inspected, because it cannot be inspected reliably. See the block comment
+    above for why the container rather than the write API is the thing matched.
+    """
+    if not any(sep in text for sep in _CODE_EXEC_SEPARATORS):
+        return False
+    for literal in _CODE_EXEC_LITERALS:
+        if literal in text:
+            return bool(_CODE_EXEC_RE.search(text))
+    return False
+
+
 def _has_sql_mutation(text: str) -> bool:
     """SQL DML/DDL anywhere in the serialized arguments."""
     lowered = text.lower()
@@ -429,7 +547,11 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
         return True
     if "<<" in serialized_args and _HEREDOC_RE.search(serialized_args):
         return True
-    return _has_shell_mutation(serialized_args)
+    if _has_shell_mutation(serialized_args):
+        return True
+    # Last because its literal gate (`sh`) is the weakest of the set: anything
+    # the shell probes already caught never reaches it.
+    return _has_code_execution(serialized_args)
 
 
 #: A retrievable CCR hash: 12-24 lowercase hex characters. This is the exact

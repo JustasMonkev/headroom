@@ -102,22 +102,55 @@ NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
 #
 # The alias is therefore derived deterministically from the memory's own ID:
 # ``m:`` + the first 8 characters of the backend ID. Any worker, in any
-# process, resolves it by unambiguous prefix lookup against the backend — no
-# shared state, nothing to warm up. Resolution is strict: exactly one *proven*
-# match resolves; zero, many, or "cannot prove uniqueness" all raise, so an
-# alias can never resolve to a memory it was not minted for. Values without the
-# ``m:`` prefix are full IDs and pass through untouched.
+# process, resolves it against the backend — no shared state, nothing to warm
+# up. Resolution is strict: exactly one *proven* match resolves; zero, many, or
+# "cannot prove uniqueness" all raise, so an alias can never resolve to a memory
+# it was not minted for. Values without the ``m:`` prefix are full IDs and pass
+# through untouched.
 # ---------------------------------------------------------------------------
 MEMORY_ALIAS_PREFIX = "m:"
 MEMORY_ALIAS_ID_CHARS = 8
 
-# Alias resolution order (PR #16 review, P2):
+# Resolution is *render-equality*, not prefix matching (PR #16 review, P2 — the
+# third defect in this scheme, and like the first two the bad outcome was
+# mutating the wrong record).
+#
+# Backend IDs are opaque strings, so nothing stops one from starting with
+# ``m:`` — and ``_alias_for_memory`` emits short IDs verbatim, so it will hand
+# back an ``m:``-leading ID as *itself*. ``memory_search`` / ``memory_list``
+# also report native IDs raw. The resolver used to read any ``m:``-leading
+# value as an alias unconditionally: it stripped the sigil and prefix-matched
+# the remainder, so a real ID like ``m:abc12345`` either failed to resolve or,
+# if exactly one *different* ID began with ``abc12345``, resolved to that other
+# record and mutated it.
+#
+# Ordering the two readings ("try an exact native match first") would only pick
+# a favourite: a long ID ``abc12345-…`` and a short ID ``m:abc12345`` render as
+# the *same* token, so preferring either one silently mutates the other half of
+# the time. Instead the resolver asks the only question that is actually
+# well-posed:
+#
+#     which stored memories would have been *rendered* as this token?
+#
+#     matches = {R in store : R == value or _alias_for_memory(R) == value}
+#
+# That set contains the native reading and the alias reading, so no legitimate
+# token is misread; and the existing "exactly one match or raise" rule then
+# makes acting on the wrong record impossible rather than unlikely — the safety
+# property no longer depends on the alias encoding being collision-free, which
+# is what closes the class instead of this one instance. See
+# ``_renders_as``.
+#
+# Candidate gathering, in order:
 #
 #   1. ``backend.get_memory_ids_by_prefix`` — an exact, backend-side prefix
 #      lookup. Nothing in-tree implements it yet; it is the hook a backend that
 #      *can* answer the question cheaply (an indexed LIKE / range scan) should
-#      implement, and it short-circuits everything below.
-#   2. Otherwise enumerate the user's memory IDs and match the prefix here.
+#      implement, and it short-circuits everything below. It is probed twice,
+#      once per reading (the alias body, and the whole value), because an ID
+#      equal to the token does not start with the alias body.
+#   2. Otherwise enumerate the user's memory IDs and apply ``_renders_as``
+#      here — one pass covers both readings at no extra cost.
 #
 # The enumeration used to be a single capped 10,000-row slice, which had two
 # problems. The one the review named: a memory outside the slice could be
@@ -126,7 +159,7 @@ MEMORY_ALIAS_ID_CHARS = 8
 # outside it could not be ruled out, so the alias could resolve to the wrong
 # record — precisely the failure the alias scheme exists to prevent.
 #
-# So the scan now escalates its page size until the backend reports fewer rows
+# So the scan escalates its page size until the backend reports fewer rows
 # than were asked for (i.e. the listing is provably exhausted). If the listing
 # cannot be exhausted within ``MEMORY_ALIAS_MAX_LOOKUP``, resolution *fails*
 # with an actionable error instead of trusting a partial view.
@@ -1014,11 +1047,30 @@ memory_update / memory_delete.
         same memory always produces the same bytes (prefix-cache friendly).
 
         IDs no longer than the alias itself are returned verbatim — there is
-        nothing to save, and a full ID always resolves.
+        nothing to save, and a full ID always resolves. Note that a *verbatim*
+        ID may itself begin with ``MEMORY_ALIAS_PREFIX``; the resolver handles
+        that (see ``_renders_as``) instead of assuming it cannot happen.
         """
         if len(memory_id) <= MEMORY_ALIAS_ID_CHARS + len(MEMORY_ALIAS_PREFIX):
             return memory_id
         return MEMORY_ALIAS_PREFIX + memory_id[:MEMORY_ALIAS_ID_CHARS]
+
+    @classmethod
+    def _renders_as(cls, stored_id: str, value: str) -> bool:
+        """Could ``stored_id`` have produced the token ``value``?
+
+        The single predicate alias resolution is built on. A stored memory is a
+        candidate for ``value`` when the model could have been shown ``value``
+        for it — either as its raw backend ID (``memory_search`` /
+        ``memory_list`` report those verbatim) or as its recall alias.
+
+        Deliberately an *equality* test on both readings rather than a prefix
+        match. Prefix matching is what let ``m:<real id>`` be mistaken for an
+        alias of some unrelated record; every alias this class mints is exactly
+        ``MEMORY_ALIAS_PREFIX`` + ``MEMORY_ALIAS_ID_CHARS`` characters, so a
+        prefix match buys nothing except the chance to be wrong.
+        """
+        return stored_id == value or cls._alias_for_memory(stored_id) == value
 
     @classmethod
     def _alias_row_ids(cls, memory_ids: list[str]) -> list[str]:
@@ -1030,6 +1082,12 @@ memory_update / memory_delete.
         ambiguous by construction; an alias that later collides with some
         other stored memory still fails loudly in ``_resolve_memory_alias``
         rather than resolving to the wrong record.
+
+        The fallback cannot help one case: a short ID that *is* ``m:`` + eight
+        characters renders as itself either way, so if some other memory's
+        alias is the same string that row stays unaddressable. The resolver
+        reports that as an ambiguity instead of picking one — which is the
+        outcome that matters.
 
         Empty IDs render as ``"?"`` (defensive: a backend row without an ID
         is visible but not addressable).
@@ -1049,25 +1107,41 @@ memory_update / memory_delete.
                 ids.append(mem_id)
         return ids
 
-    async def _backend_prefix_lookup(
-        self, backend: Any, user_id: str, prefix: str
+    async def _backend_candidate_lookup(
+        self, backend: Any, user_id: str, value: str, body: str
     ) -> list[str] | None:
-        """Exact, backend-side resolution of an alias prefix.
+        """Exact, backend-side gathering of everything that renders as ``value``.
 
-        Returns the matching IDs, or ``None`` when the backend exposes no such
+        Returns the candidate IDs, or ``None`` when the backend exposes no such
         hook (the common case today) so the caller falls back to enumeration.
         A backend that implements ``get_memory_ids_by_prefix`` answers the
         question authoritatively — no slice, nothing to truncate.
+
+        Two probes, one per reading of ``value``: ``body`` (the token minus the
+        alias sigil) finds the memories ``value`` could be an *alias* for, and
+        ``value`` itself finds a memory whose *native* ID is literally the
+        token — which does not start with ``body`` and would otherwise be
+        invisible here. The extra probe is one indexed lookup; skipping it is
+        what let a real ``m:``-leading ID resolve to a different record.
+        ``_renders_as`` then filters both probes, so a probe returning extra
+        rows cannot widen the match set.
         """
         fn = getattr(backend, "get_memory_ids_by_prefix", None)
         if not callable(fn):
             return None
-        try:
-            results = await fn(prefix=prefix, user_id=user_id)
-        except Exception as e:  # pragma: no cover - backend-specific
-            logger.debug("Memory: backend prefix lookup failed: %s", e)
-            return None
-        return self._memory_ids_from(results)
+        found: list[str] = []
+        seen: set[str] = set()
+        for probe in (body, value):
+            try:
+                results = await fn(prefix=probe, user_id=user_id)
+            except Exception as e:  # pragma: no cover - backend-specific
+                logger.debug("Memory: backend prefix lookup failed: %s", e)
+                return None
+            for mid in self._memory_ids_from(results):
+                if mid not in seen and self._renders_as(mid, value):
+                    seen.add(mid)
+                    found.append(mid)
+        return found
 
     async def _list_memory_ids(
         self, backend: Any, user_id: str, limit: int
@@ -1107,32 +1181,35 @@ memory_update / memory_delete.
         rows = list(results or [])
         return self._memory_ids_from(rows), len(rows) < limit
 
-    async def _scan_for_prefix(
-        self, backend: Any, user_id: str, prefix: str, alias: str
-    ) -> list[str]:
-        """Find every stored ID starting with ``prefix``, or refuse to guess.
+    async def _scan_for_candidates(self, backend: Any, user_id: str, value: str) -> list[str]:
+        """Find every stored memory that renders as ``value``, or refuse to guess.
 
         Escalates the listing page size until the backend proves it returned
         everything. A single match inside a *truncated* listing is not enough:
         a second match could be sitting just past the cut, and resolving to the
         wrong persistent record is the one outcome the alias scheme must never
-        produce.
+        produce. (Two matches are already conclusive — the caller raises either
+        way — so the escalation stops there.)
+
+        Both readings of ``value`` are covered by the one pass: ``_renders_as``
+        accepts a stored ID that *is* the token as readily as one whose alias
+        is, so an ``m:``-leading native ID costs no extra enumeration.
         """
         limit = MEMORY_ALIAS_PAGE_LIMIT
         while True:
             page = await self._list_memory_ids(backend, user_id, limit)
             if page is None:
                 raise MemoryAliasError(
-                    f"Cannot resolve memory reference {alias!r}: this backend cannot "
+                    f"Cannot resolve memory reference {value!r}: this backend cannot "
                     "list memories. Call memory_search and pass the full id."
                 )
             ids, exhausted = page
-            matches = [mid for mid in ids if mid.startswith(prefix)]
+            matches = [mid for mid in ids if self._renders_as(mid, value)]
             if exhausted or len(matches) > 1:
                 return matches
             if limit >= MEMORY_ALIAS_MAX_LOOKUP:
                 raise MemoryAliasError(
-                    f"Could not resolve memory reference {alias!r}: more than "
+                    f"Could not resolve memory reference {value!r}: more than "
                     f"{limit:,} memories are stored and the listing could not be "
                     "read in full, so a unique match cannot be proven. Call "
                     "memory_search or memory_list and pass the full id."
@@ -1146,25 +1223,35 @@ memory_update / memory_delete.
         returned unchanged — memory_search / memory_list results keep working
         verbatim, and no backend round-trip is spent on them.
 
-        Aliases resolve through an exact backend prefix lookup when the backend
-        offers one, and otherwise through an enumeration that is escalated
-        until it is provably exhaustive (see ``_scan_for_prefix``), so a fresh
-        process (restart, different worker) resolves them exactly like the one
-        that minted them and the reachable set is not capped at some arbitrary
-        slice. Resolution is strict: raises ``MemoryAliasError`` unless exactly
-        one stored memory matches, so an alias can never be applied to a memory
-        it was not minted for.
+        A value that *does* carry the prefix is not assumed to be an alias.
+        Backend IDs are opaque and may legitimately begin with ``m:`` (and
+        ``_alias_for_memory`` hands short ones back verbatim), so the resolver
+        collects every stored memory that could have been rendered as this
+        token — the one whose native ID *is* the token, and the one whose alias
+        is — and requires the answer to be unique. Assuming the alias reading,
+        or merely preferring one reading over the other, is what made
+        ``memory_update`` / ``memory_delete`` able to hit a record the token was
+        never minted for.
+
+        Candidates come from an exact backend prefix lookup when the backend
+        offers one, and otherwise from an enumeration that is escalated
+        until it is provably exhaustive (see ``_scan_for_candidates``), so a
+        fresh process (restart, different worker) resolves them exactly like the
+        one that minted them and the reachable set is not capped at some
+        arbitrary slice. Resolution is strict: raises ``MemoryAliasError``
+        unless exactly one stored memory matches, so a reference can never be
+        applied to a memory it was not minted for.
         """
         if not memory_id.startswith(MEMORY_ALIAS_PREFIX):
             return memory_id
 
-        prefix = memory_id[len(MEMORY_ALIAS_PREFIX) :]
-        if not prefix:
+        body = memory_id[len(MEMORY_ALIAS_PREFIX) :]
+        if not body:
             raise MemoryAliasError(f"Malformed memory reference {memory_id!r}.")
 
-        matches = await self._backend_prefix_lookup(backend, user_id, prefix)
+        matches = await self._backend_candidate_lookup(backend, user_id, memory_id, body)
         if matches is None:
-            matches = await self._scan_for_prefix(backend, user_id, prefix, memory_id)
+            matches = await self._scan_for_candidates(backend, user_id, memory_id)
 
         if len(matches) == 1:
             return matches[0]
@@ -1173,8 +1260,13 @@ memory_update / memory_delete.
                 f"No memory matches reference {memory_id!r} — it may have been "
                 "deleted. Call memory_search or memory_list to get a current id."
             )
+        detail = (
+            " — it is both a stored memory id and the recall alias of another"
+            if memory_id in matches
+            else ""
+        )
         raise MemoryAliasError(
-            f"Memory reference {memory_id!r} is ambiguous ({len(matches)} matches). "
+            f"Memory reference {memory_id!r} is ambiguous ({len(matches)} matches{detail}). "
             "Call memory_search or memory_list and pass the full id."
         )
 
