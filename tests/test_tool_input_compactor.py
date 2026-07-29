@@ -995,6 +995,14 @@ def test_patch_lookalikes_and_queries_stay_compactable(command: str) -> None:
         "curl https://api.example.test/items --data-urlencode name=x",
         "curl -F artifact=@build.tgz https://api.example.test/upload",
         "curl -T build.tgz https://api.example.test/upload",
+        "curl -K -",
+        "curl -K-",
+        "curl -Krequest.conf",
+        "curl -K request.conf",
+        "curl -sK-",
+        "curl -fsK -",
+        "curl -#K-",
+        "curl --config request.conf",
     ],
 )
 def test_remote_mutating_shell_commands_are_detected(command: str) -> None:
@@ -1017,6 +1025,7 @@ def test_remote_mutating_shell_commands_are_detected(command: str) -> None:
         "curl -d q=headroom -X GET https://api.example.test/search",
         "curl --request HEAD https://api.example.test/items",
         "curl -G https://api.example.test/search --data-urlencode q=headroom",
+        "curl -k https://api.example.test/items",
     ],
 )
 def test_remote_read_commands_stay_compactable(command: str) -> None:
@@ -1037,6 +1046,33 @@ def test_remote_read_commands_stay_compactable(command: str) -> None:
                 "command": "curl -X POST https://api.example.test/items -d '" + "x" * 2000 + "'",
             }
         ),
+        json.dumps(
+            {
+                "command": "curl -K -",
+                "stdin": (
+                    "url = https://api.example.test/items\nrequest = POST\ndata = " + "x" * 2000
+                ),
+            }
+        ),
+        json.dumps(
+            {
+                "command": "curl --config -",
+                "stdin": "url = https://api.example.test/items\nrequest = GET",
+            },
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {
+                "command": "curl -fsK -",
+                "stdin": "url = https://api.example.test/items\nrequest = POST",
+            }
+        ),
+        json.dumps(
+            {
+                "command": "curl -#K-",
+                "stdin": "url = https://api.example.test/items\nrequest = POST",
+            }
+        ),
     ],
 )
 def test_remote_mutation_payload_is_never_compacted(args: str) -> None:
@@ -1045,36 +1081,3 @@ def test_remote_mutation_payload_is_never_compacted(args: str) -> None:
     assert result.compacted_count == 0
     assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == args
     assert store.stored == []
-
-
-def test_curl_config_input_is_treated_as_a_mutation() -> None:
-    """`curl -K -` hides the method and body in stdin, not in the flags.
-
-    Per ``curl --manual`` a config file's arguments are treated exactly like
-    command-line ones, with the leading dashes optional and ``=`` or whitespace
-    as the separator. A POST whose method and payload live only there reads as a
-    bare ``curl -K -`` to every flag probe, so its sole record could be replaced
-    by an expiring CCR marker and lost for good once the TTL lapses.
-    """
-    import json
-
-    from headroom.transforms.tool_input_compactor import _has_shell_mutation
-
-    post_via_config = json.dumps(
-        {"command": "curl -K -", "stdin": "url = https://api/x\nrequest = POST\ndata = " + "a" * 400}
-    )
-    dashed_config = json.dumps(
-        {"command": "curl -K -", "stdin": "--url https://api/x\n--request POST\n--data " + "b" * 400}
-    )
-    file_config = json.dumps({"command": "curl --config req.txt", "stdin": "data-binary = @big.json"})
-
-    assert _has_shell_mutation(post_via_config)
-    assert _has_shell_mutation(dashed_config)
-    assert _has_shell_mutation(file_config)
-
-    # A read-only config stays compactable — the guard must not swallow every
-    # `-K` invocation, or it stops saving tokens on the common GET case.
-    get_via_config = json.dumps(
-        {"command": "curl -K -", "stdin": 'url = https://api/x\nheader = "Accept: application/json"'}
-    )
-    assert not _has_shell_mutation(get_via_config)

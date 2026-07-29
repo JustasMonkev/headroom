@@ -261,29 +261,13 @@ _DEPLOYMENT_MUTATION_RE = re.compile(
 )
 _CURL_METHOD_RE = re.compile(r"(?:^|\s)(?:-X|--request)(?:[=\s]*)([A-Za-z]+)\b")
 _CURL_GET_RE = re.compile(r"(?:^|\s)(?:-G|--get)\b")
-#: ``-K``/``--config`` makes curl read arguments from a file — or, with ``-K -``,
-#: from stdin. Per ``curl --manual`` those arguments are treated exactly like
-#: command-line ones, except the leading dashes may be omitted and the separator
-#: may be ``=`` or whitespace: ``request = POST`` is ``--request POST``. A
-#: request whose method and body live only in that config therefore reads as a
-#: bare ``curl -K -`` on the command line and slipped past every flag probe.
-_CURL_CONFIG_RE = re.compile(r"(?:^|\s)(?:-K|--config)(?:[=\s]|$)")
-#: Config-file spelling of the mutating directives. Dashes optional, `=` or
-#: space separator, value on the same line.
-_CURL_CONFIG_MUTATION_RE = re.compile(
-    r"(?:^|[\s\\rn\"])-{0,2}(?:"
-    r"request[=\s]+(?:POST|PUT|PATCH|DELETE)|"
-    r"data(?:-ascii|-binary|-raw|-urlencode)?[=\s]|"
-    r"json[=\s]|form(?:-string)?[=\s]|upload-file[=\s]|T[=\s]"
-    r")",
-    re.IGNORECASE,
-)
 _CURL_PAYLOAD_RE = re.compile(
     r"(?:^|\s)(?:"
     r"-d|--data(?:-ascii|-binary|-raw|-urlencode)?|--json|"
     r"-F|--form(?:-string)?|-T|--upload-file"
     r")(?:[=\s]|(?=[^-]))"
 )
+_CURL_CONFIG_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z0-9#]*K(?:\S+|\s+\S+)|--config\s+\S+)")
 
 _WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("tee",), _TEE_RE),
@@ -354,14 +338,7 @@ def _has_remote_mutation(text: str) -> bool:
             continue
         tail = segment[curl.end() :]
         if _CURL_CONFIG_RE.search(tail):
-            # The real arguments are in the config body, which for `-K -` is the
-            # sibling `stdin` field of the same serialized call. Scan the whole
-            # text rather than just this segment: a mutating directive found
-            # anywhere in it is reason enough to keep the input, and a missed
-            # fold costs only tokens where a wrong fold costs the record of what
-            # was sent.
-            if _CURL_CONFIG_MUTATION_RE.search(text):
-                return True
+            return True
         methods = _CURL_METHOD_RE.findall(tail)
         if methods:
             if methods[-1].upper() in {"POST", "PUT", "PATCH", "DELETE"}:

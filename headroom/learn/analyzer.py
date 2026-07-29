@@ -431,6 +431,7 @@ SECTION_VOCABULARY: tuple[str, ...] = (
     "Failure Modes",
     "Loop Guardrails",
 )
+_SECTION_BY_KEY = {_normalize_heading(section): section for section in SECTION_VOCABULARY}
 
 _SECTION_VOCABULARY_LIST = ", ".join(f'"{s}"' for s in SECTION_VOCABULARY)
 
@@ -875,7 +876,7 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     for rule in raw.get("context_file_rules", []):
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
+        section = _SECTION_BY_KEY.get(_normalize_heading(rule.get("section", "").strip()), "")
         content = rule.get("content", "").strip()
         if not section or not content:
             continue
@@ -893,7 +894,7 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     for rule in raw.get("memory_file_rules", []):
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
+        section = _SECTION_BY_KEY.get(_normalize_heading(rule.get("section", "").strip()), "")
         content = rule.get("content", "").strip()
         if not section or not content:
             continue
@@ -920,33 +921,8 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     return recommendations
 
 
-#: Normalized heading -> the canonical vocabulary spelling. Built once so a
-#: model variant can be mapped back to the exact bytes the vocabulary defines.
-_CANONICAL_SECTION_BY_KEY: dict[str, str] = {
-    _normalize_heading(name): name for name in SECTION_VOCABULARY
-}
-
-
 def _merge_equivalent_sections(recommendations: list[Recommendation]) -> list[Recommendation]:
-    """Fold recommendations whose headings normalize to the same key.
-
-    Folding by normalized key is not enough on its own: the *stored*
-    ``rec.section`` also has to become the canonical spelling. Otherwise a run
-    where the model writes ``Environment Rules`` merges correctly but still
-    renders that variant, and `_merge_recommendations` treats it as
-    authoritative — dropping the existing ``Environment`` section and rewriting
-    the heading. Two runs that disagree on the variant then rewrite the learned
-    block back and forth, busting its prompt-cache prefix on every
-    ``headroom learn`` despite the byte-stability this path exists to provide.
-
-    Headings outside the vocabulary are left alone; they have no canonical
-    spelling to snap to, and first-seen order still keeps them stable.
-    """
-    for rec in recommendations:
-        canonical = _CANONICAL_SECTION_BY_KEY.get(_normalize_heading(rec.section))
-        if canonical is not None and rec.section != canonical:
-            rec.section = canonical
-
+    """Fold recommendations whose headings normalize to the same key."""
     merged: dict[tuple[RecommendationTarget, str], Recommendation] = {}
     order: list[tuple[RecommendationTarget, str]] = []
     for rec in recommendations:

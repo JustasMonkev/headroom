@@ -181,7 +181,7 @@
       "type": "function",
       "function": {
         "name": "memory_delete",
-        "description": "Remove a memory the user asks you to forget, that is obsolete (merely changed \u2192 use memory_update), or that was saved in error. Permanent and not recoverable.",
+        "description": "Remove a memory the user asks you to forget, that is obsolete (merely changed → use memory_update), or that was saved in error. The stored memory is deleted.",
         "parameters": {
           "type": "object",
           "properties": {

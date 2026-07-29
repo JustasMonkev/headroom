@@ -166,6 +166,16 @@ def test_required_params_unchanged(tools: list[dict[str, Any]]) -> None:
     assert _params(_by_name(tools, "memory_delete"))["required"] == ["memory_id"]
 
 
+@ALL_VARIANTS
+def test_memory_delete_does_not_promise_retained_history(tools: list[dict[str, Any]]) -> None:
+    tool = _by_name(tools, "memory_delete")
+    definition = tool.get("function") or tool
+    description = definition["description"].lower()
+    assert "stored memory is deleted" in description
+    assert "soft delete" not in description
+    assert "history is kept" not in description
+
+
 # ---------------------------------------------------------------------------
 # Standard relationship arrays
 # ---------------------------------------------------------------------------
