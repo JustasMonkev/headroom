@@ -34,9 +34,21 @@
           "extracted_entities": {
             "type": "array",
             "items": {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "entity": {
+                  "type": "string"
+                },
+                "entity_type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "entity",
+                "entity_type"
+              ]
             },
-            "description": "Typed entities as {entity, entity_type} objects."
+            "description": "Typed entities for graph storage."
           },
           "relationships": {
             "type": "array",
@@ -48,9 +60,25 @@
           "extracted_relationships": {
             "type": "array",
             "items": {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string"
+                },
+                "relationship": {
+                  "type": "string"
+                },
+                "destination": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "relationship",
+                "destination"
+              ]
             },
-            "description": "Graph links as {source, relationship, destination} objects."
+            "description": "Graph links between entities."
           },
           "background": {
             "type": "boolean",

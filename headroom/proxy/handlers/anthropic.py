@@ -1891,11 +1891,21 @@ class AnthropicHandlerMixin:
                 # hashes the pipeline reported minting so the decision below
                 # sees them.
                 from headroom.transforms.tool_input_compactor import (
+                    ccr_hashes_in_tool_arguments,
                     merge_pipeline_ccr_hashes,
                 )
 
+                # Hashes minted this run cover the first compaction. A restart
+                # or a different worker loses the session tracker, so an
+                # already-compacted `tool_use.input` is skipped as idempotent
+                # and mints nothing — scan the transcript too, or the marker
+                # stays in context with no tool able to redeem it.
                 _detected_hashes = merge_pipeline_ccr_hashes(
-                    injector.detected_hashes, pipeline_ccr_hashes
+                    injector.detected_hashes,
+                    [
+                        *pipeline_ccr_hashes,
+                        *ccr_hashes_in_tool_arguments(optimized_messages),
+                    ],
                 )
                 if inject_system_instructions and injector.has_compressed_content:
                     optimized_messages = injector.inject_into_system_message(optimized_messages)

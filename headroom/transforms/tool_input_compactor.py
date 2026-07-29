@@ -332,6 +332,7 @@ _MUTATING_NAME_PREFIXES: tuple[str, ...] = (
     "remove",
     "rename",
     "replace",
+    "save",
     "send",
     "set",
     "submit",
@@ -341,6 +342,16 @@ _MUTATING_NAME_PREFIXES: tuple[str, ...] = (
     "upsert",
     "write",
 )
+
+# Segments of a raw tool name, before `_normalize_tool_name` folds the
+# separators away. Handles both spellings a tool name arrives in:
+# `memory_save` -> ("memory", "save") and `TodoWrite` -> ("todo", "write").
+_NAME_SEGMENTS = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
+
+
+def _name_segments(name: str) -> list[str]:
+    """Lowercased word segments of a raw tool name."""
+    return [part.casefold() for part in _NAME_SEGMENTS.findall(name)]
 
 
 def _normalize_tool_name(name: Any) -> str:
@@ -404,6 +415,14 @@ def is_mutating_tool_input(tool_name: str, serialized_args: str) -> bool:
     for leaf in leaves:
         if leaf in MUTATING_TOOL_NAMES or leaf.startswith(_MUTATING_NAME_PREFIXES):
             return True
+    # Not every name leads with its verb: `memory_save`, `page_update` and
+    # `document_delete` all write, and a prefix test alone reads them as
+    # read-only. Split the RAW name — `_normalize_tool_name` strips the
+    # separators, so segments only survive before normalization. Whole-segment
+    # equality (not prefix or suffix) is what keeps `get_asset` out while
+    # catching the noun-first spelling.
+    if any(part in _MUTATING_NAME_PREFIXES for part in _name_segments(tool_name)):
+        return True
     # Content checks are ordered cheapest-guard-first; each is substring-gated
     # so the regex engine only ever sees inputs that could actually match.
     if _has_sql_mutation(serialized_args):

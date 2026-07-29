@@ -16,6 +16,7 @@ from headroom.config import ToolInputCompactionConfig
 from headroom.transforms.tool_input_compactor import (
     CCR_INPUT_KEY,
     ToolInputCompactor,
+    is_mutating_tool_input,
 )
 
 # Read-only (reproducible) arguments — the only kind that may be compacted.
@@ -653,3 +654,50 @@ def test_hostile_blob_still_detects_a_trailing_mutation() -> None:
     assert is_mutating_tool_input("Bash", padding + ' ; echo x > "$out"') is True
     assert is_mutating_tool_input("Bash", padding + " ; touch marker") is True
     assert is_mutating_tool_input("Bash", padding + " ; mkfifo p") is True
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        # Noun-first spelling: the verb is the trailing segment, so a prefix
+        # test alone reads these as read-only.
+        "memory_save",
+        "memory_update",
+        "memory_delete",
+        "page_update",
+        "document_delete",
+        "mcp__headroom-memory__memory_save",
+        "mcp_headroom_memory_memory_save",
+        # camelCase has no separators at all to split on.
+        "TodoWrite",
+        "NotebookEdit",
+        "MultiEdit",
+    ],
+)
+def test_noun_first_and_camel_case_names_are_mutating(tool_name: str) -> None:
+    assert is_mutating_tool_input(tool_name, '{"content": "x"}') is True
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "Read",
+        "Grep",
+        "Glob",
+        "WebFetch",
+        "WebSearch",
+        "BashOutput",
+        "read_file",
+        "search_files",
+        "list_directory",
+        "list_issues",
+        "query_database",
+        "memory_search",
+        # Whole-segment equality, not prefix/suffix: "asset" must not match
+        # the "set" verb, and "settings" must not match either.
+        "get_asset",
+        "get_settings",
+    ],
+)
+def test_read_only_names_stay_compactable(tool_name: str) -> None:
+    assert is_mutating_tool_input(tool_name, '{"path": "x"}') is False
