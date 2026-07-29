@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urlsplit
 
 import trafilatura
 from trafilatura.settings import use_config
@@ -111,13 +111,74 @@ _SIGNED_QUERY_SUBSTRINGS = (
 _SIGNED_QUERY_PREFIXES = ("x-amz-", "x-goog-", "x-ms-", "x-oss-", "x-obs-", "x-cos-")
 
 
-def _is_signed_query_key(lowered_key: str) -> bool:
-    """True if ``lowered_key`` suggests the query is signed / credentialed."""
-    if lowered_key in _SIGNED_QUERY_KEYS:
+def _is_signed_query_key(reading: str) -> bool:
+    """True if ``reading`` suggests the query is signed / credentialed.
+
+    ``reading`` is one lowercased *reading* of a query key — see
+    :func:`_key_readings`, which supplies both the raw key and its decoded
+    forms so that an encoded `%73ignature` is judged as `signature`.
+    """
+    if reading in _SIGNED_QUERY_KEYS:
         return True
-    if lowered_key.startswith(_SIGNED_QUERY_PREFIXES):
+    if reading.startswith(_SIGNED_QUERY_PREFIXES):
         return True
-    return any(hint in lowered_key for hint in _SIGNED_QUERY_SUBSTRINGS)
+    return any(hint in reading for hint in _SIGNED_QUERY_SUBSTRINGS)
+
+
+# ---------------------------------------------------------------------------
+# Percent-encoded query keys.
+#
+# A key can arrive percent-encoded: `?%73ignature=…` is `?signature=…` to any
+# server that decodes before dispatching, and `?X%2DAmz%2DSignat%75re=…` is
+# `?x-amz-signature=…`. Classifying the *raw* bytes lets such a key slip past
+# the signed-query guard above, and we then drop a tracking parameter out of a
+# signed query — precisely the breakage this module exists to prevent
+# (PR #16 review, round 3).
+#
+# Keys are therefore decoded *into a copy*, solely to classify them. The
+# emitted URL always keeps its original bytes: re-encoding is what invalidated
+# MACs in the first place.
+#
+# The decoding rule, in full:
+#
+#   * Decode repeatedly, at most `_MAX_KEY_DECODE_PASSES` times, so a
+#     double-encoded `%2573ignature` is read as well; `+` is read as a space,
+#     the form-encoding convention. Each pass is lowercased, because decoding
+#     can reveal uppercase bytes (`%53` -> `S`).
+#   * *Every* reading is classified, not only the final one, so a key cannot
+#     hide behind a partial decode.
+#   * If any reading looks signed, the whole URL is returned untouched.
+#   * If a `%` survives every pass — a truncated or non-hex escape, the
+#     non-standard `%uXXXX` form, or nesting deeper than the pass limit — the
+#     key cannot be read at all, so the whole URL is returned untouched. This
+#     is what bounds the pass limit: more encoding never buys an attacker a
+#     pass, it buys a bail-out.
+#   * An encoded key is never *deleted*, even when it decodes to a tracking
+#     name. `%75tm_source` is only `utm_source` to a server that decodes, and
+#     we do not know that this one does; a key must be literal to be dropped.
+#
+# Net effect: an encoded key is classified exactly as its decoded equivalent
+# would be and never more permissively, while deletion still requires a key we
+# can read literally.
+# ---------------------------------------------------------------------------
+_MAX_KEY_DECODE_PASSES = 3
+
+
+def _key_readings(raw_key: str) -> tuple[str, ...]:
+    """Every lowercased reading of ``raw_key`` a server might arrive at.
+
+    Returns the raw key first, then each successive decoding pass, stopping
+    when decoding is a no-op or the pass limit is reached. The last element is
+    the most-decoded reading; a `%` remaining in it means the key never
+    resolved and the caller must give up on the URL.
+    """
+    readings = [raw_key.lower()]
+    for _ in range(_MAX_KEY_DECODE_PASSES):
+        decoded = unquote_plus(readings[-1]).lower()
+        if decoded == readings[-1]:
+            break
+        readings.append(decoded)
+    return tuple(readings)
 
 
 def _strip_tracking_params(url: str) -> str:
@@ -129,9 +190,10 @@ def _strip_tracking_params(url: str) -> str:
     function can make is deleting whole `key=value` segments.
 
     Returns ``url`` unchanged whenever anything about the query is uncertain:
-    a signed/credentialed key anywhere, a legacy `;` separator, a valueless
-    segment (which could itself be a signature blob), an empty segment, or
-    simply nothing to drop.
+    a signed/credentialed key anywhere — judged on the key's decoded readings,
+    not its raw bytes, see :func:`_key_readings` — a key that never decodes to
+    plain text, a legacy `;` separator, a valueless segment (which could itself
+    be a signature blob), an empty segment, or simply nothing to drop.
     """
     head, sep, rest = url.partition("?")
     if not sep or "#" in head:
@@ -150,9 +212,19 @@ def _strip_tracking_params(url: str) -> str:
         raw_key, eq, _value = segment.partition("=")
         if not eq:
             return url
-        lowered = raw_key.lower()
-        if _is_signed_query_key(lowered):
+        readings = _key_readings(raw_key)
+        if any(_is_signed_query_key(reading) for reading in readings):
             return url
+        if "%" in readings[-1]:
+            # The key never decoded to plain text, so we cannot say what it
+            # means — and an unreadable key is exactly where a signature hides.
+            return url
+        if "%" in raw_key or "+" in raw_key:
+            # Encoded, but signature-shaped under no reading. Keep it: only a
+            # key we can read literally is safe to delete.
+            kept.append(segment)
+            continue
+        lowered = readings[0]
         if lowered in _TRACKING_PARAMS or lowered.startswith("utm_"):
             dropped = True
             continue

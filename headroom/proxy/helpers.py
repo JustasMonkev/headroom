@@ -3182,7 +3182,7 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     return model_supports_gated_features(model, family="gpt")
 
 
-def _openai_model_override_verdict(model: str) -> bool | None:
+def _openai_model_override_verdict(model: str | None) -> bool | None:
     """Whether ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` decides this model.
 
     ``None`` means the override did not decide anything — it is unset, empty,
@@ -3193,7 +3193,7 @@ def _openai_model_override_verdict(model: str) -> bool | None:
     fallback while denying the override any authority it did not earn.
     """
     pattern = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
-    if not pattern:
+    if not pattern or not model:
         return None
     try:
         return re.search(pattern, model) is not None
