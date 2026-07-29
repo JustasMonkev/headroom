@@ -3056,6 +3056,7 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
+    dropped_cache_control_value: Any = None
     last_resident_real_idx: int | None = None
     resident_has_cache_control = False
     # (index in `out`, original dict) of the last deferred tool that carried the
@@ -3085,8 +3086,15 @@ def inject_tool_search_deferral(
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
+        _dropped = new_tool.pop("cache_control", None)
+        if _dropped is not None:
             dropped_cache_control = True
+            # Keep the client's own breakpoint object, not just the fact that
+            # one existed: `{"type": "ephemeral", "ttl": "1h"}` degrades to the
+            # default 5-minute TTL if we rebuild it as a bare ephemeral marker,
+            # so the tools prefix would expire and be re-billed long before the
+            # hour the client paid for.
+            dropped_cache_control_value = _dropped
             last_deferred_cache_control = (len(out), tool)
         out.append(new_tool)
         deferred += 1
@@ -3127,7 +3135,14 @@ def inject_tool_search_deferral(
         # reach here can be the process-global schema-compaction cache entry,
         # which is shared across every session with the same tools digest.
         patched = dict(out[last_resident_real_idx])
-        patched["cache_control"] = {"type": "ephemeral"}
+        # Carry the client's object across verbatim (see the drop site): a
+        # rebuilt `{"type": "ephemeral"}` silently downgrades an explicit
+        # `"ttl": "1h"` to the 5-minute default.
+        patched["cache_control"] = (
+            dropped_cache_control_value
+            if isinstance(dropped_cache_control_value, dict)
+            else {"type": "ephemeral"}
+        )
         out[last_resident_real_idx] = patched
     return out
 

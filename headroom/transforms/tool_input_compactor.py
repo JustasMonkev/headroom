@@ -201,7 +201,17 @@ _FILEOP_RE = re.compile(
 #: ``patch`` is a common English word, so it is anchored on the option/redirect
 #: that a real invocation needs (``patch -p1 …``, ``patch < fix.diff``) rather
 #: than the bare token.
-_PATCH_CMD_RE = re.compile(r"\bpatch\s+[-<]")
+#: ``patch`` is a common English word, so the bare token is not enough. Three
+#: real shapes: the classic ``patch -p1 …`` / ``patch < fix.diff``; a CLI
+#: subcommand (``kubectl patch deployment app``, ``oc patch``); and a payload
+#: flag (``--patch '<json>'``, ``--patch-file f``) where the operand follows the
+#: flag rather than the word. All three produce a bare "patched" acknowledgement,
+#: so the arguments are the only record of what the patch contained.
+_PATCH_CMD_RE = re.compile(
+    r"\bpatch\s+[-<]"
+    r"|\b(?:kubectl|oc|helm|az|gcloud|aws)\s+(?:[-\w]+\s+)*patch\b"
+    r"|--patch(?:-file)?[=\s]"
+)
 #: State-changing git subcommands. `add` matters most in practice: `git add`
 #: with hundreds of paths is exactly the long-argument, empty-result shape this
 #: guard exists for, and once the CCR entry lapses the transcript no longer
@@ -215,9 +225,17 @@ _GIT_MUTATION_RE = re.compile(
     r"sparse-checkout|stash|submodule|switch|tag|update-index|update-ref|worktree"
     r")\b"
 )
+#: Package managers accept options and toolchain selectors between the
+#: executable and the verb — ``apt-get -y remove …``, ``npm --global uninstall``,
+#: ``cargo +nightly uninstall``, ``pip -q install`` — so requiring the verb
+#: immediately after the binary missed exactly the long-argument invocations
+#: this guard is for. The gap allows short option/selector tokens only
+#: (``-y``, ``--global``, ``+nightly``), each bounded, so nothing scans to the
+#: end of a large blob.
 _PKG_MUTATION_RE = re.compile(
-    r"\b(?:npm|pnpm|yarn|pip|uv|cargo|apt|apt-get|brew)\s+(?:install|add|remove|"
-    r"uninstall|publish)\b"
+    r"\b(?:npm|pnpm|yarn|pip|pip3|uv|cargo|apt|apt-get|brew|gem|go|dotnet|poetry)\s+"
+    r"(?:[-+][-\w=]{0,30}\s+){0,4}"
+    r"(?:install|add|remove|uninstall|publish|upgrade|update)\b"
 )
 
 _WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
@@ -252,7 +270,26 @@ _WORD_MUTATION_PROBES: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     ),
     (("patch",), _PATCH_CMD_RE),
     (("git",), _GIT_MUTATION_RE),
-    (("npm", "pnpm", "yarn", "pip", "uv", "cargo", "apt", "brew"), _PKG_MUTATION_RE),
+    (
+        # Must list every binary in _PKG_MUTATION_RE: the gate is what decides
+        # whether the regex runs at all, so a binary missing here is invisible
+        # no matter what the pattern says.
+        (
+            "npm",
+            "pnpm",
+            "yarn",
+            "pip",
+            "uv",
+            "cargo",
+            "apt",
+            "brew",
+            "gem",
+            "go",
+            "dotnet",
+            "poetry",
+        ),
+        _PKG_MUTATION_RE,
+    ),
 )
 
 

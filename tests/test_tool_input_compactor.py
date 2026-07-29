@@ -877,3 +877,49 @@ def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
 )
 def test_read_only_git_subcommands_stay_compactable(command: str) -> None:
     assert is_mutating_tool_input("Bash", command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `patch` as a CLI subcommand: the word is followed by a resource type,
+        # not by `-`/`<`.
+        "kubectl patch deployment app --patch '{\"spec\": {\"replicas\": 3}}'",
+        "oc patch svc web -p '{}'",
+        "kubectl apply --patch-file overlay.yaml",
+        # ...and the classic forms still match.
+        "patch -p1 < fix.diff",
+        "patch < fix.diff",
+        # Options and toolchain selectors between the package manager and verb.
+        "apt-get -y remove pkg-a pkg-b pkg-c",
+        "npm --global uninstall left-pad",
+        "cargo +nightly uninstall ripgrep",
+        "pip -q install requests",
+        "poetry add flask",
+        "gem install rails",
+        "dotnet add package Newtonsoft.Json",
+    ],
+)
+def test_patch_and_package_mutations_are_detected(command: str) -> None:
+    assert is_mutating_tool_input("Bash", command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # "patch" as an ordinary word, and read-only package/cluster queries.
+        "grep -rn patch /repo",
+        "cat patchnotes.md",
+        "echo the patch was reviewed",
+        "kubectl get pods",
+        "kubectl describe deployment app",
+        "npm ls",
+        "pip list",
+        "cargo tree",
+        "poetry show",
+        "gem list",
+        "dotnet build",
+    ],
+)
+def test_patch_lookalikes_and_queries_stay_compactable(command: str) -> None:
+    assert is_mutating_tool_input("Bash", command) is False
