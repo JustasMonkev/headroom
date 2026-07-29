@@ -21,6 +21,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 
 from headroom import paths as _paths
 from headroom._subprocess import run
@@ -2958,19 +2959,62 @@ def _model_supports_anthropic_tool_search(model: str | None) -> bool:
     return model_supports_gated_features(model, family="claude")
 
 
-def anthropic_tool_search_enabled(model: str | None) -> bool:
+# Hosts that serve the first-party Claude API shape, i.e. the only upstreams
+# known to implement `tool_search_tool_*` + `defer_loading`. Anything else —
+# an OpenAI-compatible gateway, an enterprise relay, a per-request
+# `x-headroom-base-url` target — may speak the Messages wire format without
+# implementing Tool Search, and would 400 on the injected fields.
+_FIRST_PARTY_ANTHROPIC_HOST_SUFFIX = ".anthropic.com"
+
+
+def is_first_party_anthropic_target(base_url: str | None) -> bool:
+    """True when ``base_url`` is a first-party Anthropic API host.
+
+    ``provider_name`` alone does not answer this: ``/v1/messages`` routed
+    through ``x-headroom-base-url`` keeps ``provider_name == "anthropic"``
+    (the client speaks the Anthropic wire format) while the upstream is an
+    arbitrary gateway. Automatic, model-shape-specific injection must be scoped
+    to a *verified* Anthropic target, not merely to the request dialect.
+
+    **Fails closed**: an empty, malformed or hostless URL returns False.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    candidate = base_url.strip()
+    if "//" not in candidate:  # bare "api.anthropic.com[/path]" — give urlsplit a netloc
+        candidate = "//" + candidate
+    try:
+        host = urlsplit(candidate).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    return host == "api.anthropic.com" or host.endswith(_FIRST_PARTY_ANTHROPIC_HOST_SUFFIX)
+
+
+def anthropic_tool_search_enabled(model: str | None, *, first_party_target: bool = True) -> bool:
     """Whether to inject Anthropic's tool-search deferral for ``model``.
 
     Combines :func:`tool_search_mode` with :func:`_model_supports_anthropic_tool_search`.
-    Provider/backend scoping (first-party Anthropic only, never Bedrock/Vertex)
-    stays at the call site, which is where that context lives.
+    Provider/backend scoping (never Bedrock, never Vertex) stays at the call
+    site, which is where that context lives.
+
+    ``first_party_target`` carries the *upstream* identity (see
+    :func:`is_first_party_anthropic_target`). Automatic (``auto``) injection
+    requires it: a compatible gateway reached via ``x-headroom-base-url`` may
+    not implement Anthropic Tool Search, and requests that used to pass through
+    would start 400ing on ``defer_loading`` / ``tool_search_tool_*``. An
+    explicit ``HEADROOM_TOOL_SEARCH=1`` still forces injection — that is the
+    operator saying "my upstream supports it", and it is what the pre-default-on
+    opt-in did.
     """
     mode = tool_search_mode()
     if mode == "off":
         return False
     if mode == "on":
         return True
-    return _model_supports_anthropic_tool_search(model)
+    return first_party_target and _model_supports_anthropic_tool_search(model)
 
 
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
@@ -2995,7 +3039,10 @@ def inject_tool_search_deferral(
     at least one tool stays non-deferred; a deferred tool never carries
     ``cache_control`` — if the client's tools cache breakpoint sat on a now-deferred
     tool, it is moved to the last non-deferred real tool so the (smaller) tools
-    prefix still caches.
+    prefix still caches. When EVERY real tool would be deferred there is no such
+    tool to move it to, so the breakpoint's own tool is kept resident instead —
+    deferring one fewer schema is strictly cheaper than losing the tools-prefix
+    cache entirely, which is the very thing this transform exists to protect.
     """
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
@@ -3011,6 +3058,9 @@ def inject_tool_search_deferral(
     dropped_cache_control = False
     last_resident_real_idx: int | None = None
     resident_has_cache_control = False
+    # (index in `out`, original dict) of the last deferred tool that carried the
+    # client's cache breakpoint — the fallback holder if nothing stays resident.
+    last_deferred_cache_control: tuple[int, dict[str, Any]] | None = None
     # Match core tools case- and separator-insensitively; see _normalize_tool_name.
     core_normalized = (
         _TOOL_SEARCH_CORE_TOOLS_NORMALIZED
@@ -3037,11 +3087,33 @@ def inject_tool_search_deferral(
         new_tool["defer_loading"] = True
         if new_tool.pop("cache_control", None) is not None:
             dropped_cache_control = True
+            last_deferred_cache_control = (len(out), tool)
         out.append(new_tool)
         deferred += 1
 
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the cache prefix
+    # All-custom tool sets (every tool deferrable, e.g. a pure-MCP surface) leave
+    # `last_resident_real_idx is None`, so there is nowhere to move the client's
+    # breakpoint to and the tools prefix would silently stop caching — the
+    # opposite of this transform's purpose. Keep the breakpoint's own tool
+    # resident, exactly as the client sent it: the breakpoint stays byte-stable
+    # in place and one schema stays in context instead of the whole prefix
+    # re-billing every turn.
+    if (
+        dropped_cache_control
+        and not resident_has_cache_control
+        and last_resident_real_idx is None
+        and last_deferred_cache_control is not None
+    ):
+        _cc_idx, _cc_tool = last_deferred_cache_control
+        out[_cc_idx] = _cc_tool
+        deferred -= 1
+        last_resident_real_idx = _cc_idx
+        resident_has_cache_control = True
+        dropped_cache_control = False
+        if deferred == 0:
+            return tools  # nothing left deferred → don't perturb the cache prefix
     # Preserve a tools cache breakpoint: if we stripped cache_control off a
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).

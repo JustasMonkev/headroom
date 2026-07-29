@@ -55,6 +55,35 @@ _MODEL_FEATURE_MIN_VERSIONS: dict[str, tuple[int, int]] = {
 #   gpt-5.5 / gpt-5.5-codex / openai/gpt-5 / gpt-5.4-2026-02-01
 _MODEL_ID_SEPARATORS = re.compile(r"[^0-9a-z]+")
 
+# A `YYYYMMDD` release-date stamp is NOT a version component. Canonical Claude
+# ids interleave the two — `claude-sonnet-4-20250514` is Claude 4 Sonnet
+# released 2025-05-14, not "Claude 4.20250514" — so an 8-digit token that reads
+# as a plausible calendar date terminates the version run instead of becoming
+# the minor. Without this, every dated pre-4.5 id (`claude-sonnet-4-20250514`)
+# scored an astronomically large minor and sailed over the >= (4, 8) cutoff,
+# which is the exact set of models the cutoff exists to exclude.
+_RELEASE_DATE_MIN_YEAR = 2000
+_RELEASE_DATE_MAX_YEAR = 2100
+
+
+def _is_release_date_token(token: str) -> bool:
+    """True when ``token`` is an 8-digit ``YYYYMMDD`` release stamp.
+
+    Deliberately narrow: exactly 8 digits, a plausible year, month 1-12 and day
+    1-31. A digit run that is not a plausible date (e.g. ``12345678``) keeps its
+    old meaning as a version component rather than being silently discarded.
+    """
+    if len(token) != 8 or not token.isdigit():
+        return False
+    year = int(token[:4])
+    month = int(token[4:6])
+    day = int(token[6:8])
+    return (
+        _RELEASE_DATE_MIN_YEAR <= year <= _RELEASE_DATE_MAX_YEAR
+        and 1 <= month <= 12
+        and 1 <= day <= 31
+    )
+
 
 def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | None:
     """Parse a model id into ``(family, (major, minor))``; ``None`` if unknown.
@@ -69,6 +98,10 @@ def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | N
     every id in this repo puts it (``claude-opus-4-6`` -> ``(4, 6)``;
     ``claude-3-5-sonnet-20241022`` -> ``(3, 5)``; ``gpt-5.5-codex`` ->
     ``(5, 5)``; ``gpt-5`` -> ``(5, 0)``). A missing minor is 0.
+
+    An 8-digit ``YYYYMMDD`` release stamp is a **date, not a minor version**, and
+    ends the run: ``claude-sonnet-4-20250514`` -> ``(4, 0)`` (Claude 4 Sonnet),
+    ``claude-opus-4-8-20260210`` -> ``(4, 8)``.
 
     Returns ``None`` — never a guess — for anything unparseable, so callers
     fail closed. Non-versioned families (``o1``, ``o3``, ``gpt-4o``, embedding
@@ -91,10 +124,12 @@ def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | N
         return None
     digits: list[int] = []
     for token in tokens[start:]:
-        if token.isdigit():
+        if token.isdigit() and not _is_release_date_token(token):
             digits.append(int(token))
         elif digits:
-            break  # version digits are contiguous; stop at the family/date boundary
+            # Version digits are contiguous; stop at the family/date boundary.
+            # A release-date stamp counts as a boundary, never as a version.
+            break
     if not digits:
         return None
     major = digits[0]

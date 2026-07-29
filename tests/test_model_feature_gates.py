@@ -49,8 +49,19 @@ GATE_TABLE: list[tuple[object, bool]] = [
     ("claude-3-5-sonnet", False),
     ("claude-3-5-sonnet-20241022", False),
     ("claude-3-opus-20240229", False),
+    # --- Dated canonical ids: the YYYYMMDD stamp is a DATE, not a minor
+    # version. `claude-sonnet-4-20250514` is Claude 4 Sonnet -> below the
+    # cutoff. Reading the date as the minor made it (4, 20250514) and let
+    # exactly the models this cutoff excludes through the gate.
+    ("claude-sonnet-4-20250514", False),
+    ("claude-opus-4-20250514", False),
+    ("anthropic/claude-sonnet-4-20250514", False),
+    ("us.anthropic.claude-sonnet-4-20250514-v1:0", False),
+    ("claude-opus-4-1-20250805", False),
+    ("claude-3-haiku-20240307", False),
     # --- Claude: at/above the cutoff.
     ("claude-opus-4-8", True),
+    ("claude-opus-4-8-20260210", True),
     ("claude-sonnet-4-8-20260210", True),
     ("claude-opus-4-9", True),
     ("claude-sonnet-5", True),
@@ -111,9 +122,22 @@ def test_model_supports_gated_features(model: object, expected: bool) -> None:
         ("us.anthropic.claude-opus-4-6-v1:0", ("claude", (4, 6))),
         ("anthropic/claude-opus-4-8", ("claude", (4, 8))),
         ("claude-sonnet-5", ("claude", (5, 0))),
+        # A YYYYMMDD stamp terminates the version run instead of becoming the
+        # minor: these are Claude 4 / Claude 3, not "Claude 4.20250514".
+        ("claude-sonnet-4-20250514", ("claude", (4, 0))),
+        ("claude-opus-4-20250514", ("claude", (4, 0))),
+        ("us.anthropic.claude-sonnet-4-20250514-v1:0", ("claude", (4, 0))),
+        ("claude-opus-4-8-20260210", ("claude", (4, 8))),
+        ("claude-opus-4-1-20250805", ("claude", (4, 1))),
+        ("claude-3-haiku-20240307", ("claude", (3, 0))),
+        ("claude-3-opus-20240229", ("claude", (3, 0))),
         ("gpt-5", ("gpt", (5, 0))),
         ("gpt-5.5-codex", ("gpt", (5, 5))),
+        ("gpt-5.4-2026-02-01", ("gpt", (5, 4))),
         ("openai/gpt-6.2", ("gpt", (6, 2))),
+        # Not a plausible calendar date -> still a version component, so the
+        # date rule stays narrow and can't silently swallow real minors.
+        ("gpt-6-12345678", ("gpt", (6, 12345678))),
         ("gpt-4o", None),  # no parseable version -> unknown, not a guess
         ("o3", None),
         ("", None),

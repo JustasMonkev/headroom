@@ -72,6 +72,28 @@ def test_handler_gates_on_both_the_billing_predicate_and_the_opt_in() -> None:
     assert "bills_prior_thinking" in window, "billing gate missing"
 
 
+def test_thinking_compaction_is_offloaded_to_the_bounded_compression_executor() -> None:
+    """It must NOT run inline in the async handler.
+
+    `compact_thinking_to_text()` calls `kompress.compress()` per thinking block:
+    local ONNX inference or a blocking `httpx.Client.post()` to the remote
+    compressor. Inline, one request stalls the event loop — and therefore every
+    other request this worker is serving — for the full inference/network
+    duration, with no timeout. It goes through the same bounded executor and the
+    same compression timeout as the rest of the pipeline.
+    """
+    src = inspect.getsource(anthropic_handler.AnthropicHandlerMixin.handle_anthropic_messages)
+    assert inspect.iscoroutinefunction(
+        anthropic_handler.AnthropicHandlerMixin.handle_anthropic_messages
+    )
+    idx = src.index("compact_thinking_to_text(")  # the call, not the import
+    before = src[max(0, idx - 400) : idx]
+    after = src[idx : idx + 600]
+    assert "_run_compression_in_executor(" in before, "compaction runs inline on the event loop"
+    assert "await" in before, "compaction is not awaited off-loop"
+    assert "COMPRESSION_TIMEOUT_SECONDS" in after, "compaction offload has no timeout"
+
+
 # --------------------------------------------------------------------------
 # Gate semantics
 # --------------------------------------------------------------------------
@@ -92,6 +114,13 @@ def test_billing_gate_open_at_or_above_the_feature_cutoff(model: str) -> None:
         "claude-sonnet-4-5-20250929",
         "claude-haiku-4-5-20251001",
         "claude-3-5-sonnet-20241022",
+        # Canonical dated Claude 4 ids: the YYYYMMDD stamp is a release date, not
+        # a minor version. Reading it as one scored `(4, 20250514)`, opened the
+        # gate on a model that strips thinking server-side, and converted free
+        # input into billed, lossy text.
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-haiku-20240307",
         "",
         "not-a-model",
     ],

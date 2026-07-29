@@ -2432,6 +2432,7 @@ class AnthropicHandlerMixin:
                 "on",
             ):
                 try:
+                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
                     from headroom.transforms.compression_units import find_content_router
                     from headroom.transforms.thinking_compactor import (
                         bills_prior_thinking,
@@ -2449,10 +2450,26 @@ class AnthropicHandlerMixin:
                             _tc_keep = int(
                                 os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1")
                             )
-                            optimized_messages, _tc_stats = compact_thinking_to_text(
-                                optimized_messages,
-                                kompress=_tc_kompress,
-                                keep_last_turns=_tc_keep,
+                            # OFF the event loop. compact_thinking_to_text calls
+                            # kompress.compress() once per thinking block, and that
+                            # is either local ONNX inference or a blocking
+                            # httpx.Client.post() to the remote compressor — hundreds
+                            # of ms to seconds, during which an inline call would
+                            # stall every other request this worker is serving. Use
+                            # the same bounded compression executor (and the same
+                            # COMPRESSION_TIMEOUT_SECONDS) as the main pipeline so
+                            # the work is pool-capped, timeout-bounded and counted by
+                            # the leaked-thread/quarantine metrics. A timeout or a
+                            # quarantine raises here and is caught below -> the
+                            # request forwards with thinking untouched (fail-open).
+                            _tc_msgs_in = optimized_messages
+                            optimized_messages, _tc_stats = await self._run_compression_in_executor(
+                                lambda: compact_thinking_to_text(
+                                    _tc_msgs_in,
+                                    kompress=_tc_kompress,
+                                    keep_last_turns=_tc_keep,
+                                ),
+                                timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
                             body["messages"] = optimized_messages
                             if _tc_stats["turns_compacted"]:
@@ -2519,18 +2536,36 @@ class AnthropicHandlerMixin:
             # differently, so scope the injection to provider "anthropic" over the
             # direct API and leave those paths untouched.
             #
+            # `provider_name` is NOT sufficient on its own: a request routed through
+            # `x-headroom-base-url` (proxy_routes.anthropic_messages) keeps
+            # provider_name == "anthropic" because the CLIENT speaks the Anthropic
+            # wire format, while the UPSTREAM is an arbitrary compatible gateway.
+            # Injecting Anthropic-only fields there breaks requests that previously
+            # passed through. So the automatic path additionally requires the
+            # effective upstream to be a verified first-party Anthropic host
+            # (per-request override first, else the configured target).
+            #
             # F1: this is now default-on. `anthropic_tool_search_enabled` resolves
             # HEADROOM_TOOL_SEARCH (unset/`auto` = on for models at/above the
-            # shared MIN_CLAUDE_FEATURE_VERSION cutoff,
+            # shared MIN_CLAUDE_FEATURE_VERSION cutoff AND a first-party upstream,
             # `0`/`off` = explicit opt-out, `1`/`on` = force on regardless of the
-            # version gate) and `inject_tool_search_deferral` still no-ops for
-            # <12 tools and for clients that already ship a tool_search tool.
-            from headroom.proxy.helpers import anthropic_tool_search_enabled
+            # version gate or upstream identity) and `inject_tool_search_deferral`
+            # still no-ops for <12 tools and for clients that already ship a
+            # tool_search tool.
+            from headroom.proxy.helpers import (
+                anthropic_tool_search_enabled,
+                is_first_party_anthropic_target,
+            )
 
             if (
                 provider_name == "anthropic"
                 and getattr(self, "anthropic_backend", None) is None
-                and anthropic_tool_search_enabled(model)
+                and anthropic_tool_search_enabled(
+                    model,
+                    first_party_target=is_first_party_anthropic_target(
+                        upstream_base_url or self.ANTHROPIC_API_URL
+                    ),
+                )
             ):
                 from headroom.proxy.helpers import inject_tool_search_deferral
 
