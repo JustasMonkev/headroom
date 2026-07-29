@@ -1469,12 +1469,17 @@ fn omission_summary(selected: &[LogLine], all_lines: &[LogLine]) -> Option<Strin
         ("FAIL", LogLevel::Fail),
         ("WARN", LogLevel::Warn),
     ] {
+<<<<<<< HEAD
         let dropped = count_level(all_lines, level).saturating_sub(represented_level_count(
             selected,
             level,
             &identical_counts,
             &original_by_line,
         ));
+=======
+        let dropped =
+            count_level(all_lines, level).saturating_sub(count_level_represented(selected, level));
+>>>>>>> d63b5f6 (fix: Anthropic system injection, relationship schema, folded-duplicate counts)
         if dropped > 0 {
             parts.push(format!("{} {}", dropped, label));
         }
@@ -1499,6 +1504,7 @@ fn count_level(lines: &[LogLine], level: LogLevel) -> u64 {
     lines.iter().filter(|l| l.level == level).count() as u64
 }
 
+<<<<<<< HEAD
 fn represented_level_count(
     selected: &[LogLine],
     level: LogLevel,
@@ -1531,6 +1537,35 @@ fn represented_level_count(
                 1
             }
         })
+=======
+/// How many original lines a SELECTED line stands for.
+///
+/// `dedupe_identical` collapses N byte-identical lines into one survivor and
+/// appends ` ×N`. That survivor is one entry in `selected` but represents N
+/// entries in `all_lines`, so a plain `all − selected` subtraction counts the
+/// other N−1 as omitted — producing a footer that says `ERROR request failed
+/// ×5` in the body and `4 ERROR` compressed away underneath. The two
+/// contradict each other, and the phantom count can prompt a retrieval for
+/// errors that are already on screen.
+///
+/// Parsing the suffix back is exact because `dedupe_identical` is the only
+/// writer of this shape (`format!("{} ×{}", content, count)`). A source line
+/// that genuinely ends in ` ×N` would be read as a fold; that costs at most a
+/// slightly low omitted count, never a wrong survivor.
+fn represented_count(line: &LogLine) -> u64 {
+    line.content
+        .rsplit_once(" ×")
+        .and_then(|(_, n)| n.parse::<u64>().ok())
+        .filter(|n| *n > 1)
+        .unwrap_or(1)
+}
+
+fn count_level_represented(lines: &[LogLine], level: LogLevel) -> u64 {
+    lines
+        .iter()
+        .filter(|l| l.level == level)
+        .map(represented_count)
+>>>>>>> d63b5f6 (fix: Anthropic system injection, relationship schema, folded-duplicate counts)
         .sum()
 }
 
@@ -2279,6 +2314,40 @@ mod tests {
             result.compression_ratio < 0.5,
             "{}",
             result.compression_ratio
+        );
+    }
+
+    #[test]
+    fn folded_duplicates_are_not_also_counted_as_omitted() {
+        // Regression: `dedupe_identical` collapses N identical ERROR lines into
+        // one `×N` survivor, but the footer subtracted `all - selected` and so
+        // reported the other N-1 as compressed away. The body then said
+        // `ERROR boom ×5` while the footer claimed 4 ERROR were dropped —
+        // contradicting each other and inviting a retrieval for errors that are
+        // already on screen.
+        let mut lines: Vec<String> = (0..40).map(|i| format!("INFO step {i} ok")).collect();
+        lines.extend(std::iter::repeat_n("ERROR boom".to_string(), 5));
+        lines.extend((40..80).map(|i| format!("INFO step {i} ok")));
+        let content = lines.join("\n");
+
+        let compressor = LogCompressor::new(LogCompressorConfig::default());
+        let (result, _) = compressor.compress(&content, 1.0);
+
+        assert!(
+            result.compressed.contains("ERROR boom ×5"),
+            "{}",
+            result.compressed
+        );
+        // The survivor represents all five, so the footer must not also claim
+        // any ERROR was compressed away.
+        let footer = result
+            .compressed
+            .lines()
+            .find(|l| l.contains("compressed away"))
+            .unwrap_or("");
+        assert!(
+            !footer.contains("ERROR"),
+            "footer double-counts folded duplicates: {footer:?}"
         );
     }
 

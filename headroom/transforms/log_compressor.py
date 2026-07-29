@@ -144,6 +144,27 @@ class LogCompressionResult:
 # ─── LogCompressor (Rust-backed) ────────────────────────────────────────────
 
 
+def _represented_count(line: LogLine) -> int:
+    """How many original lines a SELECTED line stands for.
+
+    Mirrors Rust `represented_count`. Identical-line folding collapses N
+    byte-identical lines into one survivor suffixed ` ×N`. That survivor is one
+    entry in ``selected`` but represents N in ``all_lines``, so a plain
+    ``all - selected`` subtraction reports the other N-1 as omitted — a footer
+    claiming ``4 ERROR`` compressed away directly under a body line reading
+    ``ERROR request failed ×5``. The two contradict each other and the phantom
+    count can trigger a retrieval for errors already on screen.
+
+    Parsing the suffix back is exact because the fold is its only writer. A
+    source line genuinely ending in ` ×N` reads as a fold, costing at most a
+    slightly low omitted count — never a wrong survivor.
+    """
+    head, sep, tail = line.content.rpartition(" ×")
+    if not sep or not tail.isdigit():
+        return 1
+    return n if (n := int(tail)) > 1 else 1
+
+
 def _is_exception_token(token: str) -> bool:
     """Mirror of Rust `is_exception_token`.
 
@@ -685,7 +706,7 @@ class LogCompressor:
             ("WARN", LogLevel.WARN),
         ):
             dropped = sum(1 for line in all_lines if line.level == level) - sum(
-                1 for line in selected if line.level == level
+                _represented_count(line) for line in selected if line.level == level
             )
             if dropped > 0:
                 parts.append(f"{dropped} {label}")

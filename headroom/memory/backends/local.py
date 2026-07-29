@@ -379,7 +379,13 @@ class LocalBackend:
                 for rel in all_relationships:
                     source_name = rel.get("source", "").lower()
                     target_name = rel.get("target", "").lower()
-                    rel_type = rel.get("type", "related_to")
+                    # `type` is the documented spelling and what the schema now
+                    # advertises. `relation` is accepted as a legacy alias: it
+                    # is what the pre-PR schema required, so transcripts and
+                    # callers written against that contract would otherwise
+                    # have their relationship type silently downgraded to the
+                    # default rather than failing visibly.
+                    rel_type = rel.get("type") or rel.get("relation") or "related_to"
 
                     source_id = entity_id_map.get(source_name)
                     target_id = entity_id_map.get(target_name)

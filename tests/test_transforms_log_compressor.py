@@ -187,3 +187,26 @@ def test_store_in_ccr_and_result_properties(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert result.tokens_saved_estimate > 0
     assert result.lines_omitted == 15
+
+
+def test_folded_duplicates_are_not_also_counted_as_omitted() -> None:
+    """A ``×N`` survivor already represents its duplicates.
+
+    Mirror of Rust ``folded_duplicates_are_not_also_counted_as_omitted``.
+    Identical-line folding keeps one ``ERROR boom ×5`` line; the footer used to
+    subtract ``all - selected`` and so advertise the other four as compressed
+    away, contradicting the body and inviting a retrieval for errors that are
+    already on screen.
+    """
+    from headroom.transforms.log_compressor import LogCompressor, LogCompressorConfig
+
+    lines = [f"INFO step {i} ok" for i in range(40)]
+    lines += ["ERROR boom"] * 5
+    lines += [f"INFO step {i} ok" for i in range(40, 80)]
+
+    compressor = LogCompressor(LogCompressorConfig())
+    result = compressor.compress("\n".join(lines), 1.0)
+
+    assert "ERROR boom ×5" in result.compressed
+    footer = next((ln for ln in result.compressed.splitlines() if "compressed away" in ln), "")
+    assert "ERROR" not in footer, f"footer double-counts folded duplicates: {footer!r}"

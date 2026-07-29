@@ -436,6 +436,45 @@ class CCRToolInjector:
 
         return updated_messages
 
+    def inject_into_system_prompt(self, system: Any) -> Any:
+        """Inject retrieval instructions into a *top-level* system prompt.
+
+        The Anthropic Messages API carries the system prompt in `body["system"]`
+        and accepts only user/assistant roles in `messages`. Routing that path
+        through ``inject_into_system_message`` therefore never finds a system
+        message, falls through to its "prepend one" branch, and produces a
+        `role: "system"` entry that the API rejects outright — turning a valid
+        request into a 400 in order to add guidance.
+
+        Accepts and returns Anthropic's three shapes: absent (``None``), a
+        plain string, or a list of content blocks. Idempotent in each, so a
+        replayed or already-instructed prompt is returned unchanged and the
+        cached prefix keeps its bytes.
+        """
+        if not self.inject_system_instructions or not self.has_compressed_content:
+            return system
+
+        instructions = create_system_instructions(
+            self._detected_hashes,
+            self.retrieval_endpoint,
+        )
+
+        if system is None or (isinstance(system, str) and not system):
+            return instructions
+
+        if isinstance(system, str):
+            if instructions in system:
+                return system
+            return system + "\n\n" + instructions
+
+        if isinstance(system, list):
+            if _structured_content_has_instructions(system, instructions):
+                return system
+            return [*system, {"type": "text", "text": instructions}]
+
+        # Unknown shape — leave untouched rather than risk a malformed body.
+        return system
+
     def process_request(
         self,
         messages: list[dict[str, Any]],
