@@ -2472,12 +2472,22 @@ class AnthropicHandlerMixin:
                             # the leaked-thread/quarantine metrics. A timeout or a
                             # quarantine raises here and is caught below -> the
                             # request forwards with thinking untouched (fail-open).
+                            #
+                            # `count_tokens` hands the compactor THIS request's
+                            # tokenizer so its per-block net-win guard is measured
+                            # in billed tokens over the complete emitted text
+                            # (compaction marker included). Without it a marginal
+                            # summary (40 words -> 39) plus the marker replaced a
+                            # signed reasoning block with a LARGER lossy text
+                            # block: more billed input and less information.
                             _tc_msgs_in = optimized_messages
                             optimized_messages, _tc_stats = await self._run_compression_in_executor(
                                 lambda: compact_thinking_to_text(
                                     _tc_msgs_in,
                                     kompress=_tc_kompress,
                                     keep_last_turns=_tc_keep,
+                                    # Per-block net-win guard, in BILLED TOKENS.
+                                    count_tokens=tokenizer.count_text,
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )

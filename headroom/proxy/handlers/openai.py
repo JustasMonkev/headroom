@@ -2325,6 +2325,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timing: dict[str, float] | None = None,
+        upstream_base_url: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2332,6 +2333,12 @@ class OpenAIHandlerMixin:
         function is envelope-agnostic: it extracts Responses text slots into
         provider-neutral compression units, lets ContentRouter choose the
         compressor, then splices accepted replacements back into the payload.
+
+        ``upstream_base_url`` is the *effective upstream* this payload will be
+        forwarded to (per-request ``x-headroom-base-url`` override, ChatGPT/Codex
+        backend, or passthrough target); it falls back to the configured
+        ``OPENAI_API_URL``. Only OpenAI-shape-specific injection (tool-search
+        deferral) consults it — see ``is_first_party_openai_target``.
         """
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -2476,9 +2483,30 @@ class OpenAIHandlerMixin:
         # deferred defs still ride in the request body (OpenAI needs them to load
         # on demand), so this is a provider-side context saving, not a request-byte
         # one — hence a transform tag but no tokens_saved claim.
-        from headroom.proxy.helpers import inject_tool_search_deferral_openai
+        #
+        # FIRST-PARTY OPENAI ONLY (automatic path): `tool_search` +
+        # `defer_loading` are OpenAI Responses-specific fields. A `/v1/responses`
+        # request routed through `x-headroom-base-url` (or to Copilot) still
+        # looks like an OpenAI request — same wire format, and the shared model
+        # parser now accepts the vendor-prefixed ids gateways use
+        # (`openai/gpt-5.5`) — while the upstream may not implement tool search
+        # at all, and would reject a request that previously passed through.
+        # So scope automatic injection to a verified OpenAI/ChatGPT host; the
+        # explicit HEADROOM_TOOL_SEARCH / HEADROOM_OPENAI_TOOL_SEARCH_MODELS
+        # overrides remain the way to opt a compatible gateway back in. Mirrors
+        # the Anthropic path's is_first_party_anthropic_target gate.
+        from headroom.proxy.helpers import (
+            inject_tool_search_deferral_openai,
+            is_first_party_openai_target,
+        )
 
-        _deferred_tools = inject_tool_search_deferral_openai(working.get("tools"), model)
+        _deferred_tools = inject_tool_search_deferral_openai(
+            working.get("tools"),
+            model,
+            first_party_target=is_first_party_openai_target(
+                upstream_base_url or getattr(self, "OPENAI_API_URL", None)
+            ),
+        )
         if _deferred_tools is not working.get("tools"):
             if working is payload:
                 working = copy.deepcopy(payload)
@@ -2689,6 +2717,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
+        upstream_base_url: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2703,21 +2732,30 @@ class OpenAIHandlerMixin:
             shape_labels, shape_mutated = _shape_openai_responses_payload(
                 payload, model=model, request_id=request_id
             )
-            try:
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                    timing=timing,
-                )
-            except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
-                    raise
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                )
+            # Optional kwargs are peeled off one at a time so a patched/stubbed
+            # `_compress_openai_responses_payload` (tests, provider adapters)
+            # that predates them still works. Only the exact optional kwarg
+            # names are tolerated — any other TypeError propagates.
+            _optional: dict[str, Any] = {"timing": timing}
+            if upstream_base_url is not None:
+                _optional["upstream_base_url"] = upstream_base_url
+            while True:
+                try:
+                    result = self._compress_openai_responses_payload(
+                        payload,
+                        model=model,
+                        request_id=request_id,
+                        **_optional,
+                    )
+                    break
+                except TypeError as exc:
+                    dropped = next(
+                        (k for k in _optional if f"unexpected keyword argument '{k}'" in str(exc)),
+                        None,
+                    )
+                    if dropped is None:
+                        raise
+                    _optional.pop(dropped)
             if shape_labels:
                 # Carry the shaper labels on the transforms channel so the
                 # outcome funnel feeds the output-savings ledger
@@ -5104,6 +5142,11 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    # The already-resolved upstream for THIS request (ChatGPT
+                    # backend, x-headroom-base-url override, Copilot, or the
+                    # configured OpenAI target) — the tool-search deferral gate
+                    # needs the real destination, not the request dialect.
+                    upstream_base_url=url,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -6903,6 +6946,10 @@ class OpenAIHandlerMixin:
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
+                                # Resolved above: wss://chatgpt.com for ChatGPT
+                                # session auth, else the configured OpenAI /
+                                # Copilot target. Gates tool-search deferral.
+                                upstream_base_url=upstream_url,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -7248,6 +7295,8 @@ class OpenAIHandlerMixin:
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
+                                    # Same resolved upstream as the first frame.
+                                    upstream_base_url=upstream_url,
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8885,13 +8934,19 @@ class OpenAIHandlerMixin:
                 },
             )
 
-    async def _maybe_compress_passthrough_responses(self, body: bytes) -> bytes:
+    async def _maybe_compress_passthrough_responses(
+        self, body: bytes, *, upstream_base_url: str | None = None
+    ) -> bytes:
         """Compress an OpenAI Responses-shaped passthrough body, fail-open.
 
         Reuses the native `/v1/responses` compression path so custom
         wrapper-proxy routes get the same ContentRouter/Kompress treatment.
         Any parse/compression failure returns the original body unchanged so a
         catch-all request is never dropped by opting into compression.
+
+        ``upstream_base_url`` is the catch-all route's forwarding target; it
+        gates OpenAI-shape-specific injection (tool-search deferral), which must
+        not fire at an unverified gateway.
         """
         try:
             payload = json.loads(body)
@@ -8912,6 +8967,7 @@ class OpenAIHandlerMixin:
                 payload,
                 model=model,
                 request_id=request_id,
+                upstream_base_url=upstream_base_url,
             )
         except Exception as exc:  # noqa: BLE001 — fail-open on any compressor error
             logger.warning(
@@ -9027,7 +9083,9 @@ class OpenAIHandlerMixin:
             and path.rstrip("/").endswith("/responses")
             and body
         ):
-            compressed = await self._maybe_compress_passthrough_responses(body)
+            compressed = await self._maybe_compress_passthrough_responses(
+                body, upstream_base_url=base_url
+            )
             if compressed != body:
                 body = compressed
                 # Body size changed — let httpx recompute Content-Length.

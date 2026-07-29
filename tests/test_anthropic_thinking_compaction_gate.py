@@ -154,3 +154,147 @@ def test_no_kompress_is_a_noop() -> None:
     out, stats = compact_thinking_to_text(messages, kompress=None, keep_last_turns=1)
     assert out is messages
     assert stats["turns_compacted"] == 0
+
+
+# --------------------------------------------------------------------------
+# Per-block net-win guard (Codex review, handlers/anthropic.py:2481)
+#
+# The transform is LOSSY: a signed, server-replayable reasoning block becomes a
+# generated summary. The old accept test measured only the SUMMARY against the
+# original, so a compressor returning a marginal reduction (40 words -> 39)
+# passed — and then the `[prior reasoning, compressed]` marker was prepended,
+# pushing the emitted block back over the original. Result: MORE billed input
+# tokens AND less information. The accept test must cover the complete emitted
+# text, marker included, measured with the request tokenizer.
+# --------------------------------------------------------------------------
+
+_MARKER = "[prior reasoning, compressed]"
+
+
+class _MarginalKompress:
+    """Returns a summary one word shorter than the input — a marginal 'win'."""
+
+    def compress(self, text: str, allow_download: bool = True) -> Any:  # noqa: ARG002
+        words = text.split()
+        return type("R", (), {"compressed": " ".join(words[:-1])})()
+
+
+def _word_tokenizer(text: str) -> int:
+    """Stand-in for the request tokenizer (`tokenizer.count_text`)."""
+    return len(text.split())
+
+
+def _one_thinking_turn(thinking: str) -> list[dict[str, Any]]:
+    """A single OLD assistant turn (keep_last_turns=0 compacts it)."""
+    return [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": thinking, "signature": "sig-net-win"}],
+        },
+        {"role": "user", "content": "next"},
+    ]
+
+
+def test_marginal_compaction_is_rejected_and_the_signed_block_survives() -> None:
+    """40 words -> 39 words + a 3-word marker is a NET LOSS: keep the original."""
+    thinking = " ".join(f"tok{i}" for i in range(40))  # unique text -> no memo reuse
+    messages = _one_thinking_turn(thinking)
+    original_block = messages[1]["content"][0]
+
+    out, stats = compact_thinking_to_text(
+        messages,
+        kompress=_MarginalKompress(),
+        keep_last_turns=0,
+        count_tokens=_word_tokenizer,
+    )
+
+    block = out[1]["content"][0]
+    assert block["type"] == "thinking", "a lossy replacement that does not shrink was accepted"
+    assert block == original_block, "the signed thinking block must survive byte-identical"
+    assert block["signature"] == "sig-net-win"
+    assert stats["turns_compacted"] == 0 and stats["blocks"] == 0
+    assert out[1] is messages[1], "an untouched turn must not be rebuilt"
+
+
+def test_marker_is_counted_even_without_a_tokenizer() -> None:
+    """No tokenizer -> character fallback, still marker-inclusive."""
+    thinking = " ".join(f"charfallback{i}" for i in range(40))
+    out, stats = compact_thinking_to_text(
+        _one_thinking_turn(thinking), kompress=_MarginalKompress(), keep_last_turns=0
+    )
+    assert out[1]["content"][0]["type"] == "thinking"
+    assert stats["blocks"] == 0
+
+
+def test_a_real_win_is_still_accepted_under_the_tokenizer_guard() -> None:
+    """The guard must not disable the transform — a genuine reduction passes."""
+    thinking = " ".join(f"realwin{i}" for i in range(80))
+    out, stats = compact_thinking_to_text(
+        _one_thinking_turn(thinking),
+        kompress=_FakeKompress(),  # -> "short summary"
+        keep_last_turns=0,
+        count_tokens=_word_tokenizer,
+    )
+    block = out[1]["content"][0]
+    assert block == {"type": "text", "text": f"{_MARKER} short summary"}
+    assert stats["blocks"] == 1
+    assert _word_tokenizer(block["text"]) < _word_tokenizer(thinking)
+
+
+def test_guard_is_evaluated_per_block_not_per_request() -> None:
+    """One winning block must not carry a losing block along with it."""
+    win = " ".join(f"perblockwin{i}" for i in range(80))
+    lose = " ".join(f"perblocklose{i}" for i in range(40))
+
+    class _Mixed:
+        def compress(self, text: str, allow_download: bool = True) -> Any:  # noqa: ARG002
+            if text == win:
+                return type("R", (), {"compressed": "tiny"})()
+            return type("R", (), {"compressed": " ".join(text.split()[:-1])})()
+
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": win, "signature": "w"},
+                {"type": "thinking", "thinking": lose, "signature": "l"},
+            ],
+        },
+        {"role": "user", "content": "next"},
+    ]
+    losing_block = messages[1]["content"][1]
+
+    out, stats = compact_thinking_to_text(
+        messages, kompress=_Mixed(), keep_last_turns=0, count_tokens=_word_tokenizer
+    )
+
+    assert out[1]["content"][0]["type"] == "text"
+    assert out[1]["content"][1] == losing_block
+    assert stats["blocks"] == 1
+
+
+def test_a_broken_tokenizer_falls_back_instead_of_breaking_the_request() -> None:
+    def _boom(text: str) -> int:
+        raise RuntimeError("tokenizer exploded")
+
+    thinking = " ".join(f"boom{i}" for i in range(80))
+    out, stats = compact_thinking_to_text(
+        _one_thinking_turn(thinking),
+        kompress=_FakeKompress(),
+        keep_last_turns=0,
+        count_tokens=_boom,
+    )
+    assert out[1]["content"][0]["type"] == "text"  # char fallback: a real win still wins
+    assert stats["blocks"] == 1
+
+
+def test_handler_passes_the_request_tokenizer_to_the_compactor() -> None:
+    """The guard is only as good as its measure — a word/char proxy is not it."""
+    src = inspect.getsource(anthropic_handler.AnthropicHandlerMixin.handle_anthropic_messages)
+    idx = src.index("compact_thinking_to_text(")
+    call = src[idx : idx + 900]
+    assert "count_tokens=tokenizer.count_text" in call, (
+        "handler does not hand the request tokenizer to the net-win guard"
+    )

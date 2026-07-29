@@ -349,7 +349,10 @@ def test_tool_argument_scan_reads_both_marker_spellings() -> None:
                 {
                     "id": "call_2",
                     "type": "function",
-                    "function": {"name": "Grep", "arguments": f'{{"blob":"<<ccr:{other},x,1>>"}}'},
+                    "function": {
+                        "name": "Grep",
+                        "arguments": f'{{"{CCR_INPUT_KEY}":"<<ccr:{other},x,1>>"}}',
+                    },
                 },
             ],
         },
@@ -362,6 +365,177 @@ def test_tool_argument_scan_reads_both_marker_spellings() -> None:
         },
     ]
     assert ccr_hashes_in_tool_arguments(messages) == [HASH, other]
+
+
+# ---------------------------------------------------------------------------
+# Codex P2: only the `_ccr` PROPERTY counts, not the whole arguments blob.
+#
+# Marker text is ordinary data for an ordinary tool call. This repo's own
+# agents grep for `<<ccr:` and `Retrieve original: hash=` while auditing the
+# markers, so `Grep(pattern="<<ccr:0123456789ab>>")` used to hand back a hash
+# lifted straight out of its own search pattern. Nothing was ever stored under
+# it, but `apply_session_sticky_ccr_tool` registers it, so the useless
+# `headroom_retrieve` tool then rides along for the rest of the session and
+# counts toward the Anthropic tool-search threshold.
+# ---------------------------------------------------------------------------
+
+PHANTOM = "0123456789ab"
+
+
+def _marker_hunting_arguments() -> dict[str, Any]:
+    """A completed, uncompacted tool call that merely TALKS about markers."""
+    return {
+        "pattern": f"<<ccr:{PHANTOM}>>",
+        "path": "headroom/transforms/tool_input_compactor.py",
+        "note": f"Retrieve original: hash={HASH} is the other spelling",
+    }
+
+
+def test_marker_text_outside_the_ccr_property_yields_no_hashes_openai() -> None:
+    import json
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_grep",
+                    "type": "function",
+                    "function": {
+                        "name": "Grep",
+                        "arguments": json.dumps(_marker_hunting_arguments()),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_grep", "content": "3 matches"},
+    ]
+    assert ccr_hashes_in_tool_arguments(messages) == []
+
+
+def test_marker_text_outside_the_ccr_property_yields_no_hashes_anthropic() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_grep",
+                    "name": "Grep",
+                    "input": _marker_hunting_arguments(),
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_grep", "content": "ok"}],
+        },
+    ]
+    assert ccr_hashes_in_tool_arguments(messages) == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "messages"),
+    [("anthropic", _anthropic_messages()), ("openai", _openai_messages())],
+)
+def test_a_real_ccr_property_still_yields_its_hash(provider: str, messages: Any) -> None:
+    """The behaviour the function exists for, kept while the blob scan goes.
+
+    A genuinely compacted argument reaching a fresh worker must still surface
+    its hash so `headroom_retrieve` is injected and the marker stays redeemable.
+    """
+    assert ccr_hashes_in_tool_arguments(messages) == [HASH]
+
+
+def test_a_real_marker_survives_alongside_a_marker_hunting_call() -> None:
+    """Both directions in one transcript: the phantom drops, the real one stays."""
+    import json
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_grep",
+                    "type": "function",
+                    "function": {
+                        "name": "Grep",
+                        "arguments": json.dumps(_marker_hunting_arguments()),
+                    },
+                },
+                {
+                    "id": "call_compacted",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": json.dumps({CCR_INPUT_KEY: MARKER})},
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_grep",
+                    "name": "Grep",
+                    "input": _marker_hunting_arguments(),
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_compacted",
+                    "name": "Read",
+                    "input": {CCR_INPUT_KEY: MARKER},
+                },
+            ],
+        },
+    ]
+    assert ccr_hashes_in_tool_arguments(messages) == [HASH]
+
+
+def test_malformed_arguments_do_not_raise() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                # `_ccr` present so the parse gate opens, but the blob is junk.
+                {"function": {"name": "x", "arguments": '{"_ccr": '}},
+                {"function": {"name": "x", "arguments": f"not json at all _ccr {MARKER}"}},
+                {"function": {"name": "x", "arguments": '["_ccr", "' + MARKER + '"]'}},
+                {"function": {"name": "x", "arguments": '{"_ccr": {"nested": "' + MARKER + '"}}'}},
+                {"function": {"name": "x", "arguments": None}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t", "name": "x", "input": None},
+                {"type": "tool_use", "id": "t", "name": "x", "input": f"raw {MARKER}"},
+                {"type": "tool_use", "id": "t", "name": "x", "input": {CCR_INPUT_KEY: 7}},
+            ],
+        },
+    ]
+    assert ccr_hashes_in_tool_arguments(messages) == []
+
+
+def test_anthropic_input_as_a_json_string_still_reads_the_ccr_property() -> None:
+    """Streaming accumulators can hand `input` back as raw partial JSON."""
+    import json
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "Read",
+                    "input": json.dumps({CCR_INPUT_KEY: MARKER}),
+                }
+            ],
+        }
+    ]
+    assert ccr_hashes_in_tool_arguments(messages) == [HASH]
 
 
 @pytest.mark.parametrize(

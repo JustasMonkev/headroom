@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
 from headroom.config import model_supports_gated_features
@@ -98,6 +99,7 @@ def compact_thinking_to_text(
     kompress: Any,
     keep_last_turns: int = 1,
     min_words: int = 40,
+    count_tokens: Callable[[str], int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Replace ``thinking`` blocks with Kompressed ``text`` blocks.
 
@@ -106,6 +108,18 @@ def compact_thinking_to_text(
     ``text`` block holding the Kompressed summary. Deterministic per content, so
     the forwarded prefix stays cache-stable across turns. Never mutates the input
     list or its message dicts in place. Never raises.
+
+    **Per-block net-win guard.** This transform is LOSSY — a signed, replayable
+    reasoning block becomes a generated summary — so it must never also cost
+    tokens. The accept test therefore measures the COMPLETE emitted text,
+    ``f"{_MARKER} {compacted}"``, marker included, against the original
+    ``thinking`` text, and keeps the original block byte-identical unless the
+    replacement is *strictly* smaller. Without the marker in the measurement a
+    compressor returning a marginal reduction (40 words -> 39) passed the check
+    and the ~5-token marker pushed the emitted block back over the original:
+    more billed input AND less information, the worst possible outcome for a
+    lossy transform. Same shape as the per-fold net-win guards in
+    :func:`headroom.transforms.lossless_compaction.collapse_runs`.
 
     Args:
         messages: provider-native Anthropic messages.
@@ -116,6 +130,12 @@ def compact_thinking_to_text(
             left intact (the active reasoning). 0 compacts everything.
         min_words: thinking blocks below this word count are left as-is (not worth
             a Kompress call).
+        count_tokens: the REQUEST tokenizer's ``count_text``. The size that
+            matters is billed tokens, and a word/char proxy can disagree with the
+            tokenizer at the margin — which is exactly where this guard fires.
+            Callers that have a tokenizer (the proxy handlers do) should pass it;
+            when it is absent or raises, the guard falls back to a character
+            comparison, which is conservative in the same direction.
 
     Returns:
         (new_messages, stats) where stats has ``turns_compacted``, ``blocks``,
@@ -124,6 +144,15 @@ def compact_thinking_to_text(
     stats = {"turns_compacted": 0, "blocks": 0, "words_before": 0, "words_after": 0}
     if kompress is None:
         return messages, stats
+
+    def _size(text: str) -> int:
+        """Billed size of ``text``: request tokenizer when available, else chars."""
+        if count_tokens is None:
+            return len(text)
+        try:
+            return int(count_tokens(text))
+        except Exception:  # a broken tokenizer must not break the request
+            return len(text)
 
     asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
     keep = set(asst_indices[-keep_last_turns:]) if keep_last_turns > 0 else set()
@@ -152,11 +181,21 @@ def compact_thinking_to_text(
                 new_content.append(block)
                 continue
             compacted = _memo_compact(text, kompress)
-            # Skip if compaction failed or didn't actually shrink the block.
+            # Cheap pre-filter: compaction failed, or the summary is not even
+            # word-wise smaller (avoids a tokenizer call on the obvious losers).
             if compacted is None or len(compacted.split()) >= words:
                 new_content.append(block)
                 continue
-            text_block: dict[str, Any] = {"type": "text", "text": f"{_MARKER} {compacted}"}
+            emitted = f"{_MARKER} {compacted}"
+            # Authoritative net-win guard: the COMPLETE emitted text (marker
+            # included) must be strictly smaller than the original thinking, as
+            # measured by the request tokenizer. Otherwise keep the original
+            # signed block untouched — a lossy replacement that does not shrink
+            # the request is pure loss.
+            if _size(emitted) >= _size(text):
+                new_content.append(block)
+                continue
+            text_block: dict[str, Any] = {"type": "text", "text": emitted}
             # Preserve a cache breakpoint if one happened to sit on the thinking
             # block (rare — breakpoints usually sit on the last block of a message),
             # so we never silently drop a cache_control marker.

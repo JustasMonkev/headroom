@@ -10,6 +10,12 @@ compressors, a different and much riskier bet.
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
+from headroom.providers import OpenAIProvider
+from headroom.tokenizer import Tokenizer
 from headroom.transforms.content_router import (
     LOSSLESS_FOLD_MIN_CHARS,
     ContentRouter,
@@ -170,3 +176,156 @@ def test_bash_search_preempt_never_emits_the_subtractive_diff_fold() -> None:
     folded = router._bash_search_fold("bash", "call_1", diffish)
     if folded is not None:
         assert folded[1] != "lossless_diff"
+
+
+# ---------------------------------------------------------------------------
+# Byte fidelity: a protected `Read` result is never rewritten.
+#
+# The excluded-tool folds are INFORMATION-preserving, not BYTE-preserving:
+# `_minify_json_data_lossless` returns the same parsed object with different
+# bytes, and the `log` fold drops ANSI / collapses repeated lines. `Read` is
+# excluded from compression precisely because a later `Edit(old_string=...)`
+# matches LITERAL FILE BYTES — an `old_string` copied out of a minified Read
+# result silently fails to match the file. The C11 floor made that reachable for
+# 80-199-char payloads (it was already reachable at >=200); byte-sensitive tools
+# are now held out of every fold at every size.
+# ---------------------------------------------------------------------------
+
+#: Pretty-printed JSON in the band the C11 floor newly admitted.
+_READ_JSON_SMALL = json.dumps(
+    {"name": "headroom", "version": "0.9.1", "main": "index.js", "license": "MIT"}, indent=2
+)
+#: The same shape above the ORIGINAL 200-char floor (the pre-existing hole).
+_READ_JSON_BIG = json.dumps(
+    {"name": "headroom", "version": "0.9.1", "deps": {f"pkg{i}": "^1.0.0" for i in range(12)}},
+    indent=2,
+)
+
+
+@pytest.fixture
+def tokenizer():
+    provider = OpenAIProvider()
+    return Tokenizer(provider.get_token_counter("gpt-4o"), "gpt-4o")
+
+
+def _run_openai(content: str, tool: str, tokenizer) -> tuple[str, list[str]]:
+    router = ContentRouter(ContentRouterConfig())
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "function": {"name": tool, "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": content},
+    ]
+    result = router.apply(messages, tokenizer, compress_user_messages=True)
+    return result.messages[1]["content"], result.transforms_applied
+
+
+def _run_anthropic(content: str, tool: str, tokenizer) -> tuple[str, list[str]]:
+    router = ContentRouter(ContentRouterConfig())
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": tool, "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": content}],
+        },
+    ]
+    result = router.apply(messages, tokenizer, compress_user_messages=True)
+    return result.messages[1]["content"][0]["content"], result.transforms_applied
+
+
+def test_the_regression_fixture_is_in_the_band_c11_opened() -> None:
+    assert LOSSLESS_FOLD_MIN_CHARS <= len(_READ_JSON_SMALL) < 200, len(_READ_JSON_SMALL)
+    # And it really is foldable — otherwise the test below proves nothing.
+    router = ContentRouter(ContentRouterConfig())
+    assert router._lossless_compact_excluded(_READ_JSON_SMALL) is not None
+
+
+@pytest.mark.parametrize("run", [_run_openai, _run_anthropic])
+@pytest.mark.parametrize("payload", [_READ_JSON_SMALL, _READ_JSON_BIG])
+def test_recent_read_json_is_byte_identical(run, payload, tokenizer) -> None:
+    """`Edit(old_string=...)` matches file bytes, so a recent Read must not be rewritten."""
+    out, transforms = run(payload, "Read", tokenizer)
+    assert out == payload, "a protected Read result was rewritten (bytes changed)"
+    assert not any(t.startswith("router:excluded:lossless") for t in transforms), transforms
+
+
+def test_read_holdout_is_by_tool_not_by_size() -> None:
+    router = ContentRouter(ContentRouterConfig())
+    for payload in (_READ_JSON_SMALL, _READ_JSON_BIG, _grep_output(7)):
+        assert router._lossless_compact_excluded(payload, "Read") is None
+        assert router._lossless_compact_excluded(payload, "read") is None
+        # MCP wrappers resolve through their bare-name alias.
+        assert router._lossless_compact_excluded(payload, "mcp__fs__read_file") is None
+
+
+def test_read_holdout_beats_a_registered_lossless_provider() -> None:
+    """The provider contract only promises data-losslessness — too weak for a read."""
+    from headroom.transforms.lossless_provider import set_lossless_provider
+
+    router = ContentRouter(ContentRouterConfig())
+    set_lossless_provider(lambda content: ("<<rewritten>>", "custom"))
+    try:
+        assert router._lossless_compact_excluded(_READ_JSON_BIG, "Read") is None
+        # Non-byte-sensitive excluded tools are unaffected.
+        assert router._lossless_compact_excluded(_READ_JSON_BIG, "Grep") == (
+            "<<rewritten>>",
+            "custom",
+        )
+    finally:
+        set_lossless_provider(None)
+
+
+def test_other_excluded_tools_still_fold_at_the_lowered_floor(tokenizer) -> None:
+    """The holdout is surgical: C11's actual payoff (grep/log folds) is untouched."""
+    grep = _grep_output(7)
+    assert LOSSLESS_FOLD_MIN_CHARS <= len(grep) < 200
+    out, transforms = _run_openai(grep, "Grep", tokenizer)
+    assert "router:excluded:lossless_search" in transforms
+    assert search_fold_recovers(out, grep)
+
+
+def test_aged_out_read_is_still_compressible(tokenizer) -> None:
+    """The holdout covers the PROTECTED window only — age-based decay is unchanged.
+
+    Unlike `DEFAULT_VERBATIM_EXCLUDE_TOOLS`, byte sensitivity must not turn Read
+    into a permanent no-compress hold: an old Read still falls out of protection
+    with age and takes the normal path (CCR retrieval covers a miss).
+    """
+    from headroom.config import DEFAULT_VERBATIM_EXCLUDE_TOOLS, is_tool_excluded
+
+    assert not is_tool_excluded("Read", DEFAULT_VERBATIM_EXCLUDE_TOOLS)
+
+    router = ContentRouter(
+        ContentRouterConfig(
+            min_section_tokens=10,
+            min_chars_for_block_compression=10,
+            exclude_tools={"Read"},
+            # >0 is what enables age-based decay at all (0.0, the default, means
+            # "protect every excluded output regardless of depth").
+            protect_recent_reads_fraction=0.5,
+        )
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t_old", "name": "Read", "input": {"file_path": "a"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t_old", "content": _READ_JSON_BIG * 6}
+            ],
+        },
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "ack"},
+    ]
+
+    result = router.apply(messages, tokenizer, read_protection_window=2)
+    assert "router:excluded:tool" not in result.transforms_applied

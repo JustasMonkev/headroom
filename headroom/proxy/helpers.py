@@ -3185,25 +3185,107 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     return model_supports_gated_features(model, family="gpt")
 
 
+# Hosts that serve the first-party OpenAI Responses API shape, i.e. the only
+# upstreams known to implement `{"type": "tool_search"}` + `defer_loading`.
+# Anything else — an OpenAI-compatible gateway, GitHub Copilot, an enterprise
+# relay, a per-request `x-headroom-base-url` target — may speak the Responses
+# wire format without implementing tool search, and would reject the injected
+# fields. ``chatgpt.com`` is included because ChatGPT-session (codex login)
+# Responses traffic is OpenAI's own Codex backend, not a third-party gateway.
+_FIRST_PARTY_OPENAI_HOST_SUFFIXES = (".openai.com", ".chatgpt.com")
+_FIRST_PARTY_OPENAI_HOSTS = frozenset({"openai.com", "chatgpt.com"})
+
+
+def is_first_party_openai_target(base_url: str | None) -> bool:
+    """True when ``base_url`` is a first-party OpenAI (or ChatGPT/Codex) host.
+
+    The OpenAI analogue of :func:`is_first_party_anthropic_target`, and it exists
+    for the same reason: ``/v1/responses`` routed through ``x-headroom-base-url``
+    still looks like an OpenAI request (the CLIENT speaks the Responses wire
+    format) while the UPSTREAM is an arbitrary compatible gateway. That matters
+    more now than it used to, because the shared model parser accepts
+    vendor-prefixed ids such as ``openai/gpt-5.5`` — exactly the ids gateways
+    use — where the old anchored ``gpt-…`` regex rejected them. Automatic,
+    OpenAI-shape-specific injection must be scoped to a *verified* OpenAI
+    target, not merely to the request dialect.
+
+    Accepts ``http``/``https``/``ws``/``wss`` URLs and bare hosts alike (the WS
+    Responses path resolves a ``wss://`` upstream).
+
+    **Fails closed**: an empty, malformed or hostless URL returns False.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    candidate = base_url.strip()
+    if "//" not in candidate:  # bare "api.openai.com[/path]" — give urlsplit a netloc
+        candidate = "//" + candidate
+    try:
+        host = urlsplit(candidate).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    return host in _FIRST_PARTY_OPENAI_HOSTS or host.endswith(_FIRST_PARTY_OPENAI_HOST_SUFFIXES)
+
+
+def openai_tool_search_enabled(model: str | None, *, first_party_target: bool = True) -> bool:
+    """Whether to inject OpenAI's Responses tool-search deferral for ``model``.
+
+    The OpenAI analogue of :func:`anthropic_tool_search_enabled`, with one
+    deliberate difference: the MODEL gate is never bypassed. ``tool_search`` /
+    ``defer_loading`` are hard 400s on pre-5.5 Responses models, and unlike the
+    Anthropic path this one already ships a dedicated model escape hatch
+    (``HEADROOM_OPENAI_TOOL_SEARCH_MODELS``) for ids newer than this code — so
+    ``HEADROOM_TOOL_SEARCH=1`` overrides the *upstream* gate, not the model one.
+
+    ``first_party_target`` carries the *upstream* identity (see
+    :func:`is_first_party_openai_target`). Automatic injection requires it: a
+    compatible gateway reached via ``x-headroom-base-url`` (or Copilot) may not
+    implement ``tool_search`` / ``defer_loading``, and requests that used to
+    pass through would start failing. Operators running a gateway that DOES
+    implement them keep two explicit opt-ins: ``HEADROOM_TOOL_SEARCH=1`` ("my
+    upstream supports it") and ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (a model-id
+    regex asserting "these models, on my deployment, support tool search").
+    ``HEADROOM_TOOL_SEARCH=0``/``off`` is the kill switch for both paths.
+    """
+    mode = tool_search_mode()
+    if mode == "off":
+        return False
+    if not _model_supports_openai_tool_search(model):
+        return False
+    if first_party_target or mode == "on":
+        return True
+    # Not a verified first-party target: only an explicit per-deployment model
+    # override counts as the operator asserting gateway support.
+    return bool(os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip())
+
+
 def inject_tool_search_deferral_openai(
     tools: Any,
     model: str | None,
     *,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    first_party_target: bool = True,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
-    is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
-    tool_search tool is already present (client already defers), or nothing would
-    be deferred. Core coding tools and hosted/typed tools (web_search,
-    file_search, code_interpreter, computer, …) stay resident and unchanged, so
-    routine edit/read/run loops never pay a search round-trip and the request
-    stays valid; the injected search tool is itself resident.
+    No-op when: tool search is disabled for this model/upstream combination (see
+    :func:`openai_tool_search_enabled`), ``tools`` is not a list, there are fewer
+    than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a tool_search tool is already present
+    (client already defers), or nothing would be deferred. Core coding tools and
+    hosted/typed tools (web_search, file_search, code_interpreter, computer, …)
+    stay resident and unchanged, so routine edit/read/run loops never pay a
+    search round-trip and the request stays valid; the injected search tool is
+    itself resident.
+
+    ``first_party_target`` must be the verified identity of the *effective
+    upstream* for this request (``is_first_party_openai_target(upstream_base_url
+    or self.OPENAI_API_URL)``), not the request dialect.
     """
-    if not _model_supports_openai_tool_search(model):
+    if not openai_tool_search_enabled(model, first_party_target=first_party_target):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
         return tools

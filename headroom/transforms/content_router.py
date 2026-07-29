@@ -1730,6 +1730,9 @@ class ContentRouterConfig:
     # -> ripgrep --heading fold; logs -> ANSI strip + run-collapse; JSON ->
     # whitespace-minify, data-lossless), in every path — see
     # ``_lossless_compact_excluded``. Always recoverable, so no config gate.
+    # EXCEPTION: tools in ``BYTE_SENSITIVE_EXCLUDE_TOOLS`` (file reads) get no
+    # fold at all — information-preservation is too weak a guarantee for content
+    # an ``Edit(old_string=…)`` is copied out of.
 
     # Shell tool names (case-insensitive). Their output is non-excluded/lossy,
     # BUT a read-only *search* run through them (grep/rg/git grep) yields byte-
@@ -1805,12 +1808,68 @@ class ContentRouterConfig:
 # cheapest fold markers (`…x5`) plus a fold's structural overhead need a couple
 # of repeated lines to pay for themselves.
 #
+# Measured payoff is small and should not be overstated: across 18 real
+# transcripts (3,458 tool_result blocks, 1.08M tokens) the 80-199 band folds
+# recover 57 tokens — 0.005% of tool-result tokens, all of it on the bash-search
+# path. It is kept because it is free and self-verifying, not because it is
+# material.
+#
 # NOTE this is the LOSSLESS floor only. The lossy floor
 # (`ContentRouterConfig.min_chars_for_block_compression`, default 500) is
 # unchanged: lowering that would push 200-499-char blocks into the *lossy*
 # compressors, which is a different and much riskier bet. Small blocks already
 # bypass the lossy floor when a lossless fold wins (`_has_lossless_fold`).
+#
+# NOTE also that "lossless" here means INFORMATION-preserving, not BYTE-
+# preserving — see `BYTE_SENSITIVE_EXCLUDE_TOOLS`, whose outputs are held out of
+# the folds entirely at every size.
 LOSSLESS_FOLD_MIN_CHARS = 80
+
+# Excluded tools whose result text must reach the model BYTE-FOR-BYTE.
+#
+# The excluded-tool folds are *information*-preserving, not *byte*-preserving:
+# `_minify_json_data_lossless` returns the same parsed object with different
+# bytes, and the `log` fold drops ANSI and collapses repeated lines (its inverse
+# `expand_runs` recovers the lines, not the original bytes). That is a fine
+# trade for output the model only reads.
+#
+# It is NOT a fine trade for a file READ. `Read` is excluded from compression
+# precisely because `Edit(old_string=...)` matches LITERAL FILE BYTES: if the
+# model copies an `old_string` out of a rewritten Read result — minified JSON,
+# de-duplicated lines, stripped ANSI — the edit silently fails to match the
+# file. So no fold may run on these, at any size. (This is stricter than the
+# LOSSLESS_FOLD_MIN_CHARS floor and independent of it: the C11 floor of 80 only
+# controls WHEN the folds are attempted; this controls WHOSE output they may
+# touch at all.)
+#
+# Distinct from `DEFAULT_VERBATIM_EXCLUDE_TOOLS` (WebSearch/WebFetch), which is
+# a stronger, permanent hold: those results are never compressed even once they
+# age out of the read-protection window. This set does NOT widen protection —
+# it only removes the folds from the window an `Edit` can actually be built
+# from. Where a deployment enables age-based decay
+# (`protect_recent_reads_fraction > 0`), an old Read still falls through to
+# lossy compression exactly as before, with CCR retrieval covering a miss.
+#
+# Matched with `is_tool_excluded`, so entries are case-insensitive and MCP
+# wrappers (`mcp__fs__read_file`) resolve through their bare-name alias.
+BYTE_SENSITIVE_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "Read",
+        "read",
+        "read_file",
+        "ReadFile",
+        "NotebookRead",
+        "notebook_read",
+    }
+)
+
+
+def _tool_output_is_byte_sensitive(tool_name: str) -> bool:
+    """True when this tool's result must stay byte-identical (see the set above)."""
+    if not tool_name:
+        return False
+    return is_tool_excluded(tool_name, BYTE_SENSITIVE_EXCLUDE_TOOLS)
+
 
 # Outer dict is keyed by ``id(router)`` so two routers active on the same
 # context (a pipeline holding more than one, a nested standalone router) keep
@@ -5032,8 +5091,9 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(content)
+                        # output can still be losslessly compacted. Byte-
+                        # sensitive tools (Read) are held out by tool_name.
+                        compacted = self._lossless_compact_excluded(content, tool_name)
                         if compacted is not None:
                             folded, kind = compacted
                             result_slots[i] = {**message, "content": folded}
@@ -5678,7 +5738,9 @@ class ContentRouter(Transform):
             timing=compressor_timing,
         )
 
-    def _lossless_compact_excluded(self, content: Any) -> tuple[str, str] | None:
+    def _lossless_compact_excluded(
+        self, content: Any, tool_name: str = ""
+    ) -> tuple[str, str] | None:
         """Information-preserving compaction for a protected (excluded) tool output.
 
         Excluded tools are kept out of *lossy* compression for accuracy. This
@@ -5691,16 +5753,29 @@ class ContentRouter(Transform):
         * LOG (build/test/app logs) -> ANSI strip + run-collapse. Recoverable
           modulo non-semantic ANSI color (``expand_runs`` restores the lines).
         * JSON -> whitespace-minify. **Data-lossless** (``json.loads`` equals the
-          original object) — same information, fewer tokens. NOT byte-exact, so a
-          read-then-``Edit(old_string=…)`` on the *same* JSON file could miss; the
-          data is fully preserved.
+          original object) — same information, fewer tokens. NOT byte-exact.
+
+        None of these is byte-exact, so a *file read* is held out entirely:
+        ``tool_name`` in :data:`BYTE_SENSITIVE_EXCLUDE_TOOLS` (``Read`` and
+        friends) returns ``None`` before any fold runs, at any size. ``Read`` is
+        excluded from compression exactly because a later ``Edit(old_string=…)``
+        matches literal file bytes, and an ``old_string`` copied out of a
+        rewritten result silently fails to match the file. Callers that cannot
+        name the tool get the folds (the pre-existing behaviour).
 
         Returns ``(compacted, kind)`` when a recognized shape actually shrinks,
         else ``None``. Source code and glob path-lists match nothing -> verbatim.
-        Always safe to run (information-preserving) so there is no feature gate.
         Never raises.
         """
         if not isinstance(content, str):
+            return None
+        if _tool_output_is_byte_sensitive(tool_name):
+            # Byte-exactness beats every token saving available here. This runs
+            # BEFORE the provider seam too: the provider contract only promises
+            # information-preservation ("byte-recoverable, or data-lossless for
+            # structured data"), which is exactly the guarantee that is too weak
+            # for a file read, and the router cannot verify a third party's
+            # rewrite.
             return None
         provider = get_lossless_provider()
         if provider is not None:
@@ -6116,8 +6191,9 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(block.get("content"))
+                        # output can still be losslessly compacted. Byte-
+                        # sensitive tools (Read) are held out by tool_name.
+                        compacted = self._lossless_compact_excluded(block.get("content"), tool_name)
                         if compacted is not None:
                             folded, kind = compacted
                             new_blocks.append({**block, "content": folded})
