@@ -1250,14 +1250,14 @@ impl LogCompressor {
             }
         }
 
-        // Add context lines around selected ERROR/FAIL entries only.
+        // Add context lines around selected ERROR/FAIL/WARN entries only.
         //
         // This used to expand around *every* selected line — warnings,
         // summaries and stack-trace frames included. pytest's `====` banners
         // all match the summary patterns, so a single run dragged in up to
         // ~120 neighbours of pure framing against a 100-line budget, evicting
-        // the errors the context was meant to explain. Warnings and summaries
-        // are self-contained; only an error benefits from its surroundings.
+        // the errors the context was meant to explain. Summary banners stay
+        // excluded, while warnings retain source/caret/note continuations.
         //
         // The window is asymmetric: what follows an error explains it (the
         // traceback, the retry, the exit code); the line before it is usually
@@ -1282,14 +1282,22 @@ impl LogCompressor {
         let selected_indices: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
         let mut context_indices: BTreeSet<usize> = BTreeSet::new();
         for line in selected.iter() {
-            if !matches!(line.level, LogLevel::Error | LogLevel::Fail) {
+            if !matches!(
+                line.level,
+                LogLevel::Error | LogLevel::Fail | LogLevel::Warn
+            ) {
                 continue;
             }
+            let (before, after) = if line.level == LogLevel::Warn {
+                (0, self.config.error_context_lines)
+            } else {
+                (ctx_before, ctx_after)
+            };
             let empty: Vec<usize> = Vec::new();
             let dups = dup_occurrences.get(&line.line_number).unwrap_or(&empty);
             for &anchor in std::iter::once(&line.line_number).chain(dups.iter()) {
-                let lo = anchor.saturating_sub(ctx_before);
-                let hi = (anchor + ctx_after + 1).min(log_lines.len());
+                let lo = anchor.saturating_sub(before);
+                let hi = (anchor + after + 1).min(log_lines.len());
                 for i in lo..hi {
                     if i != anchor {
                         context_indices.insert(i);
@@ -2171,6 +2179,37 @@ mod tests {
             result.compression_ratio < 0.5,
             "{}",
             result.compression_ratio
+        );
+    }
+
+    #[test]
+    fn warning_keeps_multiline_diagnostic_context() {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("INFO before {i}")).collect();
+        lines.extend([
+            "warning: unused variable `value`".to_string(),
+            "  --> src/main.rs:12:9".to_string(),
+            "12 |     let value = 1;".to_string(),
+            "   |         ^^^^^ help: prefix it with an underscore".to_string(),
+        ]);
+        lines.extend((0..30).map(|i| format!("INFO after {i}")));
+
+        let compressor = LogCompressor::new(LogCompressorConfig::default());
+        let (result, _) = compressor.compress(&lines.join("\n"), 1.0);
+
+        assert!(
+            result.compressed.contains("src/main.rs:12:9"),
+            "{}",
+            result.compressed
+        );
+        assert!(
+            result.compressed.contains("12 |     let value = 1;"),
+            "{}",
+            result.compressed
+        );
+        assert!(
+            result.compressed.contains("^^^^^ help"),
+            "{}",
+            result.compressed
         );
     }
 

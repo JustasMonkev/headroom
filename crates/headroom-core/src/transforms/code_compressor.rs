@@ -431,97 +431,6 @@ const UBIQUITOUS_CALLEE_RATIO: f64 = 0.5;
 /// Below this many functions, "most of them" does not mean anything.
 const MIN_FUNCS_FOR_UBIQUITY: usize = 4;
 
-/// Callees that are noise in every language we compress: builtins, type
-/// constructors/converters, and logging. They dominated the `calls:` lists
-/// while saying nothing about what a body does. Mirrors Python
-/// `_NOISE_CALLEES`.
-const NOISE_CALLEES: &[&str] = &[
-    // Python builtins
-    "abs",
-    "all",
-    "any",
-    "bool",
-    "bytes",
-    "callable",
-    "dict",
-    "dir",
-    "enumerate",
-    "filter",
-    "float",
-    "format",
-    "frozenset",
-    "getattr",
-    "hasattr",
-    "hash",
-    "id",
-    "int",
-    "isinstance",
-    "issubclass",
-    "iter",
-    "len",
-    "list",
-    "map",
-    "max",
-    "min",
-    "next",
-    "open",
-    "print",
-    "range",
-    "repr",
-    "reversed",
-    "round",
-    "set",
-    "setattr",
-    "sorted",
-    "str",
-    "sum",
-    "super",
-    "tuple",
-    "type",
-    "vars",
-    "zip", // Logging
-    "debug",
-    "info",
-    "warning",
-    "warn",
-    "error",
-    "exception",
-    "critical",
-    "log",
-    "logger.debug",
-    "logger.info",
-    "logger.warning",
-    "logger.warn",
-    "logger.error",
-    "logger.exception",
-    "logger.critical",
-    "console.log",
-    "console.error",
-    "console.warn",
-    "console.debug",
-    // JS/TS ubiquitous
-    "Array",
-    "Boolean",
-    "Number",
-    "Object",
-    "String",
-    "JSON.parse",
-    "JSON.stringify",
-    "parseInt",
-    "parseFloat",
-    "require",
-];
-
-fn is_noise_callee(name: &str) -> bool {
-    if NOISE_CALLEES.contains(&name) {
-        return true;
-    }
-    match name.rsplit_once('.') {
-        Some((_, tail)) => NOISE_CALLEES.contains(&tail),
-        None => false,
-    }
-}
-
 // ─── Module helpers (stateless) ─────────────────────────────────────────
 
 /// `code[node.start_byte:node.end_byte]` — correct UTF-8 byte slice.
@@ -588,8 +497,8 @@ fn leading_ws(line: &str) -> &str {
 /// Build the omitted-body comment with call info. Mirrors `_make_omitted_comment`.
 ///
 /// The `calls:` list is what the reader gets *instead of* the body, so it has
-/// to carry signal: builtins/logging are dropped, callees named by more than
-/// half the file's functions are dropped, the list is capped at
+/// to carry signal: callees named by more than half the file's functions are
+/// dropped, the list is capped at
 /// [`MAX_CALLS_LISTED`], and the `+N more` suffix is gone (~5 tokens to say
 /// the hint was truncated, which a hint implies anyway).
 fn make_omitted_comment(
@@ -616,7 +525,7 @@ fn make_omitted_comment(
                 // BTreeSet iterates sorted == Python sorted(called).
                 let informative: Vec<&str> = called
                     .iter()
-                    .filter(|name| !is_noise_callee(name) && !common.contains(*name))
+                    .filter(|name| !common.contains(*name))
                     .take(MAX_CALLS_LISTED)
                     .map(|s| s.as_str())
                     .collect();
@@ -1991,6 +1900,26 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("abcdefgh"), 2);
         assert_eq!(estimate_tokens("a"), 1); // max(1, 0)
+    }
+
+    #[test]
+    fn omitted_comment_keeps_locally_defined_builtin_named_helpers() {
+        let analysis = SymbolAnalysis {
+            calls: vec![(
+                "f".to_string(),
+                ["open", "format", "error"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )],
+            ..Default::default()
+        };
+
+        let comment = make_omitted_comment(Some("f"), 9, "", "//", &analysis);
+
+        for helper in ["open", "format", "error"] {
+            assert!(comment.contains(helper), "{comment}");
+        }
     }
 
     #[test]

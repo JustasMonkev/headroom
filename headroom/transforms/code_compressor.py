@@ -2432,89 +2432,6 @@ _MAX_CALLS_LISTED = 3
 # information about any one of them.
 _UBIQUITOUS_CALLEE_RATIO = 0.5
 
-# Callees that are noise in every language we compress: builtins, type
-# constructors/converters, and logging. They dominated the `calls:` lists while
-# saying nothing about what a body does.
-_NOISE_CALLEES = frozenset(
-    {
-        # Python builtins
-        "abs",
-        "all",
-        "any",
-        "bool",
-        "bytes",
-        "callable",
-        "dict",
-        "dir",
-        "enumerate",
-        "filter",
-        "float",
-        "format",
-        "frozenset",
-        "getattr",
-        "hasattr",
-        "hash",
-        "id",
-        "int",
-        "isinstance",
-        "issubclass",
-        "iter",
-        "len",
-        "list",
-        "map",
-        "max",
-        "min",
-        "next",
-        "open",
-        "print",
-        "range",
-        "repr",
-        "reversed",
-        "round",
-        "set",
-        "setattr",
-        "sorted",
-        "str",
-        "sum",
-        "super",
-        "tuple",
-        "type",
-        "vars",
-        "zip",
-        # Logging (any level, bare or on the conventional module logger)
-        "debug",
-        "info",
-        "warning",
-        "warn",
-        "error",
-        "exception",
-        "critical",
-        "log",
-        "logger.debug",
-        "logger.info",
-        "logger.warning",
-        "logger.warn",
-        "logger.error",
-        "logger.exception",
-        "logger.critical",
-        "console.log",
-        "console.error",
-        "console.warn",
-        "console.debug",
-        # JS/TS ubiquitous
-        "Array",
-        "Boolean",
-        "Number",
-        "Object",
-        "String",
-        "JSON.parse",
-        "JSON.stringify",
-        "parseInt",
-        "parseFloat",
-        "require",
-    }
-)
-
 
 def _ubiquitous_callees(analysis: _SymbolAnalysis) -> frozenset[str]:
     """Callees named by more than half the file's functions (memoized)."""
@@ -2537,16 +2454,9 @@ def _ubiquitous_callees(analysis: _SymbolAnalysis) -> frozenset[str]:
 
 
 def _informative_callees(analysis: _SymbolAnalysis, called: set[str]) -> list[str]:
-    """Sorted callees worth naming: no builtins, no file-wide ubiquities."""
+    """Sorted locally defined callees worth naming."""
     common = _ubiquitous_callees(analysis)
-    kept = [
-        name
-        for name in sorted(called)
-        if name not in _NOISE_CALLEES
-        and name.rsplit(".", 1)[-1] not in _NOISE_CALLEES
-        and name not in common
-    ]
-    return kept
+    return [name for name in sorted(called) if name not in common]
 
 
 def _make_omitted_comment(
@@ -2559,12 +2469,8 @@ def _make_omitted_comment(
     """Build omitted comment with call information from analysis.
 
     The `calls:` list is what the reader gets *instead of* the body, so it has
-    to carry signal. Three filters keep it that way (each cost ~15-25 tokens
-    per function before):
+    to carry signal. Two filters keep it that way:
 
-    * **Builtins and logging are dropped.** `len`, `isinstance`, `str`,
-      `logger.debug` appear in most bodies and say nothing about what this one
-      does.
     * **Ubiquitous callees are dropped.** Anything called by more than half the
       functions in the file is background noise for this file specifically —
       the module's own helper that everything routes through carries no

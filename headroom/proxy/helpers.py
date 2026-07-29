@@ -3038,11 +3038,8 @@ def inject_tool_search_deferral(
     Invariants enforced (else Anthropic 400s): the search tool is never deferred;
     at least one tool stays non-deferred; a deferred tool never carries
     ``cache_control`` — if the client's tools cache breakpoint sat on a now-deferred
-    tool, it is moved to the last non-deferred real tool so the (smaller) tools
-    prefix still caches. When EVERY real tool would be deferred there is no such
-    tool to move it to, so the breakpoint's own tool is kept resident instead —
-    deferring one fewer schema is strictly cheaper than losing the tools-prefix
-    cache entirely, which is the very thing this transform exists to protect.
+    tool, that tool stays resident. A breakpoint is a client-chosen prefix
+    boundary, so moving or coalescing it can change both cache coverage and TTL.
     """
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
@@ -3055,13 +3052,6 @@ def inject_tool_search_deferral(
     search_tool = {"type": search_type, "name": search_name}
     out: list[Any] = [search_tool]
     deferred = 0
-    dropped_cache_control = False
-    dropped_cache_control_value: Any = None
-    last_resident_real_idx: int | None = None
-    resident_has_cache_control = False
-    # (index in `out`, original dict) of the last deferred tool that carried the
-    # client's cache breakpoint — the fallback holder if nothing stays resident.
-    last_deferred_cache_control: tuple[int, dict[str, Any]] | None = None
     # Match core tools case- and separator-insensitively; see _normalize_tool_name.
     core_normalized = (
         _TOOL_SEARCH_CORE_TOOLS_NORMALIZED
@@ -3078,72 +3068,19 @@ def inject_tool_search_deferral(
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
-            if isinstance(tool, dict) and not tool.get("type"):
-                last_resident_real_idx = len(out) - 1
-                resident_has_cache_control = resident_has_cache_control or bool(
-                    tool.get("cache_control")
-                )
+            continue
+        if "cache_control" in tool:
+            # A breakpoint marks a client-chosen prefix boundary. Keep its tool
+            # resident rather than coalescing multiple boundaries or TTLs.
+            out.append(tool)
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        _dropped = new_tool.pop("cache_control", None)
-        if _dropped is not None:
-            dropped_cache_control = True
-            # Keep the client's own breakpoint object, not just the fact that
-            # one existed: `{"type": "ephemeral", "ttl": "1h"}` degrades to the
-            # default 5-minute TTL if we rebuild it as a bare ephemeral marker,
-            # so the tools prefix would expire and be re-billed long before the
-            # hour the client paid for.
-            dropped_cache_control_value = _dropped
-            last_deferred_cache_control = (len(out), tool)
         out.append(new_tool)
         deferred += 1
 
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the cache prefix
-    # All-custom tool sets (every tool deferrable, e.g. a pure-MCP surface) leave
-    # `last_resident_real_idx is None`, so there is nowhere to move the client's
-    # breakpoint to and the tools prefix would silently stop caching — the
-    # opposite of this transform's purpose. Keep the breakpoint's own tool
-    # resident, exactly as the client sent it: the breakpoint stays byte-stable
-    # in place and one schema stays in context instead of the whole prefix
-    # re-billing every turn.
-    if (
-        dropped_cache_control
-        and not resident_has_cache_control
-        and last_resident_real_idx is None
-        and last_deferred_cache_control is not None
-    ):
-        _cc_idx, _cc_tool = last_deferred_cache_control
-        out[_cc_idx] = _cc_tool
-        deferred -= 1
-        last_resident_real_idx = _cc_idx
-        resident_has_cache_control = True
-        dropped_cache_control = False
-        if deferred == 0:
-            return tools  # nothing left deferred → don't perturb the cache prefix
-    # Preserve a tools cache breakpoint: if we stripped cache_control off a
-    # deferred tool and no resident tool carries one, move it to the last
-    # resident real tool (never the search tool, to keep its shape canonical).
-    if (
-        dropped_cache_control
-        and not resident_has_cache_control
-        and last_resident_real_idx is not None
-    ):
-        # Copy before writing: resident tools are appended by reference, so an
-        # in-place write would mutate the caller's list — and the tools that
-        # reach here can be the process-global schema-compaction cache entry,
-        # which is shared across every session with the same tools digest.
-        patched = dict(out[last_resident_real_idx])
-        # Carry the client's object across verbatim (see the drop site): a
-        # rebuilt `{"type": "ephemeral"}` silently downgrades an explicit
-        # `"ttl": "1h"` to the 5-minute default.
-        patched["cache_control"] = (
-            dropped_cache_control_value
-            if isinstance(dropped_cache_control_value, dict)
-            else {"type": "ephemeral"}
-        )
-        out[last_resident_real_idx] = patched
     return out
 
 

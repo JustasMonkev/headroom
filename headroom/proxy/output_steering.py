@@ -11,11 +11,10 @@ from headroom.proxy.output_verbosity_policy import (
 )
 
 
-def _resteer_content_part(part: dict[str, Any], key: str, text: str) -> bool | None:
-    """Rewrite one structured content part if it already carries a block.
-
-    Returns the "did the body change" answer when this part owned the block,
-    or ``None`` when it did not and the caller should keep looking.
+def _resteer_content_parts(
+    parts: list[Any], key: str, text: str, *, text_parts_only: bool = False
+) -> bool | None:
+    """Collapse structured steering blocks to one current block.
 
     Structured system content used to be matched with
     ``startswith(STEERING_SENTINEL)``, which after D4 shortened the sentinel
@@ -26,12 +25,31 @@ def _resteer_content_part(part: dict[str, Any], key: str, text: str) -> bool | N
     :func:`replace_or_append_steering_block` gives the structured paths the
     same legacy migration the plain-string path already had.
     """
-    value = part.get(key)
-    if not isinstance(value, str) or not contains_steering_block(value):
+    found = False
+    changed = False
+    kept: list[Any] = []
+    for part in parts:
+        value = part.get(key) if isinstance(part, dict) else None
+        if (
+            (text_parts_only and isinstance(part, dict) and part.get("type") != "text")
+            or not isinstance(value, str)
+            or not contains_steering_block(value)
+        ):
+            kept.append(part)
+            continue
+        updated, part_changed = replace_or_append_steering_block(value, text if not found else "")
+        found = True
+        changed = changed or part_changed
+        if updated or len(part) > 2:
+            if part_changed:
+                part[key] = updated
+            kept.append(part)
+        else:
+            changed = True
+    if not found:
         return None
-    updated, changed = replace_or_append_steering_block(value, text)
-    if changed:
-        part[key] = updated
+    if len(kept) != len(parts):
+        parts[:] = kept
     return changed
 
 
@@ -57,15 +75,9 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
         ]
         return True
     if isinstance(system, list):
-        for block in system:
-            # A malformed client block (``{"type": "text", "text": null}``)
-            # must not raise and 500 the request; ``_resteer_content_part``
-            # type-guards the text and returns None for anything unusable.
-            if not isinstance(block, dict):
-                continue
-            changed = _resteer_content_part(block, "text", text)
-            if changed is not None:
-                return changed
+        changed = _resteer_content_parts(system, "text", text)
+        if changed is not None:
+            return changed
         system.append({"type": "text", "text": text})
         return True
     return False
@@ -117,12 +129,9 @@ def apply_openai_chat_verbosity_steering(
         return changed
     if isinstance(content, list):
         # OpenAI also accepts a content-part list ([{"type": "text", ...}]).
-        for part in content:
-            if not isinstance(part, dict) or part.get("type") != "text":
-                continue
-            part_changed = _resteer_content_part(part, "text", text)
-            if part_changed is not None:
-                return part_changed
+        part_changed = _resteer_content_parts(content, "text", text, text_parts_only=True)
+        if part_changed is not None:
+            return part_changed
         content.append({"type": "text", "text": text})
         return True
     return False

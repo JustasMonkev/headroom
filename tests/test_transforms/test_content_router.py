@@ -946,6 +946,7 @@ class TestExcludeTools:
         # MCP wrapper aliases can still be excluded by their bare tool name.
         assert is_tool_excluded("mcp_HeadroomZai_headroom_retrieve", {"headroom_retrieve"})
         assert is_tool_excluded("mcp__Headroom__headroom_retrieve", {"headroom_retrieve"})
+        assert is_tool_excluded("mcp_my_fs_read_file", {"read_file"})
         # Empty set never excludes.
         assert not is_tool_excluded("Read", set())
 

@@ -505,6 +505,10 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
 
+            def adopt_hashes(self, hashes):  # noqa: ANN001
+                self.detected_hashes.extend(h for h in hashes if h not in self.detected_hashes)
+                self.has_compressed_content = bool(self.detected_hashes)
+
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
@@ -571,6 +575,10 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
 
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
+
+            def adopt_hashes(self, hashes):  # noqa: ANN001
+                self.detected_hashes.extend(h for h in hashes if h not in self.detected_hashes)
+                self.has_compressed_content = bool(self.detected_hashes)
 
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 

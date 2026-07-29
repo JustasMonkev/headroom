@@ -435,9 +435,7 @@ class LogCompressor:
         # occurrence map carries the folded duplicates' positions so context is
         # expanded around EACH of them, not just the survivor. Failure detail is
         # never context expanded, so it tracks no occurrences (cap 0).
-        errors, suppressed, dup_occurrences = self._dedupe_identical(
-            errors, self.config.max_errors
-        )
+        errors, suppressed, dup_occurrences = self._dedupe_identical(errors, self.config.max_errors)
         fails, fail_suppressed, fail_occurrences = self._dedupe_identical(
             fails, self.config.max_errors
         )
@@ -453,9 +451,7 @@ class LogCompressor:
             # Own budget, not shared with `max_errors` for ERROR/FAIL: *what*
             # failed and *why* answer different questions, and a run with 10
             # failures would otherwise keep 10 names and no reason.
-            selected.extend(
-                self._select_with_first_last(failure_details, self.config.max_errors)
-            )
+            selected.extend(self._select_with_first_last(failure_details, self.config.max_errors))
         if warnings:
             if self.config.dedupe_warnings:
                 warnings = self._dedupe_similar(warnings)
@@ -608,10 +604,10 @@ class LogCompressor:
         suppressed: set[int] | None = None,
         dup_occurrences: dict[int, list[int]] | None = None,
     ) -> list[LogLine]:
-        """Expand context around selected ERROR/FAIL lines only.
+        """Expand context around selected ERROR/FAIL/WARN lines only.
 
         Mirrors Rust `select_lines`. This used to expand around *every*
-        selected line — warnings, summaries and trace frames included — so
+        selected line — summaries and trace frames included — so
         pytest's ``====`` banners (all of which match the summary patterns)
         dragged in up to ~120 low-value neighbours against a 100-line budget.
         The window is asymmetric because what follows an error explains it
@@ -632,12 +628,14 @@ class LogCompressor:
         selected_indices = {line.line_number for line in selected}
         context_indices: set[int] = set()
         for line in selected:
-            if line.level not in (LogLevel.ERROR, LogLevel.FAIL):
+            if line.level not in (LogLevel.ERROR, LogLevel.FAIL, LogLevel.WARN):
                 continue
+            line_before = 0 if line.level == LogLevel.WARN else before
+            line_after = self.config.error_context_lines if line.level == LogLevel.WARN else after
             for idx in (line.line_number, *dup_occurrences.get(line.line_number, ())):
-                for i in range(max(0, idx - before), idx):
+                for i in range(max(0, idx - line_before), idx):
                     context_indices.add(i)
-                for i in range(idx + 1, min(len(all_lines), idx + after + 1)):
+                for i in range(idx + 1, min(len(all_lines), idx + line_after + 1)):
                     context_indices.add(i)
         for idx in sorted(context_indices):
             if idx not in selected_indices and idx not in suppressed and idx < len(all_lines):

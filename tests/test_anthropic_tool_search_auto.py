@@ -257,8 +257,7 @@ def test_cache_control_survives_when_every_custom_tool_would_be_deferred() -> No
 
 
 def test_cache_control_moves_to_a_resident_tool_when_one_exists() -> None:
-    """With a core tool resident, the breakpoint moves there and all custom
-    tools stay deferred (the pre-existing path, unchanged)."""
+    """A client breakpoint remains on its original tool and is not deferred."""
     tools: list[Any] = [
         {"name": "Bash", "description": "core", "input_schema": {}},
         *_tools(13),
@@ -269,9 +268,30 @@ def test_cache_control_moves_to_a_resident_tool_when_one_exists() -> None:
 
     breakpoints = [t for t in out if isinstance(t, dict) and t.get("cache_control")]
     assert len(breakpoints) == 1
-    assert breakpoints[0]["name"] == "Bash"
+    assert breakpoints[0]["name"] == tools[-1]["name"]
     assert not breakpoints[0].get("defer_loading")
-    assert sum(1 for t in out if isinstance(t, dict) and t.get("defer_loading")) == 13
+    assert sum(1 for t in out if isinstance(t, dict) and t.get("defer_loading")) == 12
+
+
+def test_every_cache_breakpoint_stays_on_its_original_tool() -> None:
+    tools: list[Any] = _tools(14)
+    tools[3] = {
+        **tools[3],
+        "cache_control": {"type": "ephemeral", "ttl": "5m"},
+    }
+    tools[10] = {
+        **tools[10],
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+
+    out = inject_tool_search_deferral(tools)
+
+    breakpoints = [t for t in out if isinstance(t, dict) and t.get("cache_control")]
+    assert [(t["name"], t["cache_control"]) for t in breakpoints] == [
+        (tools[3]["name"], tools[3]["cache_control"]),
+        (tools[10]["name"], tools[10]["cache_control"]),
+    ]
+    assert all(not t.get("defer_loading") for t in breakpoints)
 
 
 def test_no_breakpoint_means_everything_is_still_deferred() -> None:

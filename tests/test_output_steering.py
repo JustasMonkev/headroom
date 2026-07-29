@@ -178,6 +178,54 @@ def test_openai_chat_content_list_migrates_legacy_block_instead_of_duplicating()
     assert serialized.count(STEERING_SENTINEL) == 1
 
 
+def test_structured_prompts_collapse_legacy_and_current_blocks() -> None:
+    body = {
+        "system": [
+            {"type": "text", "text": _LEGACY_BLOCK},
+            {"type": "text", "text": steering_text(1)},
+        ]
+    }
+
+    assert apply_verbosity_steering(body, 4) is True
+    assert body["system"] == [{"type": "text", "text": steering_text(4)}]
+
+
+def test_structured_prompt_collapses_multiple_blocks_in_one_part() -> None:
+    body = {
+        "system": [
+            {
+                "type": "text",
+                "text": f"base\n\n{_LEGACY_BLOCK}\n\n{steering_text(1)}\n\ntail",
+            }
+        ]
+    }
+
+    assert apply_verbosity_steering(body, 4) is True
+    text = body["system"][0]["text"]
+    assert text == f"base\n\n{steering_text(4)}\n\ntail"
+    assert text.count(STEERING_SENTINEL) == 1
+    assert "headroom_output_shaping" not in text
+
+
+def test_openai_content_parts_collapse_legacy_and_current_blocks() -> None:
+    from headroom.proxy.output_steering import apply_openai_chat_verbosity_steering
+
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": _LEGACY_BLOCK},
+                    {"type": "text", "text": steering_text(1)},
+                ],
+            }
+        ]
+    }
+
+    assert apply_openai_chat_verbosity_steering(body, 4) is True
+    assert body["messages"][0]["content"] == [{"type": "text", "text": steering_text(4)}]
+
+
 def test_structured_steering_ignores_unrelated_hr_shape_tag_in_prompt() -> None:
     """A documented `<hr_shape>` element in a system part is not our block."""
     from headroom.proxy.output_steering import apply_openai_chat_verbosity_steering

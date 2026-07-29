@@ -2196,20 +2196,20 @@ class TestOmittedBodyEmission:
             assert "Expires in" not in result.compressed
 
 
+def test_locally_defined_builtin_named_helpers_are_kept():
+    analysis = cc._SymbolAnalysis(calls={"f": {"open", "format", "error", "reconcile_ledger"}})
+    out = cc._make_omitted_comment("f", 9, "    ", "#", analysis)
+
+    for helper in ("open", "format", "error"):
+        assert helper in out
+
+
 @pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter not installed")
 class TestCallsListFiltering:
     """C4: the `calls:` hint replaces the body, so it has to carry signal."""
 
     def _analysis(self, calls):
         return cc._SymbolAnalysis(calls={k: set(v) for k, v in calls.items()})
-
-    def test_builtins_and_logging_are_dropped(self):
-        analysis = self._analysis({"f": ["len", "isinstance", "logger.debug", "reconcile_ledger"]})
-        out = cc._make_omitted_comment("f", 9, "    ", "#", analysis)
-
-        assert "reconcile_ledger" in out
-        for noise in ("len", "isinstance", "logger.debug"):
-            assert noise not in out
 
     def test_ubiquitous_callees_are_dropped(self):
         # `_trace` is called by 5 of 6 functions — background noise for this file.
@@ -2227,12 +2227,6 @@ class TestCallsListFiltering:
 
         assert out.count(",") == 2  # exactly 3 names listed
         assert "more" not in out
-
-    def test_no_calls_clause_when_everything_was_noise(self):
-        analysis = self._analysis({"f": ["len", "str", "print"]})
-        out = cc._make_omitted_comment("f", 9, "", "#", analysis)
-
-        assert out == "# [9 lines omitted]"
 
     def test_ubiquity_needs_enough_functions_to_mean_anything(self):
         """With 2 functions, "more than half" is one — not evidence of noise."""

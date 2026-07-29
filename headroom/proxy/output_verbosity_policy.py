@@ -118,12 +118,11 @@ def _scan_for_block(
 
 def find_steering_block(text: str) -> tuple[int, int] | None:
     """``(start, end)`` of a Headroom-generated steering block, or ``None``."""
-    span = _scan_for_block(text, STEERING_SENTINEL, STEERING_SUFFIX, verify_body=True)
-    if span is not None:
-        return span
+    current = _scan_for_block(text, STEERING_SENTINEL, STEERING_SUFFIX, verify_body=True)
     # A block written by a pre-D4 build (echoed back by the client) is replaced
     # rather than duplicated.
-    return _scan_for_block(text, _LEGACY_SENTINEL, _LEGACY_SUFFIX, verify_body=False)
+    legacy = _scan_for_block(text, _LEGACY_SENTINEL, _LEGACY_SUFFIX, verify_body=False)
+    return min((span for span in (current, legacy) if span is not None), default=None)
 
 
 def contains_steering_block(text: str) -> bool:
@@ -132,14 +131,23 @@ def contains_steering_block(text: str) -> bool:
 
 
 def replace_or_append_steering_block(existing: str, block: str) -> tuple[str, bool]:
-    """Replace an existing steering block in text, or append one at the tail."""
-    span = find_steering_block(existing)
-    if span is not None:
+    """Collapse existing steering blocks to one, or append one at the tail."""
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    while span := find_steering_block(existing[offset:]):
         start, end = span
-        head = existing[:start].rstrip()
-        tail = existing[end:].lstrip("\n")
-        parts = [part for part in (head, block, tail) if part]
-        updated = "\n\n".join(parts)
+        spans.append((offset + start, offset + end))
+        offset += end
+    if spans:
+        updated = existing
+        for start, end in reversed(spans[1:]):
+            head = updated[:start].rstrip()
+            tail = updated[end:].lstrip("\n")
+            updated = "\n\n".join(part for part in (head, tail) if part)
+        start, end = spans[0]
+        head = updated[:start].rstrip()
+        tail = updated[end:].lstrip("\n")
+        updated = "\n\n".join(part for part in (head, block, tail) if part)
         return updated, updated != existing
 
     updated = f"{existing.rstrip()}\n\n{block}" if existing.strip() else block

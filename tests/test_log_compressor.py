@@ -974,6 +974,24 @@ class TestC2EmissionWaste:
         assert "line 28" not in kept
         assert "line 33" not in kept
 
+    def test_warning_keeps_multiline_diagnostic_context(self):
+        lines = [f"INFO before {i}" for i in range(30)]
+        lines.extend(
+            [
+                "warning: unused variable `value`",
+                "  --> src/main.rs:12:9",
+                "12 |     let value = 1;",
+                "   |         ^^^^^ help: prefix it with an underscore",
+            ]
+        )
+        lines.extend(f"INFO after {i}" for i in range(30))
+
+        result = self._compress("\n".join(lines), max_total_lines=100)
+
+        assert "src/main.rs:12:9" in result.compressed
+        assert "12 |     let value = 1;" in result.compressed
+        assert "^^^^^ help" in result.compressed
+
 
 class TestFailureDetailSurvives:
     """The narrow context window must not cost the *reason* a test failed.

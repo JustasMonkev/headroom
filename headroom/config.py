@@ -426,7 +426,14 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
         parts = name.split("_", 2)
         if len(parts) == 3 and parts[1] and parts[2]:
             aliases.append(f"mcp__{parts[1]}__{parts[2]}")
-            aliases.append(parts[2])
+        # Single-underscore wrappers are ambiguous because both the server and
+        # tool may contain underscores. Test every possible leaf suffix; a
+        # byte-sensitive Read must be protected even when the split is unclear.
+        rest = name[4:]
+        while "_" in rest:
+            rest = rest.split("_", 1)[1]
+            if rest:
+                aliases.append(rest)
 
     return tuple(dict.fromkeys(aliases))
 
