@@ -472,17 +472,17 @@ def ccr_hashes_from_markers(markers: Any) -> list[str]:
     return hashes
 
 
-#: A CCR hash as it appears inside the ``_ccr`` VALUE of a compacted tool
-#: input. Both spellings that can legitimately land there are covered: the
+#: A CCR hash as it appears INSIDE a compacted tool input. Both spellings this
+#: pass and its neighbours can leave in a tool argument are covered: the
 #: load-bearing ``Retrieve original: hash=`` phrase written by
 #: :meth:`ToolInputCompactor._store_original`, and the generic ``<<ccr:HASH>>``
 #: blob marker. Mirrors the corresponding entries of
 #: ``CCRToolInjector._marker_patterns`` (which only ever scans message TEXT).
 _TOOL_ARG_CCR_HASH_RE = re.compile(r"(?:Retrieve original: hash=|<<ccr:)([a-fA-F0-9]{12,24})")
 
-#: Cheap substring preconditions for :func:`_collect_tool_arg_hashes`. Even
-#: inside ``_ccr`` the value is a short marker, but keeping the literal gate
-#: means the regex only ever runs on text that could actually match.
+#: Cheap substring preconditions for :func:`ccr_hashes_in_tool_arguments`. Tool
+#: arguments are large and attacker-influenced, and this runs on every request,
+#: so the regex only ever sees text that could actually match.
 _TOOL_ARG_CCR_LITERALS: tuple[str, ...] = ("hash=", "<<ccr:")
 
 
@@ -490,38 +490,6 @@ def _collect_tool_arg_hashes(text: str, out: list[str]) -> None:
     if not any(literal in text for literal in _TOOL_ARG_CCR_LITERALS):
         return
     out.extend(_TOOL_ARG_CCR_HASH_RE.findall(text))
-
-
-def _collect_ccr_input_hashes(args: Any, out: list[str]) -> None:
-    """Collect marker hashes from ONE tool call's ``_ccr`` property only.
-
-    Scanning the whole arguments blob for marker text is wrong: an ordinary
-    completed call can *legitimately contain* that text as data — this repo's
-    own agents run ``Grep(pattern="<<ccr:")`` and search for
-    ``Retrieve original: hash=`` — and a hash lifted out of a search pattern
-    has no CCR entry behind it. Registering it would put ``headroom_retrieve``
-    into the sticky session tracker for the rest of the session (a permanently
-    useless tool, and one more toward the tool-search threshold). Only the
-    ``_ccr`` key is ever written by :class:`ToolInputCompactor`, so only that
-    key is read back.
-
-    ``args`` is the OpenAI JSON *string* or the Anthropic ``input`` object. The
-    JSON parse is gated on a plain substring test: transcripts with no ``_ccr``
-    anywhere — the overwhelming majority — never pay for a parse. Malformed or
-    non-object JSON is skipped, never raised.
-    """
-    if isinstance(args, str):
-        if CCR_INPUT_KEY not in args:
-            return
-        try:
-            args = json.loads(args)
-        except (TypeError, ValueError):
-            return  # Malformed arguments are not a marker.
-    if not isinstance(args, dict):
-        return
-    value = args.get(CCR_INPUT_KEY)
-    if isinstance(value, str):
-        _collect_tool_arg_hashes(value, out)
 
 
 def ccr_hashes_in_tool_arguments(messages: Any) -> list[str]:
@@ -544,12 +512,6 @@ def ccr_hashes_in_tool_arguments(messages: Any) -> list[str]:
     decision depend on what is actually being forwarded rather than on
     process-local state.
 
-    ONLY the ``_ccr`` property is inspected — never the rest of the arguments.
-    Marker text appearing anywhere else is the tool call's own data (a ``Grep``
-    pattern of ``<<ccr:`` or ``Retrieve original: hash=`` is exactly how these
-    markers get audited), and a hash taken from there names no CCR entry; see
-    :func:`_collect_ccr_input_hashes`.
-
     Results are shape-filtered through :func:`ccr_hashes_from_markers`, so only
     real ``[a-fA-F0-9]{12,24}`` hashes can drive injection.
     """
@@ -566,14 +528,22 @@ def ccr_hashes_in_tool_arguments(messages: Any) -> list[str]:
                 func = tc.get("function")
                 if not isinstance(func, dict):
                     continue
-                _collect_ccr_input_hashes(func.get("arguments"), found)
+                args = func.get("arguments")
+                if isinstance(args, str):
+                    _collect_tool_arg_hashes(args, found)
         # Anthropic shape: tool_use content blocks with object input.
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
-                _collect_ccr_input_hashes(block.get("input"), found)
+                inp = block.get("input")
+                if isinstance(inp, str):
+                    _collect_tool_arg_hashes(inp, found)
+                elif isinstance(inp, dict):
+                    for value in inp.values():
+                        if isinstance(value, str):
+                            _collect_tool_arg_hashes(value, found)
     return ccr_hashes_from_markers(found)
 
 
