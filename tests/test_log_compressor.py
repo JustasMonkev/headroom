@@ -814,6 +814,94 @@ class TestC2EmissionWaste:
         assert result.compressed.count("ERROR: connection refused") == 1
         assert "ERROR: connection refused ×40" in result.compressed
 
+    @staticmethod
+    def _same_error_different_context():
+        """Two byte-identical ERROR lines, each followed by a *different* reason."""
+        lines = [f"INFO worker {i} ok" for i in range(30)]
+        lines += [
+            "ERROR request failed",
+            "  caused by: database connection refused",
+            "  host=db-primary port=5432",
+        ]
+        lines += [f"INFO worker {i} ok" for i in range(30, 60)]
+        lines += [
+            "ERROR request failed",
+            "  caused by: permission denied for user svc",
+            "  role=svc-reader",
+        ]
+        lines += [f"INFO worker {i} ok" for i in range(60, 90)]
+        return "\n".join(lines)
+
+    def test_every_occurrence_of_a_folded_error_keeps_its_own_context(self):
+        """Identical error text is not identical failure.
+
+        Line-level dedup marked the later occurrence suppressed, and context was
+        expanded only around the survivor — so the output was
+        ``ERROR request failed ×2`` plus the database detail, with the
+        permission detail gone from the window entirely. The count still folds;
+        the surroundings of every occurrence are kept.
+        """
+        result = self._compress(self._same_error_different_context())
+
+        assert "database connection refused" in result.compressed
+        assert "permission denied" in result.compressed, result.compressed
+        # The error text is still emitted once, with its count.
+        assert result.compressed.count("ERROR request failed") == 1
+        assert "ERROR request failed ×2" in result.compressed
+        assert result.compression_ratio < 0.5
+
+    def test_identical_error_with_identical_context_still_folds_to_one(self):
+        """The token win must survive: same error AND same surroundings -> ×N."""
+        block = ["running the batch", "ERROR connection refused", "  retrying", "  giving up"]
+        content = "\n".join(block * 4 + [f"INFO tick {i}" for i in range(60)])
+        result = self._compress(content)
+
+        assert "ERROR connection refused ×4" in result.compressed
+        assert result.compressed.count("ERROR connection refused") == 1
+
+    def test_occurrence_expansion_is_bounded(self):
+        """One error repeated 500 times must not open 500 context windows."""
+        lines = []
+        for i in range(500):
+            lines.append("ERROR boom")
+            lines.append(f"detail line {i}")
+        result = self._compress("\n".join(lines), max_errors=10, max_total_lines=100)
+
+        body = result.compressed.splitlines()
+        assert len(body) <= 101, len(body)
+        assert "ERROR boom ×500" in result.compressed
+
+    def test_python_mirror_tracks_occurrences_and_expands_each(self):
+        """The legacy Python shim must mirror the Rust behaviour exactly."""
+        compressor = LogCompressor(config=LogCompressorConfig())
+        all_lines = [
+            LogLine(0, "before a", level=LogLevel.INFO),
+            LogLine(1, "ERROR boom", level=LogLevel.ERROR),
+            LogLine(2, "after a", level=LogLevel.INFO),
+            LogLine(3, "before b", level=LogLevel.INFO),
+            LogLine(4, "ERROR boom", level=LogLevel.ERROR),
+            LogLine(5, "after b", level=LogLevel.INFO),
+        ]
+        errors = [all_lines[1], all_lines[4]]
+        kept, suppressed, occurrences = compressor._dedupe_identical(errors, 10)
+
+        assert len(kept) == 1
+        assert kept[0].content == "ERROR boom ×2"
+        assert suppressed == {4}
+        assert occurrences == {1: [4]}
+
+        selected = compressor._add_context(all_lines, list(kept), suppressed, occurrences)
+        got = {line.content for line in selected}
+        # Both occurrences' neighbours, not just the survivor's.
+        assert "after a" in got
+        assert "after b" in got
+        # …and the folded duplicate itself never rides back in.
+        assert all(line.line_number != 4 for line in selected)
+
+        # Cap 0 (buckets that are never context-expanded) tracks nothing.
+        _, _, none_tracked = compressor._dedupe_identical([all_lines[1], all_lines[4]], 0)
+        assert none_tracked == {}
+
     def test_errors_differing_in_an_id_are_all_kept(self):
         """`_dedupe_similar` would collapse these; byte-identical dedup must not."""
         errors = [f"FAILED test_apply[case-{i}]: assert 0 == 1" for i in range(8)]

@@ -1141,12 +1141,6 @@ impl LogCompressor {
         // line-number-ordered output without an extra sort pass.
         let _ = (); // appease style; the BTreeSet ordering relies on Ord impl below.
 
-        // The context window used both for the dedup key below and for the
-        // expansion pass further down — they MUST agree, see
-        // `dedupe_identical_with_context`.
-        let ctx_before = self.config.error_context_lines.div_ceil(3);
-        let ctx_after = (2 * self.config.error_context_lines).div_ceil(3);
-
         // Byte-identical dedup for errors/fails. Deliberately NOT
         // `dedupe_similar`: its normaliser blanks digits, hex and paths in the
         // trailing region, which would collapse `test_apply[case-3] FAILED` and
@@ -1154,26 +1148,28 @@ impl LogCompressor {
         // failed. Only lines that are equal byte for byte are folded, and the
         // survivor states the count.
         //
-        // For ERROR/FAIL the key is the error line PLUS its context window, not
-        // the error line alone: those are the only levels the expansion pass
-        // below widens, and only the *kept* occurrence's neighbours are ever
-        // expanded. Keying on the line alone therefore collapsed two genuinely
-        // different failures that happened to share a message — two
-        // `ERROR request failed` lines, one followed by a database error and
-        // one by a permission error, became `×2` plus the database context
-        // only, silently dropping the second reason. Equal message is not equal
-        // failure; equal message *and* equal surroundings is.
-        let (errors, mut suppressed) =
-            dedupe_identical_with_context(errors, log_lines, ctx_before, ctx_after);
-        let (fails, fail_suppressed) =
-            dedupe_identical_with_context(fails, log_lines, ctx_before, ctx_after);
-        // Failure-detail lines fold on the plain line-level rule (a parametrized
-        // suite emits the same `E   assert 4 == 5` once per case). No context is
-        // ever expanded around them — they are selected on their own merit — so
-        // there is no later-occurrence context to lose.
-        let (failure_details, detail_suppressed) = dedupe_identical(failure_details);
+        // Equality of the error LINE is not equality of the failure, though. The
+        // context pass below widens ERROR/FAIL only, and used to widen only
+        // around the *kept* occurrence while every later occurrence's line
+        // number was marked suppressed — so two identical `ERROR request failed`
+        // lines followed by different diagnostics collapsed to one `×2` line
+        // plus the first one's database detail, and the second one's permission
+        // detail left the window entirely. `dup_occurrences` carries the folded
+        // occurrences' positions forward so context is expanded around EACH of
+        // them; the `×N` line still states the count exactly once.
+        let (errors, mut suppressed, mut dup_occurrences) =
+            dedupe_identical(errors, self.config.max_errors);
+        let (fails, fail_suppressed, fail_occurrences) =
+            dedupe_identical(fails, self.config.max_errors);
+        // Failure-detail lines fold on the same rule (a parametrized suite
+        // emits the same `E   assert 4 == 5` once per case). They are never
+        // context-expanded — they are selected on their own merit — so there is
+        // no later-occurrence context for them to lose and no occurrences to
+        // track (cap 0).
+        let (failure_details, detail_suppressed, _) = dedupe_identical(failure_details, 0);
         suppressed.extend(fail_suppressed);
         suppressed.extend(detail_suppressed);
+        dup_occurrences.extend(fail_occurrences);
         stats.duplicate_errors_folded += suppressed.len();
 
         for line in self.select_with_first_last(&errors, self.config.max_errors) {
@@ -1275,20 +1271,29 @@ impl LogCompressor {
         // line that named the failing test. Widening the window back to buy
         // that content would cost ~30 neighbours per error to keep one.
         //
-        // `ctx_before`/`ctx_after` are computed once, above, because the
-        // ERROR/FAIL dedup keys on exactly this window.
+        // The window is opened around EVERY occurrence of a selected error, not
+        // just the one that survived the `×N` fold: identical error text with
+        // different surrounding diagnostics is two different failures, and only
+        // widening around the first one silently dropped the second one's
+        // reason. `dup_occurrences` is already capped per kept line, so this
+        // cannot expand without bound.
+        let ctx_before = self.config.error_context_lines.div_ceil(3);
+        let ctx_after = (2 * self.config.error_context_lines).div_ceil(3);
         let selected_indices: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
         let mut context_indices: BTreeSet<usize> = BTreeSet::new();
         for line in selected.iter() {
             if !matches!(line.level, LogLevel::Error | LogLevel::Fail) {
                 continue;
             }
-            let idx = line.line_number;
-            let lo = idx.saturating_sub(ctx_before);
-            let hi = (idx + ctx_after + 1).min(log_lines.len());
-            for i in lo..hi {
-                if i != idx {
-                    context_indices.insert(i);
+            let empty: Vec<usize> = Vec::new();
+            let dups = dup_occurrences.get(&line.line_number).unwrap_or(&empty);
+            for &anchor in std::iter::once(&line.line_number).chain(dups.iter()) {
+                let lo = anchor.saturating_sub(ctx_before);
+                let hi = (anchor + ctx_after + 1).min(log_lines.len());
+                for i in lo..hi {
+                    if i != anchor {
+                        context_indices.insert(i);
+                    }
                 }
             }
         }
@@ -1468,96 +1473,50 @@ fn count_level(lines: &[LogLine], level: LogLevel) -> u64 {
     lines.iter().filter(|l| l.level == level).count() as u64
 }
 
-/// Fold ERROR/FAIL entries whose line AND context window are byte-identical.
-///
-/// The plain line-level `dedupe_identical` is wrong for the two levels that
-/// get context expanded. Only the *kept* occurrence's neighbours are expanded,
-/// and every later occurrence's line number is marked suppressed, so identical
-/// error text with DIFFERENT surroundings lost the later diagnostics entirely:
-///
-/// ```text
-/// ERROR request failed              ERROR request failed ×2
-///   database connection refused  ->    database connection refused
-/// ...                                  (permission detail gone)
-/// ERROR request failed
-///   permission denied
-/// ```
-///
-/// Equality of the error line is not equality of the failure. The key here is
-/// the same `[idx - before, idx + after]` slice the expansion pass uses, so a
-/// fold now means "this error *and everything shown about it*" repeated — and
-/// two occurrences that differ anywhere in that window each keep their own
-/// entry and expand their own context. Genuinely identical repeats (a
-/// parametrized suite emitting the same error with the same surroundings N
-/// times) still collapse to one `×N` line.
-///
-/// `all_lines` is indexed by `LogLine::line_number`.
-fn dedupe_identical_with_context(
-    lines: Vec<LogLine>,
-    all_lines: &[LogLine],
-    before: usize,
-    after: usize,
-) -> (Vec<LogLine>, BTreeSet<usize>) {
-    let mut first_at: BTreeMap<String, usize> = BTreeMap::new();
-    let mut counts: Vec<usize> = Vec::with_capacity(lines.len());
-    let mut kept: Vec<LogLine> = Vec::with_capacity(lines.len());
-    let mut suppressed: BTreeSet<usize> = BTreeSet::new();
-
-    for line in lines {
-        let idx = line.line_number;
-        let lo = idx.saturating_sub(before).min(all_lines.len());
-        let hi = (idx + after + 1).min(all_lines.len());
-        let key = if lo < hi {
-            all_lines[lo..hi]
-                .iter()
-                .map(|l| l.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            line.content.clone()
-        };
-        match first_at.get(&key) {
-            Some(&pos) => {
-                counts[pos] += 1;
-                suppressed.insert(line.line_number);
-            }
-            None => {
-                first_at.insert(key, kept.len());
-                counts.push(1);
-                kept.push(line);
-            }
-        }
-    }
-    for (line, count) in kept.iter_mut().zip(counts) {
-        if count > 1 {
-            line.content = format!("{} ×{}", line.content, count);
-        }
-    }
-    (kept, suppressed)
-}
-
 /// Fold BYTE-IDENTICAL lines: keep the first, append ` ×N` to it, and report
-/// the line numbers that were suppressed.
+/// the line numbers that were suppressed plus where those duplicates sat.
 ///
 /// Byte-identity is the whole point. Normalised similarity (see
 /// `dedupe_similar`) is fine for warnings, where the variable part is noise,
-/// but on errors the variable part is the *answer* — which id, which path,
+/// but on errors the variable part is the *answer* - which id, which path,
 /// which value failed. A fold that erases it turns "here are the 9 inputs that
 /// broke" into "something broke 9 times".
 ///
-/// Used for failure-detail lines, which are never context-expanded. ERROR/FAIL
-/// go through `dedupe_identical_with_context` instead.
-fn dedupe_identical(lines: Vec<LogLine>) -> (Vec<LogLine>, BTreeSet<usize>) {
+/// The third return value maps a KEPT line's `line_number` to the line numbers
+/// of the duplicates folded into it, first-seen order, at most
+/// `max_occurrences` per entry. Equality of the error line is NOT equality of
+/// the failure: two identical `ERROR request failed` lines can be followed by
+/// completely different diagnostics, and the caller expands a context window
+/// around ERROR/FAIL entries. Expanding only around the survivor kept the first
+/// occurrence's neighbours and dropped every later one's, so the reason the
+/// second request failed left the window altogether. Handing the occurrence
+/// positions back lets the caller keep context around each of them while the
+/// error text itself is still printed once with its count.
+///
+/// `max_occurrences` bounds that: without a cap, one error repeated 500 times
+/// in a long log would drag in 500 windows. Buckets whose lines are never
+/// context-expanded (failure detail) pass 0 and get an empty map.
+fn dedupe_identical(
+    lines: Vec<LogLine>,
+    max_occurrences: usize,
+) -> (Vec<LogLine>, BTreeSet<usize>, BTreeMap<usize, Vec<usize>>) {
     let mut first_at: BTreeMap<String, usize> = BTreeMap::new();
     let mut counts: Vec<usize> = Vec::with_capacity(lines.len());
     let mut kept: Vec<LogLine> = Vec::with_capacity(lines.len());
     let mut suppressed: BTreeSet<usize> = BTreeSet::new();
+    let mut occurrences: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
 
     for line in lines {
         match first_at.get(&line.content) {
             Some(&pos) => {
                 counts[pos] += 1;
                 suppressed.insert(line.line_number);
+                if max_occurrences > 0 {
+                    let slot = occurrences.entry(kept[pos].line_number).or_default();
+                    if slot.len() < max_occurrences {
+                        slot.push(line.line_number);
+                    }
+                }
             }
             None => {
                 first_at.insert(line.content.clone(), kept.len());
@@ -1571,7 +1530,7 @@ fn dedupe_identical(lines: Vec<LogLine>) -> (Vec<LogLine>, BTreeSet<usize>) {
             line.content = format!("{} ×{}", line.content, count);
         }
     }
-    (kept, suppressed)
+    (kept, suppressed, occurrences)
 }
 
 /// Fold stack traces whose frame lists are byte-identical.
@@ -2133,10 +2092,13 @@ mod tests {
                 l
             })
             .collect();
-        let (kept, suppressed) = dedupe_identical(lines);
+        let (kept, suppressed, occurrences) = dedupe_identical(lines, 10);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].content, "ERROR connection refused ×4");
         assert_eq!(suppressed.len(), 3);
+        // The survivor remembers where the folded copies sat, so the caller can
+        // still expand a context window around each of them.
+        assert_eq!(occurrences.get(&0), Some(&vec![1, 2, 3]));
     }
 
     #[test]
@@ -2150,9 +2112,10 @@ mod tests {
                 l
             })
             .collect();
-        let (kept, suppressed) = dedupe_identical(lines);
+        let (kept, suppressed, occurrences) = dedupe_identical(lines, 10);
         assert_eq!(kept.len(), 3);
         assert!(suppressed.is_empty());
+        assert!(occurrences.is_empty());
         assert!(kept[2].content.contains("case-2"));
     }
 
@@ -2176,10 +2139,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_errors_with_different_context_are_both_kept() {
-        // Regression: line-level dedup marked the second occurrence suppressed,
-        // and only the *kept* occurrence's neighbours are context-expanded, so
-        // the second failure's reason vanished from the output entirely.
+    fn every_occurrence_of_a_folded_error_keeps_its_own_context() {
+        // Regression: line-level dedup marked the second occurrence suppressed
+        // and only the *kept* occurrence's neighbours were context-expanded, so
+        // the second failure's reason vanished from the output entirely — the
+        // output was `ERROR request failed ×2` plus the database detail only.
         let lines = same_error_different_context();
         let compressor = LogCompressor::new(LogCompressorConfig::default());
         let content = lines.join("\n");
@@ -2195,9 +2159,10 @@ mod tests {
             "{}",
             result.compressed
         );
-        // Not folded into a single `×2` — these are two different failures.
+        // The error text is still printed once, with its count.
+        assert_eq!(result.compressed.matches("ERROR request failed").count(), 1);
         assert!(
-            !result.compressed.contains("ERROR request failed ×"),
+            result.compressed.contains("ERROR request failed ×2"),
             "{}",
             result.compressed
         );
@@ -2232,30 +2197,32 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_with_context_keys_on_the_window_not_the_line() {
-        let build = |idx: usize| {
-            let mut l = LogLine::new(idx, "ERROR boom");
-            l.level = LogLevel::Error;
-            l
-        };
-        let all: Vec<LogLine> = vec![
-            LogLine::new(0, "before a"),
-            build(1),
-            LogLine::new(2, "after a"),
-            LogLine::new(3, "before b"),
-            build(4),
-            LogLine::new(5, "after b"),
-            LogLine::new(6, "before a"),
-            build(7),
-            LogLine::new(8, "after a"),
-        ];
-        let errors = vec![all[1].clone(), all[4].clone(), all[7].clone()];
-        // before=1, after=1: entries 1 and 7 share a window; 4 does not.
-        let (kept, suppressed) = dedupe_identical_with_context(errors, &all, 1, 1);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].content, "ERROR boom ×2");
-        assert_eq!(kept[1].content, "ERROR boom");
-        assert_eq!(suppressed, [7].into_iter().collect());
+    fn folded_occurrences_are_capped() {
+        // A pathological log (one error 500 times) must not open 500 windows.
+        let lines: Vec<LogLine> = (0..500)
+            .map(|i| {
+                let mut l = LogLine::new(i, "ERROR boom");
+                l.level = LogLevel::Error;
+                l
+            })
+            .collect();
+        let (kept, suppressed, occurrences) = dedupe_identical(lines, 10);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].content, "ERROR boom \u{d7}500");
+        assert_eq!(suppressed.len(), 499);
+        assert_eq!(occurrences[&0].len(), 10);
+        assert_eq!(occurrences[&0][0], 1);
+    }
+
+    #[test]
+    fn a_bucket_that_is_never_context_expanded_tracks_no_occurrences() {
+        let lines: Vec<LogLine> = (0..3)
+            .map(|i| LogLine::new(i, "E   assert 4 == 5"))
+            .collect();
+        let (kept, suppressed, occurrences) = dedupe_identical(lines, 0);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(suppressed.len(), 2);
+        assert!(occurrences.is_empty());
     }
 
     #[test]

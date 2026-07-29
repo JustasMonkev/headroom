@@ -431,14 +431,20 @@ class LogCompressor:
             stack_traces.append(current_stack)
 
         selected: list[LogLine] = []
-        # ERROR/FAIL fold on the line *and its context window* — see
-        # `_dedupe_identical_with_context`. Failure detail is never context
-        # expanded, so it folds on the plain line-level rule.
-        errors, suppressed = self._dedupe_identical_with_context(errors, log_lines)
-        fails, fail_suppressed = self._dedupe_identical_with_context(fails, log_lines)
-        failure_details, detail_suppressed = self._dedupe_identical(failure_details)
+        # Byte-identical dedup for errors/fails — see `_dedupe_identical`. The
+        # occurrence map carries the folded duplicates' positions so context is
+        # expanded around EACH of them, not just the survivor. Failure detail is
+        # never context expanded, so it tracks no occurrences (cap 0).
+        errors, suppressed, dup_occurrences = self._dedupe_identical(
+            errors, self.config.max_errors
+        )
+        fails, fail_suppressed, fail_occurrences = self._dedupe_identical(
+            fails, self.config.max_errors
+        )
+        failure_details, detail_suppressed, _ = self._dedupe_identical(failure_details, 0)
         suppressed |= fail_suppressed
         suppressed |= detail_suppressed
+        dup_occurrences.update(fail_occurrences)
         if errors:
             selected.extend(self._select_with_first_last(errors, self.config.max_errors))
         if fails:
@@ -461,7 +467,7 @@ class LogCompressor:
         if self.config.keep_summary_lines:
             selected.extend(summaries)
 
-        selected = self._add_context(log_lines, selected, suppressed)
+        selected = self._add_context(log_lines, selected, suppressed, dup_occurrences)
         selected = sorted(set(selected), key=lambda x: x.line_number)
 
         if len(selected) > adaptive_max:
@@ -518,59 +524,9 @@ class LogCompressor:
                 deduped.append(line)
         return deduped
 
-    def _context_window(self) -> tuple[int, int]:
-        """``(before, after)`` — the asymmetric window ``_add_context`` expands.
-
-        Shared with `_dedupe_identical_with_context`, which keys on exactly this
-        slice; the two MUST agree. Mirrors Rust `ctx_before`/`ctx_after`.
-        """
-        return (
-            -(-self.config.error_context_lines // 3),
-            -(-(2 * self.config.error_context_lines) // 3),
-        )
-
-    def _dedupe_identical_with_context(
-        self, lines: list[LogLine], all_lines: list[LogLine]
-    ) -> tuple[list[LogLine], set[int]]:
-        """Fold ERROR/FAIL entries whose line AND context window are identical.
-
-        Mirrors Rust `dedupe_identical_with_context`.
-
-        Line-level dedup is wrong for the two levels that get context expanded:
-        only the *kept* occurrence's neighbours are expanded and every later
-        occurrence is marked suppressed, so two ``ERROR request failed`` lines —
-        one followed by a database error, one by a permission error — collapsed
-        to one ``×2`` line plus the database context, silently dropping the
-        second failure's reason. Equality of the error line is not equality of
-        the failure; equality of the line *and its surroundings* is.
-
-        Truly identical repeats (a parametrized suite emitting the same error
-        with the same neighbours N times) still collapse to one ``×N`` entry.
-        """
-        before, after = self._context_window()
-        first_at: dict[str, int] = {}
-        counts: list[int] = []
-        kept: list[LogLine] = []
-        suppressed: set[int] = set()
-        for line in lines:
-            idx = line.line_number
-            lo = min(max(0, idx - before), len(all_lines))
-            hi = min(idx + after + 1, len(all_lines))
-            key = "\n".join(ln.content for ln in all_lines[lo:hi]) if lo < hi else line.content
-            pos = first_at.get(key)
-            if pos is None:
-                first_at[key] = len(kept)
-                counts.append(1)
-                kept.append(line)
-            else:
-                counts[pos] += 1
-                suppressed.add(line.line_number)
-        for line, count in zip(kept, counts, strict=True):
-            if count > 1:
-                line.content = f"{line.content} ×{count}"
-        return kept, suppressed
-
-    def _dedupe_identical(self, lines: list[LogLine]) -> tuple[list[LogLine], set[int]]:
+    def _dedupe_identical(
+        self, lines: list[LogLine], max_occurrences: int
+    ) -> tuple[list[LogLine], set[int], dict[int, list[int]]]:
         """Fold BYTE-IDENTICAL lines: keep the first, append ``×N`` to it.
 
         Mirrors Rust `dedupe_identical`. Deliberately NOT `_dedupe_similar`:
@@ -579,13 +535,27 @@ class LogCompressor:
         ``test_apply[case-3] FAILED`` and ``test_apply[case-9] FAILED`` would
         become one entry. Only exact repeats are folded.
 
-        Returns ``(kept, suppressed_line_numbers)``; the suppressed numbers are
-        excluded from context expansion so a folded duplicate can't ride back in.
+        Returns ``(kept, suppressed_line_numbers, occurrences)``. The suppressed
+        numbers are excluded from context expansion so a folded duplicate can't
+        ride back in verbatim. ``occurrences`` maps a KEPT line's number to the
+        line numbers of the duplicates folded into it (first-seen order, at most
+        ``max_occurrences`` each).
+
+        That map is the fix for a real loss: equality of the error LINE is not
+        equality of the failure. Two identical ``ERROR request failed`` lines can
+        be followed by completely different diagnostics, and ``_add_context``
+        widens a window around ERROR/FAIL entries. Widening only around the
+        survivor kept the first occurrence's neighbours and dropped every later
+        one's, so the second request's reason left the window altogether — one
+        ``×2`` line plus the database detail, with the permission detail gone.
+        The cap bounds the pathological case (one error repeated 500 times must
+        not open 500 windows); buckets that are never context-expanded pass 0.
         """
         first_at: dict[str, int] = {}
         counts: list[int] = []
         kept: list[LogLine] = []
         suppressed: set[int] = set()
+        occurrences: dict[int, list[int]] = {}
         for line in lines:
             pos = first_at.get(line.content)
             if pos is None:
@@ -595,10 +565,14 @@ class LogCompressor:
             else:
                 counts[pos] += 1
                 suppressed.add(line.line_number)
+                if max_occurrences > 0:
+                    slot = occurrences.setdefault(kept[pos].line_number, [])
+                    if len(slot) < max_occurrences:
+                        slot.append(line.line_number)
         for line, count in zip(kept, counts, strict=True):
             if count > 1:
                 line.content = f"{line.content} ×{count}"
-        return kept, suppressed
+        return kept, suppressed, occurrences
 
     def _dedupe_identical_traces(
         self, traces: list[list[LogLine]]
@@ -632,6 +606,7 @@ class LogCompressor:
         all_lines: list[LogLine],
         selected: list[LogLine],
         suppressed: set[int] | None = None,
+        dup_occurrences: dict[int, list[int]] | None = None,
     ) -> list[LogLine]:
         """Expand context around selected ERROR/FAIL lines only.
 
@@ -642,19 +617,28 @@ class LogCompressor:
         The window is asymmetric because what follows an error explains it
         while the line before is usually just the last thing that went right:
         1 before / 2 after at the default ``error_context_lines = 3``.
+
+        The window is opened around EVERY occurrence of a selected error
+        (``dup_occurrences``, from `_dedupe_identical`), not only the one that
+        survived the ``×N`` fold: identical error text with different
+        surrounding diagnostics is two different failures, and widening only
+        around the survivor dropped the later ones' reasons. The occurrence
+        lists are already capped, so this cannot expand without bound.
         """
         suppressed = suppressed or set()
-        before, after = self._context_window()
+        dup_occurrences = dup_occurrences or {}
+        before = -(-self.config.error_context_lines // 3)
+        after = -(-(2 * self.config.error_context_lines) // 3)
         selected_indices = {line.line_number for line in selected}
         context_indices: set[int] = set()
         for line in selected:
             if line.level not in (LogLevel.ERROR, LogLevel.FAIL):
                 continue
-            idx = line.line_number
-            for i in range(max(0, idx - before), idx):
-                context_indices.add(i)
-            for i in range(idx + 1, min(len(all_lines), idx + after + 1)):
-                context_indices.add(i)
+            for idx in (line.line_number, *dup_occurrences.get(line.line_number, ())):
+                for i in range(max(0, idx - before), idx):
+                    context_indices.add(i)
+                for i in range(idx + 1, min(len(all_lines), idx + after + 1)):
+                    context_indices.add(i)
         for idx in sorted(context_indices):
             if idx not in selected_indices and idx not in suppressed and idx < len(all_lines):
                 selected.append(all_lines[idx])
