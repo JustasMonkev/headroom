@@ -853,6 +853,9 @@ def test_read_only_names_stay_compactable(tool_name: str) -> None:
         "git config user.name someone",
         "git update-ref refs/heads/x abc",
         "git sparse-checkout set src",
+        "git -C /repo add src/a.py",
+        "git -c user.name=x commit -m x",
+        "git --git-dir=/repo/.git reset --hard HEAD",
     ],
 )
 def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
@@ -873,6 +876,9 @@ def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
         "git ls-files",
         "git rev-parse HEAD",
         "git describe --tags",
+        "git -C /repo status",
+        "git -c color.ui=false log --oneline",
+        "git --git-dir=/repo/.git diff HEAD",
     ],
 )
 def test_read_only_git_subcommands_stay_compactable(command: str) -> None:

@@ -219,7 +219,9 @@ _PATCH_CMD_RE = re.compile(
 #: grep, ls-files, rev-parse, describe) is deliberately absent so it stays
 #: compactable.
 _GIT_MUTATION_RE = re.compile(
-    r"\bgit\s+(?:"
+    r"\bgit\s+"
+    r"(?:(?:(?:-C|-c)\s+\S+|--[-\w]+(?:=\S+)?|-p|-P)\s+){0,8}"
+    r"(?:"
     r"add|am|apply|branch|checkout|cherry-pick|clean|commit|config|fetch|gc|init|"
     r"merge|mv|notes|prune|pull|push|rebase|remote|reset|restore|revert|rm|"
     r"sparse-checkout|stash|submodule|switch|tag|update-index|update-ref|worktree"
