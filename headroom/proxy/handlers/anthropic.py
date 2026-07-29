@@ -1838,12 +1838,6 @@ class AnthropicHandlerMixin:
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
-                if inject_system_instructions and frozen_message_count > 0:
-                    logger.info(
-                        f"[{request_id}] CCR: skipping system instruction injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
-                    )
-                    inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
                 if configured_inject_tool and frozen_message_count > 0:
                     logger.info(
@@ -1884,8 +1878,6 @@ class AnthropicHandlerMixin:
                 # injector's own list, so a tool-input-only marker would leave it
                 # empty and silently skip the guidance.
                 injector.adopt_hashes(_detected_hashes)
-                if inject_system_instructions and injector.has_compressed_content:
-                    optimized_messages = injector.inject_into_system_message(optimized_messages)
 
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
@@ -1930,6 +1922,7 @@ class AnthropicHandlerMixin:
                             f"(frozen_message_count={frozen_message_count}); injecting to "
                             "prevent unredeemable markers (#1006)"
                         )
+                if should_inject:
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
@@ -2391,6 +2384,41 @@ class AnthropicHandlerMixin:
                 logger.warning(
                     "[%s] system prompt compaction FAILED: %s", request_id, _sys_compaction_exc
                 )
+
+            # Anthropic system guidance belongs in the top-level `system` field,
+            # after its final compaction pass. Rescan here because system
+            # compaction can itself emit a new CCR marker.
+            if (
+                self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
+            ) and not _bypass:
+                _ccr_system = [{"role": "system", "content": body.get("system", "")}]
+                _system_ccr_hashes = list(injector.scan_for_markers(_ccr_system))
+                _detected_hashes = merge_pipeline_ccr_hashes(
+                    _detected_hashes,
+                    _system_ccr_hashes,
+                )
+                injector.adopt_hashes(_detected_hashes)
+
+                if inject_system_instructions and injector.has_compressed_content:
+                    _ccr_system = injector.inject_into_system_message(_ccr_system)
+                    body["system"] = _ccr_system[0]["content"]
+
+                if configured_inject_tool and _system_ccr_hashes:
+                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                    tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                        provider="anthropic",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        has_compressed_content_this_turn=True,
+                    )
+                    if ccr_tool_injected:
+                        tools = self._tools_for_forwarding(
+                            tools,
+                            preserve_order=preserve_tool_order,
+                        )
+                        body["tools"] = tools
 
             # F2: prior-turn thinking compaction (HEADROOM_THINKING_COMPACT,
             # off by default). On Claude 4.6+ prior-turn `thinking` blocks are

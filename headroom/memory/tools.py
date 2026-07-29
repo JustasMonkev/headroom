@@ -71,14 +71,32 @@ MEMORY_ID_PARAM_DESCRIPTION = (
 _IMPORTANCE_DESCRIPTION = "0.0 (low) to 1.0 (critical). Ranks recall order."
 _CONTENT_DESCRIPTION = "What to remember; specific and self-contained."
 _ENTITIES_DESCRIPTION = "Entity names referenced."
-_RELATIONSHIPS_DESCRIPTION = "Entity links as {source, relation, target} objects."
+_RELATIONSHIPS_DESCRIPTION = "Entity links as {source, type, target} objects."
 _QUERY_DESCRIPTION = "What you are looking for."
 _FACTS_DESCRIPTION = "Pre-extracted self-contained facts."
 _EXTRACTED_ENTITIES_DESCRIPTION = "Typed entities for graph storage."
 _EXTRACTED_RELATIONSHIPS_DESCRIPTION = "Graph links between entities."
 
 # ---------------------------------------------------------------------------
-# Item schemas for the two pre-extraction arrays that reach the graph writer.
+# Item schemas for relationship and pre-extraction arrays.
+#
+# ``LocalBackend.save_memory`` needs both endpoints to create a relationship;
+# ``type`` is optional because it deliberately defaults to ``related_to``.
+# Share this object between standard and optimized memory_save so one variant
+# cannot silently regress to accepting endpoint-free objects.
+# ---------------------------------------------------------------------------
+RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "type": {"type": "string"},
+    },
+    "required": ["source", "target"],
+}
+
+# ---------------------------------------------------------------------------
+# The two pre-extraction arrays reach the graph writer directly.
 #
 # These are NOT decoration and must not be collapsed to a bare
 # ``{"type": "object"}`` to save tokens (PR #16 review). ``DirectMem0Adapter
@@ -136,7 +154,7 @@ MEMORY_TOOLS: list[dict[str, Any]] = [
                     },
                     "relationships": {
                         "type": "array",
-                        "items": {"type": "object"},
+                        "items": RELATIONSHIP_ITEM_SCHEMA,
                         "description": _RELATIONSHIPS_DESCRIPTION,
                     },
                 },
@@ -299,7 +317,7 @@ MEMORY_SAVE_OPTIMIZED: dict[str, Any] = {
                 },
                 "relationships": {
                     "type": "array",
-                    "items": {"type": "object"},
+                    "items": RELATIONSHIP_ITEM_SCHEMA,
                     "description": _RELATIONSHIPS_DESCRIPTION,
                 },
                 "extracted_relationships": {

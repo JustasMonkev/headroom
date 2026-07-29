@@ -53,9 +53,24 @@
           "relationships": {
             "type": "array",
             "items": {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "target"
+              ]
             },
-            "description": "Entity links as {source, relation, target} objects."
+            "description": "Entity links as {source, type, target} objects."
           },
           "extracted_relationships": {
             "type": "array",

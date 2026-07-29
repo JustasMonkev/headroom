@@ -34,6 +34,7 @@ from headroom.memory.tools import (
     MEMORY_SEARCH_DESCRIPTION,
     MEMORY_TOOLS,
     MEMORY_TOOLS_OPTIMIZED,
+    RELATIONSHIP_ITEM_SCHEMA,
 )
 from headroom.proxy.memory_tool_adapter import (
     ANTHROPIC_CUSTOM_TOOLS,
@@ -163,6 +164,39 @@ def test_required_params_unchanged(tools: list[dict[str, Any]]) -> None:
         "new_content",
     }
     assert _params(_by_name(tools, "memory_delete"))["required"] == ["memory_id"]
+
+
+# ---------------------------------------------------------------------------
+# Standard relationship arrays
+# ---------------------------------------------------------------------------
+
+RELATIONSHIP_VARIANTS = pytest.mark.parametrize(
+    "tools",
+    [MEMORY_TOOLS, MEMORY_TOOLS_OPTIMIZED],
+    ids=["standard", "optimized"],
+)
+
+
+@RELATIONSHIP_VARIANTS
+def test_relationship_items_require_both_endpoints(tools: list[dict[str, Any]]) -> None:
+    item = _params(_by_name(tools, "memory_save"))["properties"]["relationships"]["items"]
+
+    assert item is RELATIONSHIP_ITEM_SCHEMA
+    assert set(item["properties"]) == {"source", "target", "type"}
+    assert set(item["required"]) == {"source", "target"}
+    assert all(prop["type"] == "string" for prop in item["properties"].values())
+
+
+@RELATIONSHIP_VARIANTS
+def test_relationship_items_reject_a_missing_endpoint(tools: list[dict[str, Any]]) -> None:
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _params(_by_name(tools, "memory_save"))["properties"]["relationships"]["items"]
+
+    jsonschema.validate({"source": "Alice", "target": "Acme"}, schema)
+    jsonschema.validate({"source": "Alice", "target": "Acme", "type": "works_at"}, schema)
+    for incomplete in ({"source": "Alice"}, {"target": "Acme"}, {"type": "works_at"}):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(incomplete, schema)
 
 
 # ---------------------------------------------------------------------------

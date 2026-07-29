@@ -44,7 +44,7 @@
 //!   for human-readable summary output. Preserved for parity but
 //!   future code should treat them as equivalent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -1450,13 +1450,31 @@ fn omission_summary(selected: &[LogLine], all_lines: &[LogLine]) -> Option<Strin
     if omitted == 0 {
         return None;
     }
+    let mut identical_counts: HashMap<(LogLevel, &str), u64> = HashMap::new();
+    for line in all_lines
+        .iter()
+        .filter(|line| matches!(line.level, LogLevel::Error | LogLevel::Fail))
+    {
+        *identical_counts
+            .entry((line.level, line.content.as_str()))
+            .or_default() += 1;
+    }
+    let original_by_line: HashMap<usize, &LogLine> = all_lines
+        .iter()
+        .map(|line| (line.line_number, line))
+        .collect();
     let mut parts: Vec<String> = Vec::new();
     for (label, level) in [
         ("ERROR", LogLevel::Error),
         ("FAIL", LogLevel::Fail),
         ("WARN", LogLevel::Warn),
     ] {
-        let dropped = count_level(all_lines, level).saturating_sub(count_level(selected, level));
+        let dropped = count_level(all_lines, level).saturating_sub(represented_level_count(
+            selected,
+            level,
+            &identical_counts,
+            &original_by_line,
+        ));
         if dropped > 0 {
             parts.push(format!("{} {}", dropped, label));
         }
@@ -1479,6 +1497,41 @@ fn omission_summary(selected: &[LogLine], all_lines: &[LogLine]) -> Option<Strin
 
 fn count_level(lines: &[LogLine], level: LogLevel) -> u64 {
     lines.iter().filter(|l| l.level == level).count() as u64
+}
+
+fn represented_level_count(
+    selected: &[LogLine],
+    level: LogLevel,
+    identical_counts: &HashMap<(LogLevel, &str), u64>,
+    original_by_line: &HashMap<usize, &LogLine>,
+) -> u64 {
+    selected
+        .iter()
+        .filter(|line| line.level == level)
+        .map(|line| {
+            if !matches!(level, LogLevel::Error | LogLevel::Fail) {
+                return 1;
+            }
+            let Some((original, count)) = line.content.rsplit_once(" ×") else {
+                return 1;
+            };
+            let Ok(count) = count.parse::<u64>() else {
+                return 1;
+            };
+            let originals = identical_counts
+                .get(&(level, original))
+                .copied()
+                .unwrap_or_default();
+            let is_generated_fold = original_by_line
+                .get(&line.line_number)
+                .is_some_and(|source| source.level == level && source.content == original);
+            if is_generated_fold && count > 1 && count == originals {
+                count
+            } else {
+                1
+            }
+        })
+        .sum()
 }
 
 /// Fold BYTE-IDENTICAL lines: keep the first, append ` ×N` to it, and report
@@ -2089,6 +2142,53 @@ mod tests {
         let all_lines = vec![a.clone(), b];
         let (output, _) = c.format_output(&[a], &all_lines);
         assert_eq!(output, "ERROR boom\n[1 lines compressed away]");
+    }
+
+    #[test]
+    fn omission_footer_counts_folded_error_and_fail_multiplicity_as_present() {
+        let line = |number, content, level| {
+            let mut line = LogLine::new(number, content);
+            line.level = level;
+            line
+        };
+        let all_lines = vec![
+            line(0, "ERROR connection refused", LogLevel::Error),
+            line(1, "ERROR connection refused", LogLevel::Error),
+            line(2, "ERROR connection refused", LogLevel::Error),
+            line(3, "ERROR distinct", LogLevel::Error),
+            line(4, "FAIL test_login", LogLevel::Fail),
+            line(5, "FAIL test_login", LogLevel::Fail),
+            line(6, "FAIL distinct", LogLevel::Fail),
+            line(7, "WARN genuinely omitted", LogLevel::Warn),
+        ];
+        let (errors, _, _) = dedupe_identical(all_lines[0..3].to_vec(), 0);
+        let (fails, _, _) = dedupe_identical(all_lines[4..6].to_vec(), 0);
+        let selected = vec![errors[0].clone(), fails[0].clone()];
+
+        let (output, _) = cmp().format_output(&selected, &all_lines);
+
+        assert_eq!(
+            output,
+            "ERROR connection refused ×3\nFAIL test_login ×2\n\
+             [6 lines compressed away: 1 ERROR, 1 FAIL, 1 WARN]"
+        );
+    }
+
+    #[test]
+    fn omission_footer_does_not_treat_a_literal_count_suffix_as_a_fold() {
+        let mut all_lines = vec![
+            LogLine::new(0, "ERROR boom"),
+            LogLine::new(1, "ERROR boom"),
+            LogLine::new(2, "ERROR boom ×2"),
+        ];
+        for line in &mut all_lines {
+            line.level = LogLevel::Error;
+        }
+        let selected = vec![all_lines[2].clone()];
+
+        let (output, _) = cmp().format_output(&selected, &all_lines);
+
+        assert_eq!(output, "ERROR boom ×2\n[2 lines compressed away: 2 ERROR]");
     }
 
     #[test]

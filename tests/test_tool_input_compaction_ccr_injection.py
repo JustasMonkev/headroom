@@ -793,6 +793,7 @@ def test_handler_rollback_uses_only_hashes_in_forwarded_messages(provider: str) 
     for body in forwarded[:2]:
         assert HASH not in json.dumps(body["messages"])
         assert CCR_SYSTEM_INSTRUCTIONS not in json.dumps(body["messages"])
+        assert CCR_SYSTEM_INSTRUCTIONS not in json.dumps(body.get("system"))
         names = {
             t.get("name") or (t.get("function") or {}).get("name") for t in body.get("tools") or []
         }
@@ -800,9 +801,218 @@ def test_handler_rollback_uses_only_hashes_in_forwarded_messages(provider: str) 
 
     marker_body = forwarded[2]
     assert HASH in json.dumps(marker_body["messages"])
-    assert CCR_SYSTEM_INSTRUCTIONS in json.dumps(marker_body["messages"])
+    if provider == "anthropic":
+        assert {message["role"] for message in marker_body["messages"]} <= {
+            "user",
+            "assistant",
+        }
+        assert CCR_SYSTEM_INSTRUCTIONS not in json.dumps(marker_body["messages"])
+        assert CCR_SYSTEM_INSTRUCTIONS in json.dumps(marker_body["system"])
+    else:
+        # OpenAI Chat keeps its system guidance in `messages`; this change is
+        # Anthropic-only.
+        assert CCR_SYSTEM_INSTRUCTIONS in json.dumps(marker_body["messages"])
     marker_names = {
         t.get("name") or (t.get("function") or {}).get("name")
         for t in marker_body.get("tools") or []
     }
     assert CCR_TOOL_NAME in marker_names
+
+
+@pytest.mark.parametrize(
+    ("initial_system", "expected_system"),
+    [
+        (None, CCR_SYSTEM_INSTRUCTIONS),
+        ("base system", f"base system\n\n{CCR_SYSTEM_INSTRUCTIONS}"),
+        (
+            [
+                {
+                    "type": "text",
+                    "text": "base system",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            [
+                {
+                    "type": "text",
+                    "text": "base system",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": CCR_SYSTEM_INSTRUCTIONS},
+            ],
+        ),
+    ],
+)
+def test_anthropic_ccr_guidance_is_final_and_cache_stable(
+    initial_system: Any,
+    expected_system: Any,
+) -> None:
+    """Absent/string/list systems stay valid and byte-stable on a frozen replay."""
+    pytest.importorskip("fastapi")
+
+    import copy
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    class _FrozenTracker:
+        def __init__(self) -> None:
+            self._cached_token_count = 0
+            self.forwarded: list[dict[str, Any]] = []
+
+        def get_frozen_message_count(self) -> int:
+            return 1
+
+        def get_last_original_messages(self) -> list[dict[str, Any]]:
+            return []
+
+        def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
+            return self.forwarded.copy()
+
+        def update_from_response(self, **kwargs: Any) -> None:
+            self._cached_token_count = kwargs.get("cache_read_tokens", 0) + kwargs.get(
+                "cache_write_tokens", 0
+            )
+            self.forwarded = kwargs.get("messages", []).copy()
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=True,
+        ccr_inject_system_instructions=True,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    forwarded: list[dict[str, Any]] = []
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        tracker = _FrozenTracker()
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-ccr-system"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            forwarded.append(copy.deepcopy(body))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_ccr_system",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        payload: dict[str, Any] = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "messages": _anthropic_messages(),
+        }
+        if initial_system is not None:
+            payload["system"] = initial_system
+
+        for _ in range(2):
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json=payload,
+            )
+            assert response.status_code == 200, response.text
+
+    assert [body["system"] for body in forwarded] == [expected_system, expected_system]
+    for body in forwarded:
+        assert {message["role"] for message in body["messages"]} <= {"user", "assistant"}
+        assert str(body["system"]).count(CCR_SYSTEM_INSTRUCTIONS) == 1
+    assert CCR_TOOL_NAME in {tool.get("name") for tool in forwarded[0].get("tools") or []}
+
+
+def test_anthropic_system_compaction_marker_gets_final_guidance_and_tool(monkeypatch) -> None:
+    """A marker minted by Layer 3 is redeemable in the same forwarded request."""
+    pytest.importorskip("fastapi")
+
+    import copy
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_SYSTEM_COMPACT", "1")
+    monkeypatch.setattr(
+        "headroom.transforms.compression_units.find_content_router",
+        lambda pipeline: object(),
+    )
+
+    def _compact(body: dict[str, Any], **kwargs: Any) -> tuple[dict[str, Any], bool, int, int]:
+        compacted = {**body, "system": f"compacted system\n\n{MARKER}"}
+        return compacted, True, 100, 20
+
+    monkeypatch.setattr("headroom.proxy.system_compaction.compact_system_prompt", _compact)
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=True,
+        ccr_inject_system_instructions=True,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    forwarded: dict[str, Any] = {}
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            forwarded.update(copy.deepcopy(body))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_system_compaction",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "system": "base system",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    assert MARKER in forwarded["system"]
+    assert forwarded["system"].endswith(CCR_SYSTEM_INSTRUCTIONS)
+    assert {message["role"] for message in forwarded["messages"]} <= {"user", "assistant"}
+    assert CCR_TOOL_NAME in {tool.get("name") for tool in forwarded.get("tools") or []}
