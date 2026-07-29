@@ -202,8 +202,18 @@ _FILEOP_RE = re.compile(
 #: that a real invocation needs (``patch -p1 …``, ``patch < fix.diff``) rather
 #: than the bare token.
 _PATCH_CMD_RE = re.compile(r"\bpatch\s+[-<]")
+#: State-changing git subcommands. `add` matters most in practice: `git add`
+#: with hundreds of paths is exactly the long-argument, empty-result shape this
+#: guard exists for, and once the CCR entry lapses the transcript no longer
+#: records what was staged. Read-only porcelain (status, log, diff, show, blame,
+#: grep, ls-files, rev-parse, describe) is deliberately absent so it stays
+#: compactable.
 _GIT_MUTATION_RE = re.compile(
-    r"\bgit\s+(?:commit|apply|checkout|reset|push|rebase|merge|am|revert|clean)\b"
+    r"\bgit\s+(?:"
+    r"add|am|apply|branch|checkout|cherry-pick|clean|commit|config|fetch|gc|init|"
+    r"merge|mv|notes|prune|pull|push|rebase|remote|reset|restore|revert|rm|"
+    r"sparse-checkout|stash|submodule|switch|tag|update-index|update-ref|worktree"
+    r")\b"
 )
 _PKG_MUTATION_RE = re.compile(
     r"\b(?:npm|pnpm|yarn|pip|uv|cargo|apt|apt-get|brew)\s+(?:install|add|remove|"

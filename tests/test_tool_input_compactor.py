@@ -831,3 +831,49 @@ def test_noun_first_and_camel_case_names_are_mutating(tool_name: str) -> None:
 )
 def test_read_only_names_stay_compactable(tool_name: str) -> None:
     assert is_mutating_tool_input(tool_name, '{"path": "x"}') is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `git add` with hundreds of paths is the long-argument, empty-result
+        # shape this guard exists for: once the CCR entry lapses, nothing
+        # records what was staged.
+        "git add -A",
+        "git add src/a.py src/b.py src/c.py",
+        "git stash push -u",
+        "git switch -c feature/x",
+        "git cherry-pick abc123",
+        "git restore --staged file.py",
+        "git rm -r build/",
+        "git mv old.py new.py",
+        "git tag -a v1.0 -m release",
+        "git worktree add ../wt",
+        "git submodule update --init",
+        "git config user.name someone",
+        "git update-ref refs/heads/x abc",
+        "git sparse-checkout set src",
+    ],
+)
+def test_state_changing_git_subcommands_are_mutating(command: str) -> None:
+    assert is_mutating_tool_input("Bash", command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Read-only porcelain must stay compactable — it is reproducible by
+        # re-running the command.
+        "git status",
+        "git log --oneline -5",
+        "git diff HEAD",
+        "git show abc123",
+        "git blame file.py",
+        "git grep pattern",
+        "git ls-files",
+        "git rev-parse HEAD",
+        "git describe --tags",
+    ],
+)
+def test_read_only_git_subcommands_stay_compactable(command: str) -> None:
+    assert is_mutating_tool_input("Bash", command) is False
