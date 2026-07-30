@@ -713,12 +713,14 @@ class AnthropicHandlerMixin:
             # aborting multi-turn sessions. Canonicalizing here (in place, so body,
             # original, forwarded, and the recorded/replayed prefix are all identical)
             # keeps it cache-safe: overlay_cached_prefix replays the same stripped bytes.
-            _strip_streaming_only_content_fields(messages)
+            # JSON serializers never escape ASCII key characters, so a body
+            # without the literal bytes `"index"` cannot contain the key —
+            # skip the full-conversation walk for the common case.
+            if b'"index"' in original_body_bytes:
+                _strip_streaming_only_content_fields(messages)
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
             pipeline_stream = bool(body.get("stream", False) or force_stream)
-            with stage_timer.measure("deep_copy"):
-                original_client_messages = copy.deepcopy(messages)
             input_event = self.pipeline_extensions.emit(
                 PipelineStage.INPUT_RECEIVED,
                 operation="proxy.request",
@@ -731,10 +733,14 @@ class AnthropicHandlerMixin:
             )
             if input_event.messages is not None:
                 messages = input_event.messages
-                with stage_timer.measure("deep_copy"):
-                    original_client_messages = copy.deepcopy(messages)
             if input_event.tools is not None:
                 body["tools"] = input_event.tools
+            # Snapshot ONCE, after the input extensions: emit() echoes the passed
+            # list back through event.messages, so a pre-emit copy would always be
+            # discarded and re-taken; in-place extension mutations land in
+            # `messages` before this copy either way.
+            with stage_timer.measure("deep_copy"):
+                original_client_messages = copy.deepcopy(messages)
 
             # Validate message array size
             if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
@@ -1010,6 +1016,11 @@ class AnthropicHandlerMixin:
             # resolution may hit the network (HF download) and counting a full
             # conversation is CPU-bound — on-loop it froze the server (#1701).
             tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+            # `messages` content here is identical to original_client_messages
+            # (the snapshot is frozen and nothing mutates messages in between),
+            # so the consistency recount before send reuses this handler-scale
+            # count instead of re-walking the whole conversation on-loop.
+            _handler_original_tokens = original_tokens
 
             # Enterprise Security: scan request before compression
             _security_ctx = None
@@ -2704,13 +2715,15 @@ class AnthropicHandlerMixin:
             # and the handler use different token estimators, and cache-mode branches
             # can leave original_tokens (handler, line ~1049) and optimized_tokens
             # (pipeline, result.tokens_after) on different scales — which produced
-            # impossible tok_after>tok_before deltas and masked real savings. Recount
-            # BOTH endpoints (pre-compression snapshot vs final outbound messages) with
-            # the handler tokenizer so the delta is meaningful. This also captures any
-            # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
+            # impossible tok_after>tok_before deltas and masked real savings. Both
+            # endpoints must come from the handler tokenizer: the original endpoint
+            # reuses the handler-scale count taken at request start (same tokenizer,
+            # identical frozen snapshot — recounting it here walked the entire
+            # conversation on-loop for a value already known), and only the final
+            # outbound messages are counted fresh. This also captures any turn-hook
+            # fold (optimized_messages is post-hook). Runs unconditionally.
             try:
-                _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
-                original_tokens = tokenizer.count_messages(_orig_snapshot)
+                original_tokens = _handler_original_tokens  # noqa: F821 (bound at request start)
                 optimized_tokens = tokenizer.count_messages(optimized_messages)
                 tokens_saved = max(0, original_tokens - optimized_tokens)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
