@@ -31,7 +31,7 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -1228,8 +1228,6 @@ class AnthropicHandlerMixin:
             )
             _image_decision.apply_to_tags(tags)
             if _image_decision.should_compress and not is_cache_mode(self.config.mode):
-                from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                 compressor = None
                 try:
                     compressor = _get_image_compressor()
@@ -1279,8 +1277,6 @@ class AnthropicHandlerMixin:
                 )
             if _decision.should_compress and not _skip_compression_for_backpressure:
                 try:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                     context_limit = self.anthropic_provider.get_context_limit(model)
                     result = None
                     biases = (
@@ -2456,7 +2452,6 @@ class AnthropicHandlerMixin:
                 "on",
             ):
                 try:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
                     from headroom.transforms.compression_units import find_content_router
                     from headroom.transforms.thinking_compactor import (
                         bills_prior_thinking,
@@ -2535,10 +2530,19 @@ class AnthropicHandlerMixin:
                 metadata={"path": pipeline_path, "stream": stream},
             )
             previous_presend_messages = optimized_messages
+            previous_presend_tools = tools
             if presend_event.messages is not None:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
-            if presend_event.tools is not None:
+            # Re-sorting costs a canonical json.dumps per tool, and emit() echoes
+            # the tools list back through the event — so with no extensions
+            # installed nothing can have changed and the already-deterministic
+            # order stands. With extensions, always re-sort: the contract allows
+            # in-place mutation, which an identity check cannot see.
+            if presend_event.tools is not None and (
+                self.pipeline_extensions.enabled
+                or presend_event.tools is not previous_presend_tools
+            ):
                 tools = self._tools_for_forwarding(
                     presend_event.tools,
                     preserve_order=preserve_tool_order,
@@ -4179,8 +4183,6 @@ class AnthropicHandlerMixin:
                     _, original_tokens = await self._count_tokens_offloaded(model, messages)
                     optimized_tokens = original_tokens
                 else:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                     # Offload off the event loop (#1701): an inline apply()
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
