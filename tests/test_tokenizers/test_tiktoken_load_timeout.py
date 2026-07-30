@@ -71,10 +71,39 @@ def test_fast_load_returns_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tc.load_encoding("fast-enc") is sentinel
 
 
+def test_offline_mode_never_calls_tiktoken_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tiktoken
+
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setattr(
+        tiktoken,
+        "get_encoding",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("offline mode attempted a tiktoken vocabulary load")
+        ),
+    )
+
+    with pytest.raises(tc.TiktokenLoadError, match="offline mode"):
+        tc.load_encoding("cold-offline-encoding")
+
+    counter = TokenizerRegistry()._create_tiktoken("gpt-4")
+    # The guarantee is "no vocabulary download attempted" — the patched
+    # get_encoding above raises if touched, so reaching here proves it. With
+    # the Rust-bundled BPE available the counter stays EXACT offline (no
+    # network involved); on a pure-Python install it degrades to estimation.
+    if tc._rust_bundled_encoding("cl100k_base") is not None:
+        assert isinstance(counter.encoding, tc._RustBundledEncoding)
+        assert counter.count_text("hello world") >= 1
+    else:
+        assert isinstance(counter, EstimatingTokenCounter)
+
+
 def test_registry_falls_back_to_estimator_on_stall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the Rust-bundled BPE, a stalled load still degrades to estimation."""
     import tiktoken
 
     monkeypatch.setattr(tiktoken, "get_encoding", _stalled_get_encoding)
+    monkeypatch.setattr(tc, "_rust_bundled_encoding", lambda _name: None)
     monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.2")
 
     counter = TokenizerRegistry()._create_tiktoken("gpt-4")

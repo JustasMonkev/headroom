@@ -19,10 +19,10 @@
   "input_sha256": "e79625ba83a6f22d3bd5d25aa779d38fa07291a4169a5d23fcf2e087d629121c",
   "output": {
     "cache_key": null,
-    "compressed": "import logging\n\ndef configure(level, handlers, fmt, propagate, capture_warnings):\n    \"\"\"Configure logging for the whole application.\"\"\"\n    logger = logging.getLogger()\n    # [9 lines omitted]\n    pass\ndef teardown(logger):\n    for handler in list(logger.handlers):\n        handler.flush()\n        handler.close()\n        logger.removeHandler(handler)\n    # [1 lines omitted]\n    pass",
+    "compressed": "import logging\n\ndef configure(level, handlers, fmt, propagate, capture_warnings):\n    \"\"\"Configure logging for the whole application.\"\"\"\n    logger = logging.getLogger()\n    # [9 lines omitted]\ndef teardown(logger):\n    for handler in list(logger.handlers):\n        handler.flush()\n        handler.close()\n        logger.removeHandler(handler)\n    # [1 lines omitted]",
     "compressed_bodies": 0,
-    "compressed_tokens": 96,
-    "compression_ratio": 0.44036697247706424,
+    "compressed_tokens": 91,
+    "compression_ratio": 0.41743119266055045,
     "language": "python",
     "language_confidence": 1.0,
     "original": "import logging\n\n\ndef configure(level, handlers, fmt, propagate, capture_warnings):\n    \"\"\"Configure logging for the whole application.\n\n    Sets up the root logger with the given level and handler list,\n    applies the format string to every handler, and toggles warning\n    capture so library warnings are routed through the logger too.\n    \"\"\"\n    logger = logging.getLogger()\n    logger.setLevel(level)\n    formatter = logging.Formatter(fmt)\n    for handler in handlers:\n        handler.setFormatter(formatter)\n        logger.addHandler(handler)\n    logger.propagate = propagate\n    logging.captureWarnings(capture_warnings)\n    logger.info(\"logging configured at level %s\", level)\n    return logger\n\n\ndef teardown(logger):\n    for handler in list(logger.handlers):\n        handler.flush()\n        handler.close()\n        logger.removeHandler(handler)\n    return logger\n",

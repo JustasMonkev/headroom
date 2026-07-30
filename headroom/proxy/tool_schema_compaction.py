@@ -164,7 +164,7 @@ def strip_semantic_params() -> bool:
 # ---------------------------------------------------------------------------
 
 _cache_lock = threading.Lock()
-_compaction_cache: dict[str, tuple[dict[str, Any], int, int]] = {}
+_compaction_cache: dict[str, tuple[Any, int, int]] = {}
 _CACHE_MAX_ENTRIES = 8
 
 
@@ -177,12 +177,12 @@ def _cache_key(tools: list[Any], *config_vals: Any) -> str:
     return h.hexdigest()[:16]
 
 
-def _cache_get(key: str) -> tuple[dict[str, Any], int, int] | None:
+def _cache_get(key: str) -> tuple[Any, int, int] | None:
     with _cache_lock:
         return _compaction_cache.get(key)
 
 
-def _cache_put(key: str, compacted: dict[str, Any], before: int, after: int) -> None:
+def _cache_put(key: str, compacted: Any, before: int, after: int) -> None:
     with _cache_lock:
         if len(_compaction_cache) >= _CACHE_MAX_ENTRIES:
             # Evict oldest entry (first key).
@@ -262,13 +262,23 @@ def compact_tools(
         if after >= before:
             return payload, False, before, after
         updated = copy.deepcopy(payload)
-        updated["tools"] = compacted_tools
+        # Hand out a copy, never the cache entry itself: _compaction_cache is a
+        # process-global keyed only on the tools digest, so it is shared across
+        # sessions and concurrent requests. Downstream stages mutate the tools
+        # they are given (inject_tool_search_deferral moving a cache_control
+        # breakpoint, for one), and an aliased entry would let one request's
+        # edit leak into every later request with the same tools.
+        updated["tools"] = copy.deepcopy(compacted_tools)
         return updated, True, before, after
 
     compacted_tools = compact_tool_schema_value(tools)
     before = _json_byte_len(tools)
     after = _json_byte_len(compacted_tools)
-    _cache_put(key, compacted_tools, before, after)
+    # Cache an isolated snapshot.  The first caller receives
+    # ``compacted_tools`` below and downstream hooks may mutate it in place;
+    # sharing that object with the process-global cache would poison every
+    # later request with the same digest.
+    _cache_put(key, copy.deepcopy(compacted_tools), before, after)
 
     if after >= before:
         return payload, False, before, after
@@ -400,13 +410,20 @@ def compact_tool_descriptions(
         if after >= before:
             return payload, False, before, after
         updated = copy.deepcopy(payload)
-        updated["tools"] = compacted_tools
+        # Hand out a copy, never the cache entry itself: _compaction_cache is a
+        # process-global keyed only on the tools digest, so it is shared across
+        # sessions and concurrent requests. Downstream stages mutate the tools
+        # they are given (inject_tool_search_deferral moving a cache_control
+        # breakpoint, for one), and an aliased entry would let one request's
+        # edit leak into every later request with the same tools.
+        updated["tools"] = copy.deepcopy(compacted_tools)
         return updated, True, before, after
 
     compacted_tools = _truncate_descriptions_in_schema(tools, max_chars, strip_sem)
     before = _json_byte_len(tools)
     after = _json_byte_len(compacted_tools)
-    _cache_put(key, compacted_tools, before, after)
+    # As in Layer 1, isolate the initial miss from the process-global cache.
+    _cache_put(key, copy.deepcopy(compacted_tools), before, after)
 
     if after >= before:
         return payload, False, before, after

@@ -597,12 +597,20 @@ async def test_execute_search_update_delete_and_handler_status(
     )
     assert search_payload["status"] == "found"
     assert search_payload["count"] == 1
+    # Scores are opt-in (include_scores); non-empty entities are included.
     assert search_payload["memories"][0] == {
         "id": "m1",
         "content": "pizza",
-        "score": 0.912,
         "entities": ["food", "italy"],
     }
+
+    scored_payload = json.loads(
+        await handler._execute_search(
+            {"query": "pizza", "include_scores": True},
+            "u1",
+        )
+    )
+    assert scored_payload["memories"][0]["score"] == 0.912
 
     assert json.loads(await handler._execute_update({}, "u1")) == {
         "status": "error",
@@ -761,7 +769,8 @@ async def test_execute_save_handles_search_failure(handler: MemoryHandler) -> No
 
     backend.raise_on = "search"
     saved = json.loads(await handler._execute_save({"content": "Useful fact"}, "u1"))
-    assert saved == {"status": "saved", "memory_id": "mem-1", "content": "Useful fact"}
+    # The saved content is not echoed back — the model just wrote it.
+    assert saved == {"status": "saved", "memory_id": "mem-1"}
 
 
 @pytest.mark.asyncio
@@ -1560,3 +1569,60 @@ async def test_memory_list_dispatched_via_execute_memory_tool(handler: MemoryHan
     payload = json.loads(out)
     assert payload["status"] == "ok"
     assert payload["memories"][0]["id"] == "m1"
+
+
+# ---------------------------------------------------------------------------
+# F4 payload hygiene (docs/token-efficiency-review.md).
+#
+# The Codex review on PR #15 flagged that only ONE of the two content previews
+# is round-trip waste. These tests pin the distinction so a future "drop the
+# previews" sweep can't take out the wrong one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_memory_save_does_not_echo_saved_content(handler: MemoryHandler) -> None:
+    """The model just wrote this content; echoing a preview back re-bills the
+    same bytes for zero information (F4)."""
+
+    class SaveBackend:
+        async def save_memory(self, **kwargs):  # noqa: ANN003
+            return SimpleNamespace(id="mem-1", content=kwargs["content"], metadata={})
+
+        async def search_memories(self, **kwargs):  # noqa: ANN003
+            return []
+
+    handler._backend = SaveBackend()  # type: ignore[assignment]
+    handler._initialized = True
+
+    payload = json.loads(
+        await handler._execute_save(
+            {"content": "a distinctive fact worth remembering", "importance": 0.8}, "u1"
+        )
+    )
+    assert payload["status"] == "saved"
+    assert payload["memory_id"] == "mem-1"
+    assert "content" not in payload
+    assert "distinctive fact" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_list_all_memories_keeps_content_preview(handler: MemoryHandler) -> None:
+    """`view /memories/all` renders ONLY previews — they are the identifying
+    payload of the listing, not an echo. Dropping them (as the round-2 report
+    suggested for :1267) would leave the listing unusable: the model would see
+    numbered blank rows."""
+
+    class ListBackend:
+        async def search_memories(self, **kwargs):  # noqa: ANN003
+            return [
+                make_result("mem-1", "user prefers dark mode"),
+                make_result("mem-2", "deploys run on Tuesdays"),
+            ]
+
+    handler._backend = ListBackend()  # type: ignore[assignment]
+    handler._initialized = True
+
+    out = await handler._list_all_memories("u1", limit=20)
+    assert "user prefers dark mode" in out
+    assert "deploys run on Tuesdays" in out

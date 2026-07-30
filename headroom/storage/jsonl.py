@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import RequestMetrics
 from ..utils import format_timestamp, parse_timestamp
 from .base import Storage
+
+
+def _utc_key(ts: datetime) -> datetime:
+    """Comparable UTC form of a possibly-naive timestamp.
+
+    A long-lived file can mix naive and timezone-aware timestamps
+    (parse_timestamp keeps a "+00:00" offset but strips "Z"), and comparing
+    the two raises TypeError. Naive values are treated as UTC — the
+    convention format_timestamp writes.
+    """
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
 class JSONLStorage(Storage):
@@ -101,35 +113,43 @@ class JSONLStorage(Storage):
         limit: int = 100,
         offset: int = 0,
     ) -> list[RequestMetrics]:
-        """Query metrics with filters."""
-        results: list[RequestMetrics] = []
-        skipped = 0
+        """Query metrics with filters.
 
-        for metrics in self.iter_all():
-            # Apply filters
-            if start_time is not None and metrics.timestamp < start_time:
-                continue
-            if end_time is not None and metrics.timestamp > end_time:
-                continue
-            if model is not None and metrics.model != model:
-                continue
-            if mode is not None and metrics.mode != mode:
-                continue
+        Ordering must be applied before offset/limit: the file is in append
+        (ascending) order, so slicing first would return the OLDEST matches —
+        the opposite of SQLiteStorage's ``ORDER BY timestamp DESC LIMIT ?
+        OFFSET ?``, which this backend must mirror (both sit behind the same
+        Storage interface). A bounded heap keeps only the newest
+        ``offset + limit`` matches so memory doesn't grow with full history.
+        """
+        page_end = offset + limit
+        if page_end <= 0:
+            return []
 
-            # Handle offset
-            if skipped < offset:
-                skipped += 1
-                continue
+        # Normalize BOTH the filter bounds and each record's timestamp: the
+        # file can mix naive and aware timestamps (see _utc_key), and a raw
+        # comparison between the two raises TypeError — since paging exhausts
+        # the history, one mismatched old record would break every page.
+        start_key = _utc_key(start_time) if start_time is not None else None
+        end_key = _utc_key(end_time) if end_time is not None else None
 
-            results.append(metrics)
+        def _matches() -> Any:
+            for idx, metrics in enumerate(self.iter_all()):
+                ts = _utc_key(metrics.timestamp)
+                if start_key is not None and ts < start_key:
+                    continue
+                if end_key is not None and ts > end_key:
+                    continue
+                if model is not None and metrics.model != model:
+                    continue
+                if mode is not None and metrics.mode != mode:
+                    continue
+                # Tie-break equal timestamps by earlier file position first,
+                # matching the previous stable descending sort.
+                yield (ts, -idx), metrics
 
-            # Handle limit
-            if len(results) >= limit:
-                break
-
-        # Sort by timestamp descending
-        results.sort(key=lambda m: m.timestamp, reverse=True)
-        return results
+        newest = heapq.nlargest(page_end, _matches(), key=lambda pair: pair[0])
+        return [metrics for _, metrics in newest[offset:]]
 
     def count(
         self,
@@ -140,11 +160,14 @@ class JSONLStorage(Storage):
     ) -> int:
         """Count metrics matching filters."""
         count = 0
+        start_key = _utc_key(start_time) if start_time is not None else None
+        end_key = _utc_key(end_time) if end_time is not None else None
 
         for metrics in self.iter_all():
-            if start_time is not None and metrics.timestamp < start_time:
+            ts = _utc_key(metrics.timestamp)
+            if start_key is not None and ts < start_key:
                 continue
-            if end_time is not None and metrics.timestamp > end_time:
+            if end_key is not None and ts > end_key:
                 continue
             if model is not None and metrics.model != model:
                 continue
@@ -159,16 +182,30 @@ class JSONLStorage(Storage):
         if not Path(self.file_path).exists():
             return
 
-        with open(self.file_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+        # Binary mode with per-line strict decoding: in text mode a torn
+        # multibyte write raises UnicodeDecodeError inside the file ITERATOR,
+        # before any except around the body can catch it — and query()
+        # exhausts the full history, so one damaged byte would break every
+        # page.
+        with open(self.file_path, "rb") as f:
+            for raw in f:
                 try:
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
                     data = json.loads(line)
                     yield self._dict_to_metrics(data)
-                except json.JSONDecodeError:
-                    # Skip malformed lines
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    ValueError,
+                    TypeError,
+                ):
+                    # Skip undecodable and malformed lines AND structurally
+                    # invalid records (missing required fields -> KeyError,
+                    # bad timestamps -> ValueError): a single bad record
+                    # anywhere in the history must not break every page.
                     continue
 
     def get_summary_stats(
@@ -183,11 +220,14 @@ class JSONLStorage(Storage):
         total_cache_alignment = 0.0
         audit_count = 0
         optimize_count = 0
+        start_key = _utc_key(start_time) if start_time is not None else None
+        end_key = _utc_key(end_time) if end_time is not None else None
 
         for metrics in self.iter_all():
-            if start_time is not None and metrics.timestamp < start_time:
+            ts = _utc_key(metrics.timestamp)
+            if start_key is not None and ts < start_key:
                 continue
-            if end_time is not None and metrics.timestamp > end_time:
+            if end_key is not None and ts > end_key:
                 continue
 
             total_requests += 1

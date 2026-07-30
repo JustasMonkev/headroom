@@ -49,8 +49,18 @@ RAG_PATTERN = re.compile("|".join(RAG_MARKERS), re.IGNORECASE)
 
 
 def compute_hash(text: str) -> str:
-    """Compute hash of text, truncated to 16 chars."""
-    return hashlib.md5(text.encode()).hexdigest()[:16]  # nosec B324
+    """Compute hash of text, truncated to 16 chars.
+
+    ``surrogatepass`` because ``json.loads`` legitimately produces lone
+    surrogates (e.g. a clipped emoji ``"\\ud83d"`` in tool output); strict
+    UTF-8 would raise UnicodeEncodeError here and abort the whole request
+    before it reaches the provider.
+    """
+    return hashlib.md5(
+        text.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[  # nosec B324
+        :16
+    ]
 
 
 def _coerce_tool_call_to_dict(tc: Any) -> dict[str, Any]:

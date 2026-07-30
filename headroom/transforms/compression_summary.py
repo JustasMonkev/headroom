@@ -91,8 +91,14 @@ def summarize_compressed_code(
         compressed_bodies_count: Number of bodies that were compressed.
 
     Returns:
-        Summary string like "5 bodies compressed: authenticate(), validate_token(), ..."
-        or empty string.
+        Summary string like "5 bodies: authenticate, validate_token" or empty
+        string.
+
+    The phrasing is deliberately bare. This lands inside a marker that already
+    opens with "N tokens compressed", so a second "compressed" was a duplicate
+    verb; the `()` suffix cost ~1 token per name to say "function", which the
+    word "bodies" already said; and `(+3 more)` cost ~5 tokens to announce that
+    a list of examples is a list of examples.
     """
     if not function_bodies or compressed_bodies_count == 0:
         return ""
@@ -105,17 +111,15 @@ def summarize_compressed_code(
             names.append(name)
 
     if not names:
-        return f"{compressed_bodies_count} function bodies compressed"
+        return f"{compressed_bodies_count} bodies"
 
-    # Show up to 6 names
-    shown = names[:6]
-    result = f"{compressed_bodies_count} bodies compressed: {', '.join(shown)}"
-    if len(names) > 6:
-        result += f" (+{len(names) - 6} more)"
-    return result
+    return f"{compressed_bodies_count} bodies: {', '.join(names[:_MAX_NAMES_LISTED])}"
 
 
 # ---- Internal helpers ----
+
+# Names listed in a compressed-code summary. Examples, not an index.
+_MAX_NAMES_LISTED = 6
 
 # Fields that commonly indicate item category/type
 _CATEGORY_FIELDS = (
@@ -219,16 +223,19 @@ def _extract_name_from_signature(sig: str) -> str:
     - Go: "func (s *Server) HandleRequest("
     - Rust: "fn authenticate("
     - Java/C++: "public void authenticate("
+
+    Returns a BARE name. The `()` suffix this used to append cost ~1 token per
+    name to say "this is a function", which the caller's wording already says.
     """
     # Try common function definition patterns
     match = re.search(r"(?:def|func|fn|function)\s+(?:\([^)]*\)\s*)?(\w+)", sig)
     if match:
-        return match.group(1) + "()"
+        return match.group(1)
 
     # Try method patterns: "public static void methodName("
     match = re.search(r"(?:public|private|protected|static|async|export)\s+.*?(\w+)\s*\(", sig)
     if match:
-        return match.group(1) + "()"
+        return match.group(1)
 
     # Try class patterns
     match = re.search(r"class\s+(\w+)", sig)
@@ -238,6 +245,6 @@ def _extract_name_from_signature(sig: str) -> str:
     # Fallback: last word before (
     match = re.search(r"(\w+)\s*\(", sig)
     if match:
-        return match.group(1) + "()"
+        return match.group(1)
 
     return ""

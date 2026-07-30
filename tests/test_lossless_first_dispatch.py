@@ -9,8 +9,10 @@ its byte-exact fold — the lossless floor is never discarded by a later lossy
 stage.
 """
 
+from types import SimpleNamespace
+
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import search_fold_recovers
 
 
 def _grep_block() -> str:
@@ -66,10 +68,28 @@ def test_flag_on_search_folds_lossless_byte_exact():
     assert was is True
     assert tr == ["router:tool_result:lossless_search"]
     assert len(out) < len(block)
-    # word count is flat/higher -> the old word-ratio gate would have rejected it
-    assert len(out.split()) >= len(block.split())
     # fully recoverable
-    assert search_unheading(out) == block
+    assert search_fold_recovers(out, block)
+
+
+def test_flag_on_search_fold_accepted_when_word_count_is_flat():
+    # The regression this guards: acceptance is a BYTE reduction, not a word
+    # reduction. Distinct bodies give the tree fold nothing to collapse beyond
+    # the paths, so word count stays flat/rises while bytes drop — exactly what
+    # the old word-ratio gate rejected.
+    block = (
+        "\n".join(
+            f"src/services/wallet/overdraft/handler_{ln}.py:{ln}:    step_{ln} = resolve(ln_{ln})"
+            for ln in range(1, 40)
+        )
+        + "\n"
+    )
+    out, was, tr = _compress(block, lossless=True)
+    assert was is True
+    assert tr == ["router:tool_result:lossless_search"]
+    assert len(out) < len(block)
+    assert len(out.split()) >= len(block.split())
+    assert search_fold_recovers(out, block)
 
 
 def test_flag_on_search_fold_is_deterministic():
@@ -91,7 +111,7 @@ def test_flag_off_still_keeps_lossless_floor_for_foldable():
     out, was, tr = _compress(block, lossless=False)
     assert was is True
     assert tr == ["router:tool_result:lossless_search"]
-    assert search_unheading(out) == block
+    assert search_fold_recovers(out, block)
 
 
 def test_has_lossless_fold_admits_small_block_below_size_floor():
@@ -129,3 +149,35 @@ def test_lossless_mode_non_foldable_is_lossless_noop_not_ratio_too_high():
     assert was is False
     assert rc.get("lossless_noop", 0) >= 1
     assert rc.get("ratio_too_high", 0) == 0
+
+
+def test_token_larger_lossless_chain_cannot_fall_through_or_poison_cache():
+    router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False))
+    original, candidate = "original", "candidate"
+    router._runtime_tokenizer = SimpleNamespace(
+        count_text=lambda text: {original: 10, candidate: 11}[text]
+    )
+    router.compress = lambda *args, **kwargs: SimpleNamespace(
+        compressed=candidate,
+        strategy_chain=["lossless_log", "kompress"],
+        strategy_used=SimpleNamespace(value="log"),
+        compression_ratio=0.1,
+    )
+
+    for _ in range(2):
+        transforms: list[str] = []
+        out, was = router._compress_block_content(
+            original,
+            hash(original),
+            "",
+            1.0,
+            1.0,
+            None,
+            transforms,
+            {},
+            [],
+            "tool_result",
+            "tool",
+            True,
+        )
+        assert (out, was, transforms) == (None, False, [])

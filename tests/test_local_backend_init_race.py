@@ -15,11 +15,13 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from headroom.memory.adapters.graph import InMemoryGraphStore
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 
 
@@ -88,3 +90,25 @@ async def test_cancelled_cold_start_resets_state_and_retries(tmp_path, monkeypat
     assert backend._initialized is True
     assert backend._hierarchical_memory is not None
     assert attempts["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_save_memory_accepts_legacy_relation_alias(tmp_path):
+    backend = _backend(tmp_path)
+    backend._initialized = True
+    backend._hierarchical_memory = SimpleNamespace(
+        add=AsyncMock(return_value=SimpleNamespace(id="memory-1"))
+    )
+    backend._graph = InMemoryGraphStore()
+
+    await backend.save_memory(
+        content="Alice works at Acme",
+        user_id="alice",
+        entities=["Alice", "Acme"],
+        relationships=[{"source": "Alice", "target": "Acme", "relation": "works_at"}],
+    )
+
+    alice = await backend._graph.get_entity_by_name("alice", "Alice")
+    assert alice is not None
+    relationships = await backend._graph.get_relationships(alice.id)
+    assert [relationship.relation_type for relationship in relationships] == ["works_at"]

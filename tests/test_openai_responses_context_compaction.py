@@ -505,3 +505,117 @@ def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
     assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
     assert tokens_saved > 0  # ...and the message-fold saving is counted
     assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)
+
+
+def test_tool_schema_savings_are_not_double_counted(monkeypatch) -> None:
+    """F11: layer 1 (schema compaction) and layer 2 (description truncation)
+    both rewrite ``working["tools"]``. Measuring each against the ORIGINAL
+    payload counted layer 1's reduction twice. Each stage must be measured
+    against the preceding stage, so the total equals ``original - final``."""
+    from headroom.proxy import tool_schema_compaction as _tsc
+    from headroom.proxy.handlers.openai import _json_debug_dumps
+
+    # `tool_desc_max_chars()` memoizes the env var per-process, so set the
+    # resolved value directly.
+    monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "40")
+    monkeypatch.setattr(_tsc, "_TOOL_DESC_MAX_CHARS", 40, raising=False)
+
+    verbose = " ".join(["Use this tool to read a file from the workspace."] * 40)
+    tools = [
+        {
+            "type": "function",
+            "name": f"read_file_{i}",
+            "description": verbose,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": verbose,
+                        "examples": ["a/b.py", "c/d.py"],
+                    }
+                },
+                "required": ["path"],
+            },
+        }
+        for i in range(3)
+    ]
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "tools": tools,
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ],
+    }
+
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    working, _modified, tokens_saved, transforms, *_ = handler._compress_openai_responses_payload(
+        payload, model="gpt-5.5", request_id="hr_f11"
+    )
+
+    # Both layers must have run — otherwise the double-count can't happen and
+    # the test would pass vacuously.
+    assert "openai:responses:tool_schema_compaction" in transforms
+    assert "openai:responses:tool_desc_compaction" in transforms
+
+    counter = _StubTokenizer()
+    expected = counter.count_text(_json_debug_dumps(payload["tools"])) - counter.count_text(
+        _json_debug_dumps(working["tools"])
+    )
+    assert expected > 0
+    assert tokens_saved == expected, (
+        f"tool-schema savings double-counted: reported {tokens_saved}, actual {expected}"
+    )
+
+
+def test_unmodified_payload_reuses_the_input_serialization() -> None:
+    """F10: nothing changed => `working is payload`, so the second full
+    `json.dumps` of the whole request is redundant. Reusing the input bytes
+    must keep the reported byte totals exact."""
+    import json as _json
+
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ],
+    }
+
+    working, modified, _saved, _transforms, _reason, in_bytes, out_bytes, _att = (
+        handler._compress_openai_responses_payload(payload, model="gpt-5.5", request_id="hr_f10")
+    )
+
+    assert modified is False
+    assert working is payload
+    assert in_bytes == out_bytes == len(_json.dumps(payload).encode("utf-8"))
+
+
+def test_modified_payload_still_reports_its_own_output_bytes() -> None:
+    import json as _json
+
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": " ".join(["compressible"] * 400),
+            }
+        ],
+    }
+
+    working, modified, _saved, _transforms, _reason, in_bytes, out_bytes, _att = (
+        handler._compress_openai_responses_payload(payload, model="gpt-5.5", request_id="hr_f10b")
+    )
+    if modified:
+        assert working is not payload
+        assert out_bytes == len(_json.dumps(working).encode("utf-8"))
+        assert out_bytes != in_bytes

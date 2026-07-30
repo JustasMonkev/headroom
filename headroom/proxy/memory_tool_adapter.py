@@ -32,6 +32,16 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from headroom.memory.tools import (
+    EXTRACTED_ENTITY_ITEM_SCHEMA,
+    EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
+    MEMORY_DELETE_DESCRIPTION,
+    MEMORY_ID_PARAM_DESCRIPTION,
+    MEMORY_SAVE_DESCRIPTION,
+    MEMORY_SEARCH_DESCRIPTION,
+    MEMORY_UPDATE_DESCRIPTION,
+)
+
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
 
@@ -73,63 +83,39 @@ ANTHROPIC_NATIVE_TOOL: dict[str, Any] = {
 ANTHROPIC_CUSTOM_TOOLS: list[dict[str, Any]] = [
     {
         "name": "memory_save",
-        "description": """Save important information to long-term memory for future reference.
-
-Use this tool when you encounter information that should be remembered across conversations:
-- User preferences (e.g., "prefers Python over JavaScript")
-- Personal facts (e.g., "works at Acme Corp", "has a dog named Max")
-- Project context (e.g., "working on a CLI tool", "using React 18")
-- Decisions made (e.g., "chose PostgreSQL for the database")
-- Important relationships (e.g., "Alice is Bob's manager")
-
-DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""",
+        "description": MEMORY_SAVE_DESCRIPTION,
         "input_schema": {
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The information to remember. Be specific and self-contained.",
+                    "description": "What to remember. Specific and self-contained.",
                 },
                 "importance": {
                     "type": "number",
                     "minimum": 0.0,
                     "maximum": 1.0,
-                    "description": "Importance score from 0.0 (low) to 1.0 (critical).",
+                    "description": "0.0 (low) to 1.0 (critical). Ranks recall order.",
                 },
                 "facts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Pre-extracted discrete facts for efficient storage.",
+                    "description": "Pre-extracted self-contained facts, one per string.",
                 },
                 "entities": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Entity names referenced in this memory.",
+                    "description": "Entity names referenced, e.g. ['Alice', 'Project X'].",
                 },
                 "extracted_entities": {
                     "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "entity": {"type": "string"},
-                            "entity_type": {"type": "string"},
-                        },
-                        "required": ["entity", "entity_type"],
-                    },
-                    "description": "Pre-extracted entities with types.",
+                    "items": EXTRACTED_ENTITY_ITEM_SCHEMA,
+                    "description": "Typed entities for graph storage.",
                 },
                 "extracted_relationships": {
                     "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source": {"type": "string"},
-                            "relationship": {"type": "string"},
-                            "destination": {"type": "string"},
-                        },
-                        "required": ["source", "relationship", "destination"],
-                    },
-                    "description": "Pre-extracted relationships for graph storage.",
+                    "items": EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
+                    "description": "Graph links between entities.",
                 },
             },
             "required": ["content", "importance"],
@@ -137,36 +123,32 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
     },
     {
         "name": "memory_search",
-        "description": """Search stored memories to recall relevant information.
-
-Use this tool to retrieve previously saved information before responding to questions about:
-- User preferences or past decisions
-- Personal or professional context
-- Previously discussed topics or projects
-- Relationships between people, systems, or concepts
-
-Search BEFORE saving to avoid duplicates.""",
+        "description": MEMORY_SEARCH_DESCRIPTION,
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language search query.",
+                    "description": "Natural language description of what you are looking for.",
                 },
                 "entities": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Filter to memories mentioning these entities.",
+                    "description": "Only return memories mentioning these entities.",
                 },
                 "include_related": {
                     "type": "boolean",
-                    "description": "Also retrieve connected memories.",
+                    "description": "Also return linked memories.",
+                },
+                "include_scores": {
+                    "type": "boolean",
+                    "description": "Return relevance scores (default false).",
                 },
                 "top_k": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 50,
-                    "description": "Maximum number of memories to retrieve (default 10).",
+                    "description": "Max results (default 10).",
                 },
             },
             "required": ["query"],
@@ -174,26 +156,21 @@ Search BEFORE saving to avoid duplicates.""",
     },
     {
         "name": "memory_update",
-        "description": """Update an existing memory with corrected or evolved information.
-
-Use when:
-- User provides a correction to stored information
-- Information has changed over time
-- Adding detail or clarification to an existing memory""",
+        "description": MEMORY_UPDATE_DESCRIPTION,
         "input_schema": {
             "type": "object",
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "The unique ID of the memory to update.",
+                    "description": MEMORY_ID_PARAM_DESCRIPTION,
                 },
                 "new_content": {
                     "type": "string",
-                    "description": "The updated content.",
+                    "description": "Replacement content. Complete and self-contained.",
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Explanation for the update.",
+                    "description": "Why, for the audit trail (e.g. 'user correction').",
                 },
             },
             "required": ["memory_id", "new_content"],
@@ -201,22 +178,17 @@ Use when:
     },
     {
         "name": "memory_delete",
-        "description": """Delete a memory that is no longer relevant or was stored in error.
-
-Use when:
-- User explicitly asks to forget something
-- Information is outdated and no longer applicable
-- A memory was saved in error""",
+        "description": MEMORY_DELETE_DESCRIPTION,
         "input_schema": {
             "type": "object",
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "The unique ID of the memory to delete.",
+                    "description": MEMORY_ID_PARAM_DESCRIPTION,
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Explanation for the deletion.",
+                    "description": "Why, for the audit trail (e.g. 'user request').",
                 },
             },
             "required": ["memory_id"],
@@ -233,59 +205,39 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "memory_save",
-            "description": """Save important information to long-term memory for future reference.
-
-Use this tool when you encounter information that should be remembered across conversations:
-- User preferences, personal facts, project context, decisions, relationships
-
-DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""",
+            "description": MEMORY_SAVE_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "The information to remember. Be specific and self-contained.",
+                        "description": "What to remember. Specific and self-contained.",
                     },
                     "importance": {
                         "type": "number",
                         "minimum": 0.0,
                         "maximum": 1.0,
-                        "description": "Importance score from 0.0 (low) to 1.0 (critical).",
+                        "description": "0.0 (low) to 1.0 (critical). Ranks recall order.",
                     },
                     "facts": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Pre-extracted discrete facts.",
+                        "description": "Pre-extracted self-contained facts, one per string.",
                     },
                     "entities": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Entity names referenced in this memory.",
+                        "description": "Entity names referenced, e.g. ['Alice', 'Project X'].",
                     },
                     "extracted_entities": {
                         "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "entity": {"type": "string"},
-                                "entity_type": {"type": "string"},
-                            },
-                            "required": ["entity", "entity_type"],
-                        },
-                        "description": "Pre-extracted entities with types.",
+                        "items": EXTRACTED_ENTITY_ITEM_SCHEMA,
+                        "description": "Typed entities for graph storage.",
                     },
                     "extracted_relationships": {
                         "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "source": {"type": "string"},
-                                "relationship": {"type": "string"},
-                                "destination": {"type": "string"},
-                            },
-                            "required": ["source", "relationship", "destination"],
-                        },
-                        "description": "Pre-extracted relationships.",
+                        "items": EXTRACTED_RELATIONSHIP_ITEM_SCHEMA,
+                        "description": "Graph links between entities.",
                     },
                 },
                 "required": ["content", "importance"],
@@ -296,28 +248,32 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
         "type": "function",
         "function": {
             "name": "memory_search",
-            "description": "Search stored memories to recall relevant information.",
+            "description": MEMORY_SEARCH_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Natural language search query.",
+                        "description": "Natural language description of what you are looking for.",
                     },
                     "entities": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Filter to memories mentioning these entities.",
+                        "description": "Only return memories mentioning these entities.",
                     },
                     "include_related": {
                         "type": "boolean",
-                        "description": "Also retrieve connected memories.",
+                        "description": "Also return linked memories.",
+                    },
+                    "include_scores": {
+                        "type": "boolean",
+                        "description": "Return relevance scores (default false).",
                     },
                     "top_k": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 50,
-                        "description": "Maximum number of memories to retrieve.",
+                        "description": "Max results (default 10).",
                     },
                 },
                 "required": ["query"],
@@ -328,21 +284,21 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
         "type": "function",
         "function": {
             "name": "memory_update",
-            "description": "Update an existing memory with corrected or evolved information.",
+            "description": MEMORY_UPDATE_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "memory_id": {
                         "type": "string",
-                        "description": "The unique ID of the memory to update.",
+                        "description": MEMORY_ID_PARAM_DESCRIPTION,
                     },
                     "new_content": {
                         "type": "string",
-                        "description": "The updated content.",
+                        "description": "Replacement content. Complete and self-contained.",
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Explanation for the update.",
+                        "description": "Why, for the audit trail (e.g. 'user correction').",
                     },
                 },
                 "required": ["memory_id", "new_content"],
@@ -353,17 +309,17 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
         "type": "function",
         "function": {
             "name": "memory_delete",
-            "description": "Delete a memory that is no longer relevant.",
+            "description": MEMORY_DELETE_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "memory_id": {
                         "type": "string",
-                        "description": "The unique ID of the memory to delete.",
+                        "description": MEMORY_ID_PARAM_DESCRIPTION,
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Explanation for the deletion.",
+                        "description": "Why, for the audit trail (e.g. 'user request').",
                     },
                 },
                 "required": ["memory_id"],
@@ -380,32 +336,27 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
 GEMINI_TOOLS: list[dict[str, Any]] = [
     {
         "name": "memory_save",
-        "description": """Save important information to long-term memory for future reference.
-
-Use this tool when you encounter information that should be remembered across conversations:
-- User preferences, personal facts, project context, decisions, relationships
-
-DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""",
+        "description": MEMORY_SAVE_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The information to remember. Be specific and self-contained.",
+                    "description": "What to remember. Specific and self-contained.",
                 },
                 "importance": {
                     "type": "number",
-                    "description": "Importance score from 0.0 (low) to 1.0 (critical).",
+                    "description": "0.0 (low) to 1.0 (critical). Ranks recall order.",
                 },
                 "facts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Pre-extracted discrete facts.",
+                    "description": "Pre-extracted self-contained facts, one per string.",
                 },
                 "entities": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Entity names referenced in this memory.",
+                    "description": "Entity names referenced, e.g. ['Alice', 'Project X'].",
                 },
             },
             "required": ["content", "importance"],
@@ -413,26 +364,30 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
     },
     {
         "name": "memory_search",
-        "description": "Search stored memories to recall relevant information.",
+        "description": MEMORY_SEARCH_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language search query.",
+                    "description": "Natural language description of what you are looking for.",
                 },
                 "entities": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Filter to memories mentioning these entities.",
+                    "description": "Only return memories mentioning these entities.",
                 },
                 "include_related": {
                     "type": "boolean",
-                    "description": "Also retrieve connected memories.",
+                    "description": "Also return linked memories.",
+                },
+                "include_scores": {
+                    "type": "boolean",
+                    "description": "Return relevance scores (default false).",
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Maximum number of memories to retrieve.",
+                    "description": "Max results (default 10).",
                 },
             },
             "required": ["query"],
@@ -440,21 +395,21 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
     },
     {
         "name": "memory_update",
-        "description": "Update an existing memory with corrected or evolved information.",
+        "description": MEMORY_UPDATE_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "The unique ID of the memory to update.",
+                    "description": MEMORY_ID_PARAM_DESCRIPTION,
                 },
                 "new_content": {
                     "type": "string",
-                    "description": "The updated content.",
+                    "description": "Replacement content. Complete and self-contained.",
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Explanation for the update.",
+                    "description": "Why, for the audit trail (e.g. 'user correction').",
                 },
             },
             "required": ["memory_id", "new_content"],
@@ -462,17 +417,17 @@ DO NOT save: transient info, sensitive data (passwords, keys), redundant info.""
     },
     {
         "name": "memory_delete",
-        "description": "Delete a memory that is no longer relevant.",
+        "description": MEMORY_DELETE_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "The unique ID of the memory to delete.",
+                    "description": MEMORY_ID_PARAM_DESCRIPTION,
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Explanation for the deletion.",
+                    "description": "Why, for the audit trail (e.g. 'user request').",
                 },
             },
             "required": ["memory_id"],
@@ -1198,23 +1153,24 @@ To SAVE: create /memories/<topic>.txt "content"
             entities=entities_filter,
         )
 
+        # Scores and entities are opt-in, matching MemoryHandler._execute_search:
+        # results are already relevance-ordered, so per-row scores rarely change
+        # model behavior, and empty entity lists were pure ballast.
+        include_scores = bool(input_data.get("include_scores", False))
+        memories: list[dict[str, Any]] = []
+        for r in results:
+            entry: dict[str, Any] = {"id": r.memory.id, "content": r.memory.content}
+            if include_scores:
+                entry["score"] = round(r.score, 3)
+            if getattr(r, "related_entities", None):
+                entry["entities"] = r.related_entities[:5]
+            memories.append(entry)
+
         return json.dumps(
             {
                 "status": "found",
-                "count": len(results),
-                "memories": [
-                    {
-                        "id": r.memory.id,
-                        "content": r.memory.content,
-                        "score": round(r.score, 3),
-                        "entities": (
-                            r.related_entities[:5]
-                            if hasattr(r, "related_entities") and r.related_entities
-                            else []
-                        ),
-                    }
-                    for r in results
-                ],
+                "count": len(memories),
+                "memories": memories,
             }
         )
 

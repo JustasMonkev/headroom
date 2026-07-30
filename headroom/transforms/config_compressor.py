@@ -212,7 +212,9 @@ class ConfigCompressor:
         if data is None:
             return None
         try:
-            json_str = json.dumps(data, ensure_ascii=False, default=_json_default)
+            json_str = json.dumps(
+                data, separators=(",", ":"), ensure_ascii=False, default=_json_default
+            )
         except TypeError:
             return None  # a value we can't represent faithfully → don't fold
 

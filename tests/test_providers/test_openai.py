@@ -2,12 +2,42 @@
 
 import pytest
 
+import headroom.providers.openai as openai_module
 from headroom.providers.openai import (
+    OpenAIProvider,
     _get_encoding_name_for_model,
 )
+from headroom.tokenizers import tiktoken_counter
+from headroom.tokenizers.estimator import EstimatingTokenCounter
 
 
 class TestOpenAITokenCounting:
+    def test_offline_provider_uses_estimator_without_loading_tiktoken(self, monkeypatch):
+        import tiktoken
+
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        openai_module._get_encoding.cache_clear()
+        tiktoken_counter._get_encoding.cache_clear()
+        monkeypatch.setattr(
+            tiktoken,
+            "get_encoding",
+            lambda _name: (_ for _ in ()).throw(
+                AssertionError("offline provider attempted a vocabulary load")
+            ),
+        )
+
+        counter = OpenAIProvider().get_token_counter("gpt-4o")
+
+        # The guarantee is "no vocabulary download attempted" — the patched
+        # get_encoding above raises if touched, so reaching here proves it.
+        # With the Rust-bundled BPE available the counter stays EXACT offline
+        # (no network involved); on a pure-Python install it degrades to
+        # estimation.
+        if tiktoken_counter._rust_bundled_encoding("o200k_base") is not None:
+            assert counter.count_text("Hello, world!") == 4  # exact o200k count
+        else:
+            assert isinstance(counter, EstimatingTokenCounter)
+
     def test_count_text_empty(self, openai_tokenizer):
         assert openai_tokenizer.count_text("") == 0
 

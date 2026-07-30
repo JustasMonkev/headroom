@@ -277,6 +277,11 @@ class ProxyConfig:
     # Read lifecycle management
     read_lifecycle: bool = True
 
+    # Completed tool-call INPUT compaction (opt-in; also enabled via
+    # HEADROOM_COMPACT_TOOL_INPUTS=1). Replaces large historical tool-call
+    # arguments with CCR markers once their results have arrived.
+    compact_tool_inputs: bool = False
+
     # Mechanism B: activity-based read maturation (hold fresh Reads out of
     # the provider prefix cache; compress once their file quiesces).
     # Experimental — default off. CLI: --read-maturation;
@@ -432,9 +437,13 @@ class ProxyConfig:
     # to the pod network. Env: HEADROOM_PROXY_TOKEN.
     proxy_token: str | None = None
 
-    # Air-gap master switch — hard-disable ALL outbound network egress
-    # (telemetry beacon, update check, license/usage reporter, HuggingFace model
-    # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.
+    # Auxiliary-egress master switch — hard-disable Headroom's own outbound
+    # network calls (telemetry beacon, update check, license/usage reporter,
+    # HuggingFace model downloads) for regulated deployments.
+    # Env: HEADROOM_OFFLINE=1.
+    #
+    # Does NOT block provider forwarding: requests still reach the configured
+    # upstream unless that upstream is itself local. See headroom/offline.py.
     offline: bool = False
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.

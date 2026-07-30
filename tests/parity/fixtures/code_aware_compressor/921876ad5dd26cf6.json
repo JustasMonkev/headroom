@@ -19,10 +19,10 @@
   "input_sha256": "921876ad5dd26cf623a97a7668ec4a1026f9f8b4e2d97af154943f29482c160c",
   "output": {
     "cache_key": null,
-    "compressed": "from collections import defaultdict\n\ndef build_index(records):\n    index = defaultdict(list)\n    # [8 lines omitted]\n    pass\ndef merge(a, b):\n    out = dict(a)\n    # [3 lines omitted]\n    pass",
+    "compressed": "from collections import defaultdict\n\ndef build_index(records):\n    index = defaultdict(list)\n    # [8 lines omitted]\ndef merge(a, b):\n    out = dict(a)\n    # [3 lines omitted]",
     "compressed_bodies": 0,
-    "compressed_tokens": 48,
-    "compression_ratio": 0.46601941747572817,
+    "compressed_tokens": 43,
+    "compression_ratio": 0.4174757281553398,
     "language": "python",
     "language_confidence": 1.0,
     "original": "from collections import defaultdict\n\n\ndef build_index(records):\n    index = defaultdict(list)\n    for rec in records:\n        key = rec.get(\"id\")\n        if key is None:\n            continue\n        index[key].append(rec)\n        if len(index[key]) > 100:\n            index[key] = index[key][:100]\n    return index\n\n\ndef merge(a, b):\n    out = dict(a)\n    for k, v in b.items():\n        out[k] = v\n    return out\n",

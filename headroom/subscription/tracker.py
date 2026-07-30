@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.offline import is_offline
 from headroom.subscription.base import QuotaTracker
 from headroom.subscription.client import SubscriptionClient
 from headroom.subscription.models import (
@@ -230,7 +231,7 @@ class SubscriptionTracker(QuotaTracker):
 
     def is_available(self) -> bool:
         """Returns ``True`` when subscription tracking is enabled in config."""
-        return self._enabled
+        return self._enabled and not is_offline()
 
     def get_stats(self) -> dict[str, Any] | None:
         """Return current tracker state dict for ``/stats``."""
@@ -242,6 +243,9 @@ class SubscriptionTracker(QuotaTracker):
 
     async def start(self) -> None:
         """Start the background polling loop."""
+        if not self.is_available():
+            logger.info("Subscription tracker disabled by config or offline mode")
+            return
         if self._poll_task and not self._poll_task.done():
             return
         self._stop_event = asyncio.Event()
@@ -669,6 +673,9 @@ class SubscriptionTracker(QuotaTracker):
         keeping fleet-wide poll rate within Anthropic tolerance. All
         exceptions are swallowed and logged — never propagated.
         """
+        if not self.is_available():
+            return
+
         now_ts = time.time()
         with self._lock:
             elapsed = now_ts - self._last_on_demand_poll
@@ -721,6 +728,11 @@ class SubscriptionTracker(QuotaTracker):
                 pass  # normal: poll interval elapsed
 
     async def _maybe_poll(self) -> None:
+        # Defense in depth for direct callers and a process that enters offline
+        # mode after the background task was created.
+        if not self.is_available():
+            return
+
         with self._lock:
             is_active = self._state.is_active(active_window_s=self._active_window_s)
             token = self._current_token

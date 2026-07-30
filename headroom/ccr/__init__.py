@@ -57,6 +57,8 @@ from .tool_calls import (
     tool_call_id_for_provider,
 )
 from .tool_injection import (
+    CCR_RETRIEVE_DESCRIPTION,
+    CCR_SYSTEM_INSTRUCTIONS,
     CCR_TOOL_NAME,
     CCRToolInjector,
     create_ccr_tool_definition,
@@ -76,6 +78,8 @@ except ImportError:
 
 __all__ = [
     # Tool injection
+    "CCR_RETRIEVE_DESCRIPTION",
+    "CCR_SYSTEM_INSTRUCTIONS",
     "CCR_TOOL_NAME",
     "CCRToolInjector",
     "create_ccr_tool_definition",

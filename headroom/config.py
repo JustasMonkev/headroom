@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -23,6 +24,169 @@ class HeadroomMode(str, Enum):
 # Model context limits should be provided by the Provider
 # This dict allows user overrides only
 DEFAULT_MODEL_CONTEXT_LIMITS: dict[str, int] = {}
+
+
+# ---------------------------------------------------------------------------
+# Model-specific feature gates
+# ---------------------------------------------------------------------------
+# Headroom's *ordinary* compression runs on every model. A handful of transforms
+# are different: they exploit provider behaviour that only exists on recent
+# frontier models (server-side tool search, native output controls, prior-turn
+# thinking being re-billed as input). Firing those on an older model is not
+# merely a missed saving — it can cost tokens or 400 the request.
+#
+# These are the shared conservative cutoffs. Features with verified earlier
+# support keep their own threshold while reusing :func:`parse_model_family_version`.
+# Older models keep working through the proxy and keep getting ordinary
+# compression — they just don't get unsupported gated features.
+MIN_CLAUDE_FEATURE_VERSION: tuple[int, int] = (4, 8)
+MIN_GPT_FEATURE_VERSION: tuple[int, int] = (5, 5)
+
+_MODEL_FEATURE_MIN_VERSIONS: dict[str, tuple[int, int]] = {
+    "claude": MIN_CLAUDE_FEATURE_VERSION,
+    "gpt": MIN_GPT_FEATURE_VERSION,
+}
+
+# Everything that is not [0-9a-z] is a separator in a model id. This collapses
+# every real-world shape onto the same token stream:
+#   claude-opus-4-6 / anthropic/claude-opus-4-6 / us.anthropic.claude-opus-4-6-v1:0
+#   claude-sonnet-4-5-20250929 / claude-3-5-sonnet-20241022 / claude-opus-4-6[1m]
+#   gpt-5.5 / gpt-5.5-codex / openai/gpt-5 / gpt-5.4-2026-02-01
+_MODEL_ID_SEPARATORS = re.compile(r"[^0-9a-z]+")
+
+# A `YYYYMMDD` release-date stamp is NOT a version component. Canonical Claude
+# ids interleave the two — `claude-sonnet-4-20250514` is Claude 4 Sonnet
+# released 2025-05-14, not "Claude 4.20250514" — so an 8-digit token that reads
+# as a plausible calendar date terminates the version run instead of becoming
+# the minor. Without this, every dated pre-4.5 id (`claude-sonnet-4-20250514`)
+# scored an astronomically large minor and sailed over the >= (4, 8) cutoff,
+# which is the exact set of models the cutoff exists to exclude.
+_RELEASE_DATE_MIN_YEAR = 2000
+_RELEASE_DATE_MAX_YEAR = 2100
+
+
+def _is_release_date_token(token: str) -> bool:
+    """True when ``token`` is an 8-digit ``YYYYMMDD`` release stamp.
+
+    Deliberately narrow: exactly 8 digits, a plausible year, month 1-12 and day
+    1-31. A digit run that is not a plausible date (e.g. ``12345678``) keeps its
+    old meaning as a version component rather than being silently discarded.
+    """
+    if len(token) != 8 or not token.isdigit():
+        return False
+    year = int(token[:4])
+    month = int(token[4:6])
+    day = int(token[6:8])
+    return (
+        _RELEASE_DATE_MIN_YEAR <= year <= _RELEASE_DATE_MAX_YEAR
+        and 1 <= month <= 12
+        and 1 <= day <= 31
+    )
+
+
+def _is_split_release_date(tokens: list[str], index: int) -> bool:
+    """True when ``tokens[index:index + 3]`` is a ``YYYY``/``MM``/``DD`` stamp.
+
+    OpenAI spells snapshot dates with separators (``gpt-5-2025-08-07``), which
+    tokenizes to ``5``, ``2025``, ``08``, ``07`` — so the 8-digit check alone
+    would read ``2025`` as the minor version and let a GPT-5 snapshot clear the
+    5.5 cutoff. Month and day must be exactly two digits, matching the canonical
+    ISO form, so an ordinary version run is never mistaken for a date.
+    """
+    if index + 2 >= len(tokens):
+        return False
+    year_tok, month_tok, day_tok = tokens[index : index + 3]
+    if not (year_tok.isdigit() and month_tok.isdigit() and day_tok.isdigit()):
+        return False
+    if len(year_tok) != 4 or len(month_tok) != 2 or len(day_tok) != 2:
+        return False
+    return (
+        _RELEASE_DATE_MIN_YEAR <= int(year_tok) <= _RELEASE_DATE_MAX_YEAR
+        and 1 <= int(month_tok) <= 12
+        and 1 <= int(day_tok) <= 31
+    )
+
+
+def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | None:
+    """Parse a model id into ``(family, (major, minor))``; ``None`` if unknown.
+
+    ``family`` is ``"claude"`` or ``"gpt"`` — the only two families with
+    version-gated optimizations. Vendor prefixes (``anthropic/``,
+    ``us.anthropic.``, ``openai/``), date suffixes, variant suffixes
+    (``-codex``, ``[1m]``, ``-v1:0``) and dotted or dashed version separators
+    are all handled.
+
+    The version is the first contiguous run of all-digit tokens, which is where
+    every id in this repo puts it (``claude-opus-4-6`` -> ``(4, 6)``;
+    ``claude-3-5-sonnet-20241022`` -> ``(3, 5)``; ``gpt-5.5-codex`` ->
+    ``(5, 5)``; ``gpt-5`` -> ``(5, 0)``). A missing minor is 0.
+
+    An 8-digit ``YYYYMMDD`` release stamp is a **date, not a minor version**, and
+    ends the run: ``claude-sonnet-4-20250514`` -> ``(4, 0)`` (Claude 4 Sonnet),
+    ``claude-opus-4-8-20260210`` -> ``(4, 8)``.
+
+    Returns ``None`` — never a guess — for anything unparseable, so callers
+    fail closed. Non-versioned families (``o1``, ``o3``, ``gpt-4o``, embedding
+    models, …) also return ``None``.
+    """
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().lower()
+    if not normalized:
+        return None
+    tokens = [t for t in _MODEL_ID_SEPARATORS.split(normalized) if t]
+    family: str | None = None
+    start = 0
+    for name in _MODEL_FEATURE_MIN_VERSIONS:
+        if name in tokens:
+            family = name
+            start = tokens.index(name) + 1  # version digits follow the family name
+            break
+    if family is None:
+        return None
+    digits: list[int] = []
+    for offset, token in enumerate(tokens[start:], start=start):
+        if _is_split_release_date(tokens, offset):
+            # `gpt-5-2025-08-07`: the date starts here, so the version ended.
+            break
+        if token.isdigit() and not _is_release_date_token(token):
+            digits.append(int(token))
+        elif digits:
+            # Version digits are contiguous; stop at the family/date boundary.
+            # A release-date stamp counts as a boundary, never as a version.
+            break
+    if not digits:
+        return None
+    major = digits[0]
+    minor = digits[1] if len(digits) > 1 else 0
+    return family, (major, minor)
+
+
+def model_supports_gated_features(model: object, *, family: str | None = None) -> bool:
+    """True when ``model`` is new enough for Headroom's model-specific features.
+
+    The shared cutoffs are :data:`MIN_CLAUDE_FEATURE_VERSION` and
+    :data:`MIN_GPT_FEATURE_VERSION`. Applied strictly by version number, so
+    ``claude-sonnet-4-6`` and ``gpt-5.4`` remain below these conservative
+    defaults. Features with verified earlier support use
+    :func:`parse_model_family_version` with their own cutoff.
+
+    ``family`` optionally restricts the answer to one family (``"claude"`` or
+    ``"gpt"``) so a provider-specific gate can't be opened by a model id from
+    the other vendor.
+
+    **Fails closed**: an unrecognized, unparseable or empty model id returns
+    False. That direction is deliberate — every gated feature costs tokens or
+    errors when fired on a model that does not support it, whereas a false
+    negative costs only a missed saving.
+    """
+    parsed = parse_model_family_version(model)
+    if parsed is None:
+        return False
+    parsed_family, version = parsed
+    if family is not None and parsed_family != family:
+        return False
+    return version >= _MODEL_FEATURE_MIN_VERSIONS[parsed_family]
 
 
 @dataclass
@@ -216,6 +380,12 @@ class AnchorConfig:
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
+        "ReadFile",
+        "readfile",
+        "read_file",
+        "NotebookRead",
+        "notebookread",
+        "notebook_read",
         "Glob",
         "Grep",
         "Write",
@@ -261,7 +431,14 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
         parts = name.split("_", 2)
         if len(parts) == 3 and parts[1] and parts[2]:
             aliases.append(f"mcp__{parts[1]}__{parts[2]}")
-            aliases.append(parts[2])
+        # Single-underscore wrappers are ambiguous because both the server and
+        # tool may contain underscores. Test every possible leaf suffix; a
+        # byte-sensitive Read must be protected even when the split is unclear.
+        rest = name[4:]
+        while "_" in rest:
+            rest = rest.split("_", 1)[1]
+            if rest:
+                aliases.append(rest)
 
     return tuple(dict.fromkeys(aliases))
 
@@ -327,6 +504,38 @@ class ReadLifecycleConfig:
     compress_stale: bool = True  # Replace Reads of files that were later edited
     compress_superseded: bool = False  # Disabled: busts Anthropic prompt cache prefix
     min_size_bytes: int = 512  # Skip tiny Read outputs (not worth the overhead)
+
+
+@dataclass
+class ToolInputCompactionConfig:
+    """Compact completed tool-call INPUTS (arguments) via CCR.
+
+    Tool outputs are compressed by ContentRouter, but tool-call arguments —
+    Write payloads, apply_patch bodies, shell heredocs, SQL strings — stay
+    verbatim in context for the rest of the session. Once the matching tool
+    result has arrived, the model has acted on it; the full argument bytes
+    are historical record, not working context. This pass replaces large,
+    completed arguments with a compact marker + CCR hash, preserving the
+    call id and tool name so provider validation and conversation structure
+    are untouched. Originals stay retrievable via the CCR store.
+
+    Safety rules:
+    - Only calls whose matching tool result appears LATER in the
+      conversation are touched (completed calls).
+    - The trailing ``protect_recent_turns`` assistant messages are never
+      touched (the model may still be working with those arguments).
+    - Messages inside the provider's frozen cache prefix are never touched.
+
+    Disabled by default while the mechanism is validated in pilots
+    (opt-in via ``HEADROOM_COMPACT_TOOL_INPUTS=1`` on the proxy).
+    """
+
+    enabled: bool = False
+    # Only compact serialized arguments at least this large — below this a
+    # marker plus store entry costs more than it saves.
+    min_chars: int = 800
+    # Trailing assistant messages whose tool calls are never compacted.
+    protect_recent_turns: int = 2
 
 
 @dataclass
@@ -568,14 +777,9 @@ class CCRConfig:
     inject_tool: bool = True  # Inject headroom_retrieve tool into tools array
     inject_system_instructions: bool = False  # Add retrieval instructions to system message
 
-    # Retrieval marker format
-    # Inserted at end of compressed content to tell LLM how to get more
-    marker_template: str = (
-        "\n[{original_count} items compressed to {compressed_count}."
-        "{summary}"
-        " Retrieve more: hash={hash}."
-        " Expires in {ttl_minutes}m.]"
-    )
+    # NOTE: a `marker_template` field used to live here. It had zero consumers
+    # (every compressor hardcodes its own f-string) and was removed as dead
+    # config — see "B5" in docs/token-efficiency-review.md.
 
 
 @dataclass
@@ -647,10 +851,17 @@ class HeadroomConfig:
         """
         if model in self.model_context_limits:
             return self.model_context_limits[model]
-        # Try prefix matching for versioned model names
-        for known_model, limit in self.model_context_limits.items():
-            if model.startswith(known_model):
-                return limit
+        # Try prefix matching for versioned model names. Longest prefix wins:
+        # with {"gpt-4": 8192, "gpt-4o": 128000} configured, "gpt-4o-mini"
+        # must resolve via "gpt-4o", not whichever key dict order yields first.
+        best_match: str | None = None
+        for known_model in self.model_context_limits:
+            if model.startswith(known_model) and (
+                best_match is None or len(known_model) > len(best_match)
+            ):
+                best_match = known_model
+        if best_match is not None:
+            return self.model_context_limits[best_match]
         return None
 
 

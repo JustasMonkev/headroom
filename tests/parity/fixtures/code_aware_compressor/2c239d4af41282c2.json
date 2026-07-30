@@ -19,10 +19,10 @@
   "input_sha256": "2c239d4af41282c27453261058252f76b9f173d4b16d69fa1094010556969416",
   "output": {
     "cache_key": null,
-    "compressed": "import json\n\ndef load(path):\n    with open(path) as fh:\n        data = json.load(fh)\n    # [6 lines omitted]\n    pass\ndef transform(records, factor):\n    out = []\n    # [6 lines omitted]\n    pass\ndef run(path, factor):\n    data = load(path)\n    # [3 lines omitted; calls: load, transform]\n    pass",
+    "compressed": "import json\n\ndef load(path):\n    with open(path) as fh:\n        data = json.load(fh)\n    # [6 lines omitted]\ndef transform(records, factor):\n    out = []\n    # [6 lines omitted]\ndef run(path, factor):\n    data = load(path)\n    # [3 lines omitted; calls: load, transform]",
     "compressed_bodies": 0,
-    "compressed_tokens": 74,
-    "compression_ratio": 0.524822695035461,
+    "compressed_tokens": 67,
+    "compression_ratio": 0.475177304964539,
     "language": "python",
     "language_confidence": 1.0,
     "original": "import json\n\n\ndef load(path):\n    with open(path) as fh:\n        data = json.load(fh)\n    cleaned = {}\n    for key, value in data.items():\n        if value is None:\n            continue\n        cleaned[key] = value\n    return cleaned\n\n\ndef transform(records, factor):\n    out = []\n    for r in records:\n        scaled = r * factor\n        if scaled > 1000:\n            scaled = 1000\n        out.append(scaled)\n    return out\n\n\ndef run(path, factor):\n    data = load(path)\n    values = list(data.values())\n    result = transform(values, factor)\n    return sum(result)\n",

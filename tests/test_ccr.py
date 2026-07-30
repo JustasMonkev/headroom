@@ -359,3 +359,17 @@ class TestCCREdgeCases:
             t.join()
 
         assert errors == [], f"Errors during concurrent operations: {errors}"
+
+
+def test_ccr_config_has_no_dead_marker_template():
+    """B5: `CCRConfig.marker_template` had zero consumers and was removed.
+
+    Every compressor hardcodes its own f-string — which is *why* there are five
+    marker grammars. The dead field just implied a knob that did nothing.
+    """
+    from dataclasses import fields
+
+    from headroom.config import CCRConfig
+
+    assert "marker_template" not in {f.name for f in fields(CCRConfig)}
+    assert not hasattr(CCRConfig(), "marker_template")

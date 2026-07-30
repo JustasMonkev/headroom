@@ -36,6 +36,21 @@ static P50K: LazyLock<Arc<CoreBPE>> =
 static R50K: LazyLock<Arc<CoreBPE>> =
     LazyLock::new(|| Arc::new(tiktoken_rs::r50k_base().expect("r50k_base init")));
 
+/// Shared BPE handle for one of the four bundled encodings, by tiktoken
+/// encoding name. `tiktoken-rs` vendors the BPE data files, so unlike
+/// Python `tiktoken` this needs no network access — the PyO3 bridge uses
+/// this to keep exact token counts available when the vocab download is
+/// unreachable.
+pub fn bpe_for_encoding(name: &str) -> Option<Arc<CoreBPE>> {
+    match name {
+        "o200k_base" => Some(O200K.clone()),
+        "cl100k_base" => Some(CL100K.clone()),
+        "p50k_base" => Some(P50K.clone()),
+        "r50k_base" => Some(R50K.clone()),
+        _ => None,
+    }
+}
+
 /// BPE token counter for OpenAI / o-series models.
 pub struct TiktokenCounter {
     model: String,

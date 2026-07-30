@@ -26,6 +26,19 @@ if TYPE_CHECKING:
 # This prevents JSON path injection attacks via malicious key names
 _SAFE_METADATA_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_\-]*$")
 
+# Container filters above this many entries fall back from per-entry SQL
+# predicates to the bounded json_each-join comparison: each entry emits 1-2
+# AND predicates, and a ~500-element array would exceed SQLite's
+# MAX_EXPR_DEPTH (default 1000), failing the whole query with "Expression
+# tree is too large".
+_MAX_STRUCTURAL_ITEMS = 64
+
+# Shared budget for the TOTAL number of predicates one metadata_filters build
+# may emit: per-container limits alone compose multiplicatively (an array of
+# eight 64-element arrays passes every local check yet emits 1000+ ANDs).
+# Once exhausted, remaining containers use the bounded comparison.
+_MAX_METADATA_PREDICATES = 256
+
 
 def _validate_metadata_key(key: str) -> bool:
     """Validate that a metadata key is safe for use in JSON path expressions.
@@ -502,8 +515,11 @@ class SQLiteMemoryStore:
             conditions.append("(valid_until IS NULL OR valid_until > ?)")
             params.append(valid_at_str)
 
-        # Superseded filtering
-        if not filter.include_superseded:
+        # Superseded filtering. Skipped for point-in-time queries: valid_at
+        # already constrains to versions valid at that instant, and ANDing
+        # "valid_until IS NULL" on top would contradict it for any superseded
+        # row — "what did we know at time t?" would always return nothing.
+        if not filter.include_superseded and filter.valid_at is None:
             # Default: only return current memories (not superseded)
             conditions.append("valid_until IS NULL")
 
@@ -540,17 +556,173 @@ class SQLiteMemoryStore:
 
         # Metadata filtering with key validation to prevent JSON path injection
         if filter.metadata_filters:
+            budget = [_MAX_METADATA_PREDICATES]
             for key, value in filter.metadata_filters.items():
                 # Validate key to prevent JSON path injection attacks
                 # Invalid keys are silently skipped to avoid breaking legitimate queries
                 # while blocking malicious attempts like "'] OR 1=1--"
                 if not _validate_metadata_key(key):
                     continue
-                # Use JSON extraction for metadata filtering
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                params.append(json.dumps(value) if not isinstance(value, str) else value)
+                self._append_metadata_condition(f"$.{key}", value, conditions, params, budget)
 
         return conditions, params
+
+    def _bounded_container_equality(
+        self, json_path: str, value: Any, conditions: list[str], params: list[Any]
+    ) -> None:
+        """Constant-size, full-depth structural equality for a container.
+
+        Used when per-entry predicates would grow the SQL expression tree
+        beyond SQLite's MAX_EXPR_DEPTH (oversized containers, spent predicate
+        budget, or nested keys unsafe for JSON paths). A recursive CTE walks
+        (filter, stored) value pairs in lockstep, joining a matched container
+        pair's children on key/index, and checks each pair: presence, type
+        (integer/real grouped as one numeric class, matching the per-entry
+        branch), scalar value, and per-container entry count. Object entries
+        are matched by NAME at every depth — key order never matters — while
+        array entries are matched by index, so array order is enforced.
+        Extra stored entries fail the count check of their parent container;
+        missing ones fail the presence check.
+
+        The SQL is constant-size regardless of container size or nesting
+        depth (the CTE's row count follows the filter's node count, which is
+        data, not expression depth). Keys participate only as join DATA —
+        never as JSON path syntax — so any key spelling, including quotes,
+        is safe and compares correctly.
+        """
+        json_kind = "array" if isinstance(value, (list, tuple)) else "object"
+        serialized = json.dumps(value, separators=(",", ":"))
+        stored = f"json_extract(metadata, '{json_path}')"
+        conditions.append(f"json_type(metadata, '{json_path}') = '{json_kind}'")
+        # The CTE walks (filter, stored) VALUE pairs in lockstep, descending
+        # a matched container pair by joining its children on key/index.
+        # Node addressing never round-trips through JSON path syntax —
+        # json_each.fullkey representations of keys containing quotes are not
+        # re-parseable by json_type/json_extract — keys participate only as
+        # join DATA, so any key spelling works. Descent happens only when
+        # both sides are the same container type; the CASE dummy keeps
+        # json_each off scalar values for the rows that don't descend.
+        conditions.append(
+            "NOT EXISTS ("
+            " WITH RECURSIVE pair(fv, ft, sv, st) AS ("
+            f"   SELECT json(?), json_type(?), {stored}, json_type(metadata, '{json_path}')"
+            "   UNION ALL"
+            "   SELECT fe.value, fe.type, se.value, se.type"
+            "   FROM pair, json_each(pair.fv) AS fe"
+            "   LEFT JOIN json_each(CASE WHEN pair.st IN ('object', 'array')"
+            "                       THEN pair.sv ELSE '{}' END) AS se"
+            "     ON se.key = fe.key"
+            "   WHERE pair.ft IN ('object', 'array') AND pair.st = pair.ft"
+            " )"
+            " SELECT 1 FROM pair"
+            " WHERE st IS NULL"
+            " OR (ft != st AND NOT (ft IN ('integer', 'real') AND st IN ('integer', 'real')))"
+            " OR (ft IN ('integer', 'real', 'text') AND sv IS NOT fv)"
+            " OR (ft IN ('object', 'array')"
+            "     AND CASE WHEN st = ft"
+            "         THEN (SELECT COUNT(*) FROM json_each(fv))"
+            "              != (SELECT COUNT(*) FROM json_each(sv))"
+            "         ELSE 1 END)"
+            ")"
+        )
+        # One bind per '?' in the condition above, in order of appearance.
+        params.extend([serialized] * 2)
+
+    def _append_metadata_condition(
+        self,
+        json_path: str,
+        value: Any,
+        conditions: list[str],
+        params: list[Any],
+        budget: list[int],
+    ) -> None:
+        """Append typed equality conditions for one metadata JSON path.
+
+        json_extract() returns typed SQL values (INTEGER for ints and
+        booleans, REAL for floats, TEXT for strings AND for containers'
+        minified JSON), so every branch pins both the comparable value and
+        the JSON type — plain equality either silently matched nothing
+        (JSON text 'true' vs integer 1) or matched across types (a string
+        holding '["a"]' vs a real array).
+
+        ``json_path`` is built exclusively from _validate_metadata_key-vetted
+        segments, so interpolating it is injection-safe. ``budget`` is the
+        shared predicate allowance for the whole metadata_filters build:
+        per-container limits alone compose multiplicatively across nesting,
+        which could still blow SQLite's expression-depth cap.
+        """
+        budget[0] -= 2
+        if value is None:
+            # `= NULL` never matches in SQL, and json_extract() maps BOTH an
+            # explicit JSON null and a missing key to SQL NULL — an IS NULL
+            # filter would return every memory that merely omits the key.
+            # json_type() names an explicit null 'null' and returns SQL NULL
+            # for a missing path, so equality matches only explicit nulls.
+            conditions.append(f"json_type(metadata, '{json_path}') = 'null'")
+            return
+        if isinstance(value, bool):
+            # json_extract() collapses JSON true/1 (and false/0) to the same
+            # SQL integer. json_type() names booleans 'true'/'false' directly
+            # — the type IS the value.
+            conditions.append(f"json_type(metadata, '{json_path}') = ?")
+            params.append("true" if value else "false")
+            return
+        if isinstance(value, (int, float)):
+            # Require a numeric JSON type so {"active": true} doesn't match a
+            # filter of 1 (the mirror of the boolean case).
+            conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+            conditions.append(f"json_type(metadata, '{json_path}') IN ('integer', 'real')")
+            params.append(value)
+            return
+        if isinstance(value, str):
+            # Require the text type: json_extract exposes arrays and objects
+            # as SQL text too, so a string filter holding minified JSON
+            # (e.g. '["a"]') would otherwise also match a real container.
+            conditions.append(f"json_extract(metadata, '{json_path}') = ?")
+            conditions.append(f"json_type(metadata, '{json_path}') = 'text'")
+            params.append(value)
+            return
+        if isinstance(value, dict):
+            # JSON objects are unordered, but json_extract() preserves the
+            # STORED key order while json.dumps preserves the FILTER's — raw
+            # minified-text equality would miss logically equal objects.
+            # Compare structurally: object type, entry count, and each entry
+            # recursively. Oversized objects, spent budget, or nested keys
+            # that can't be expressed as safe JSON paths all use the bounded
+            # json_each-join comparison instead — which keys on entry NAME,
+            # so it stays key-order-insensitive at this level and handles
+            # arbitrary key spellings safely.
+            if (
+                len(value) > _MAX_STRUCTURAL_ITEMS
+                or budget[0] <= 0
+                or not all(_validate_metadata_key(k) for k in value)
+            ):
+                self._bounded_container_equality(json_path, value, conditions, params)
+                return
+            conditions.append(f"json_type(metadata, '{json_path}') = 'object'")
+            conditions.append(f"(SELECT COUNT(*) FROM json_each(metadata, '{json_path}')) = ?")
+            params.append(len(value))
+            for sub_key, sub_value in value.items():
+                self._append_metadata_condition(
+                    f"{json_path}.{sub_key}", sub_value, conditions, params, budget
+                )
+            return
+        # Arrays: JSON arrays are ordered, so compare element-by-element in
+        # order — but recurse per element, because an element may itself be
+        # an OBJECT whose key order must not matter (raw minified-text
+        # equality of the whole array would be order-sensitive there).
+        # Oversized arrays or a spent budget use the bounded comparison,
+        # which joins on index so ordering stays enforced.
+        if len(value) > _MAX_STRUCTURAL_ITEMS or budget[0] <= 0:
+            self._bounded_container_equality(json_path, value, conditions, params)
+            return
+        conditions.append(f"json_type(metadata, '{json_path}') = 'array'")
+        conditions.append(f"json_array_length(metadata, '{json_path}') = ?")
+        params.append(len(value))
+        for index, item in enumerate(value):
+            self._append_metadata_condition(
+                f"{json_path}[{index}]", item, conditions, params, budget
+            )
 
     async def query(self, filter: MemoryFilter) -> list[Memory]:
         """Query memories matching the given filter.

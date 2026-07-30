@@ -40,12 +40,16 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, wait
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -55,6 +59,7 @@ from ..config import (
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
     RelevanceScorerConfig,
+    ToolInputCompactionConfig,
     TransformResult,
     is_tool_excluded,
 )
@@ -93,6 +98,127 @@ _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 _detect_native_verified = False  # native detect has returned once -> skip the watchdog
+
+
+class _DaemonBoundedExecutor:
+    """Small fixed worker pool whose bounded queue and daemon workers can be abandoned.
+
+    ``ThreadPoolExecutor`` registers its workers for an interpreter-exit join,
+    so one permanently wedged compressor can prevent process shutdown even
+    when requests fail open. These workers are daemon threads and therefore do
+    not participate in that join. The queue holds at most one pending wave.
+    """
+
+    def __init__(self, max_workers: int, max_pending: int) -> None:
+        self._max_workers = max_workers
+        self._queue: queue.Queue[
+            tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+        ] = queue.Queue(maxsize=max_pending)
+        self._worker_lock = threading.Lock()
+        self._idle_workers = 0
+        self._threads: list[threading.Thread] = []
+
+    def _worker(self) -> None:
+        while True:
+            future, fn, args, kwargs = self._queue.get()
+            with self._worker_lock:
+                self._idle_workers -= 1
+            # A submitter can race between queue.get() and the idle decrement.
+            # Re-check after becoming busy so any work it left queued gets the
+            # additional worker capacity it needs.
+            self._ensure_workers_for_pending()
+            try:
+                if future.set_running_or_notify_cancel():
+                    try:
+                        future.set_result(fn(*args, **kwargs))
+                    except BaseException as exc:  # noqa: BLE001 - Future transports worker errors
+                        future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+                with self._worker_lock:
+                    self._idle_workers += 1
+            # Do not retain the Future, callable, arguments, or result payload
+            # in this idle thread's frame while it blocks for the next job.
+            del future, fn, args, kwargs
+
+    def _ensure_workers_for_pending(self) -> None:
+        """Start only enough daemon workers for currently queued work."""
+        with self._worker_lock:
+            pending = self._queue.qsize()
+            needed = max(0, pending - self._idle_workers)
+            to_start = min(needed, self._max_workers - len(self._threads))
+            workers = []
+            for _ in range(to_start):
+                index = len(self._threads)
+                worker = threading.Thread(
+                    target=self._worker,
+                    name=f"headroom-router-compress-{index}",
+                    daemon=True,
+                )
+                self._threads.append(worker)
+                # Count a newly created worker as available before start() so
+                # concurrent submissions cannot over-provision while it waits
+                # to be scheduled by the OS.
+                self._idle_workers += 1
+                workers.append(worker)
+        for worker in workers:
+            worker.start()
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        block: bool,
+        **kwargs: Any,
+    ) -> Future[Any] | None:
+        future: Future[Any] = Future()
+        try:
+            self._queue.put((future, fn, args, kwargs), block=block)
+        except queue.Full:
+            return None
+        self._ensure_workers_for_pending()
+        return future
+
+    def cancel_pending(self, futures: list[Future[Any]]) -> int:
+        """Cancel and remove queued work whose request can no longer use it."""
+        cancelled = {future for future in futures if future.cancel()}
+        if not cancelled:
+            return 0
+
+        # ``Future.cancel`` prevents execution but Queue entries would still
+        # occupy the one pending wave until a worker eventually dequeues them.
+        # Remove those entries under Queue's own mutex so a subsequent request
+        # can use the freed bounded capacity immediately. A worker that raced
+        # us and already dequeued an entry will observe the cancelled Future
+        # through ``set_running_or_notify_cancel`` and skip the callable.
+        with self._queue.mutex:
+            retained = [item for item in self._queue.queue if item[0] not in cancelled]
+            removed = len(self._queue.queue) - len(retained)
+            if removed:
+                self._queue.queue.clear()
+                self._queue.queue.extend(retained)
+                self._queue.unfinished_tasks -= removed
+                self._queue.not_full.notify_all()
+                if self._queue.unfinished_tasks == 0:
+                    self._queue.all_tasks_done.notify_all()
+        return len(cancelled)
+
+
+_STAGE_COMPRESSION_EXECUTORS_LOCK = threading.Lock()
+_STAGE_COMPRESSION_EXECUTORS: dict[int, _DaemonBoundedExecutor] = {}
+
+
+def _shared_stage_compression_executor(max_workers: int) -> _DaemonBoundedExecutor:
+    """Reuse one bounded worker set for every router with the same concurrency."""
+    with _STAGE_COMPRESSION_EXECUTORS_LOCK:
+        executor = _STAGE_COMPRESSION_EXECUTORS.get(max_workers)
+        if executor is None:
+            executor = _DaemonBoundedExecutor(
+                max_workers=max_workers,
+                max_pending=max_workers,
+            )
+            _STAGE_COMPRESSION_EXECUTORS[max_workers] = executor
+        return executor
 
 
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
@@ -1604,6 +1730,9 @@ class ContentRouterConfig:
     # -> ripgrep --heading fold; logs -> ANSI strip + run-collapse; JSON ->
     # whitespace-minify, data-lossless), in every path — see
     # ``_lossless_compact_excluded``. Always recoverable, so no config gate.
+    # EXCEPTION: tools in ``BYTE_SENSITIVE_EXCLUDE_TOOLS`` (file reads) get no
+    # fold at all — information-preservation is too weak a guarantee for content
+    # an ``Edit(old_string=…)`` is copied out of.
 
     # Shell tool names (case-insensitive). Their output is non-excluded/lossy,
     # BUT a read-only *search* run through them (grep/rg/git grep) yields byte-
@@ -1617,6 +1746,13 @@ class ContentRouterConfig:
 
     # Read lifecycle management (stale/superseded detection)
     read_lifecycle: ReadLifecycleConfig = field(default_factory=ReadLifecycleConfig)
+
+    # Completed tool-call INPUT compaction (opt-in; see
+    # ToolInputCompactionConfig). Replaces large historical tool-call
+    # arguments with CCR markers once their results have arrived.
+    tool_input_compaction: ToolInputCompactionConfig = field(
+        default_factory=ToolInputCompactionConfig
+    )
 
     # Per-tool compression profiles (tool_name → CompressionProfile)
     # Set to None to use DEFAULT_TOOL_PROFILES from config
@@ -1640,6 +1776,217 @@ class ContentRouterConfig:
     # Group search-compressor output by file (`rg --heading` style).
     # Default False; the proxy enables it in token mode.
     search_group_by_file: bool = False
+
+
+# ---------------------------------------------------------------------------
+# F6: per-request routing context.
+#
+# Routers are long-lived and SHARED: the proxy builds one per pipeline and
+# reuses it for every request, and `apply()` itself runs on a compression
+# executor thread while the parallel block pass fans out to more threads. The
+# request-specific routing knobs below (target ratio, kompress model override,
+# the tool_call_id -> args/command maps, the read-protection sets) used to be
+# plain instance attributes assigned at the top of `apply()`, so two concurrent
+# requests overwrote each other's routing context — request B's target ratio
+# and tool-args map silently applied to request A's blocks mid-flight.
+#
+# The fix scopes them to a `contextvars` request scope: `apply()` installs a
+# fresh dict, every read/write goes through it, and the parallel pass copies the
+# calling context into its workers so they observe THEIR request's values. Reads
+# outside any scope (direct `compress()` callers, tests inspecting the router
+# after `apply()` returned) fall back to a per-instance dict, which preserves
+# the pre-existing behaviour for those paths.
+# ---------------------------------------------------------------------------
+
+# C11: floor below which the LOSSLESS folds are not even attempted.
+#
+# Formerly 200, which skipped the single most common payload in an agent
+# transcript. `compact_lossless` is pure-stdlib, microsecond-fast and
+# self-verifying (it returns its input untouched when it cannot shrink), so the
+# only cost of attempting it is a few microseconds — there is no accuracy risk
+# to trade off. 80 chars is roughly the point below which no fold can win: the
+# cheapest fold markers (`…x5`) plus a fold's structural overhead need a couple
+# of repeated lines to pay for themselves.
+#
+# Measured payoff is small and should not be overstated: across 18 real
+# transcripts (3,458 tool_result blocks, 1.08M tokens) the 80-199 band folds
+# recover 57 tokens — 0.005% of tool-result tokens, all of it on the bash-search
+# path. It is kept because it is free and self-verifying, not because it is
+# material.
+#
+# NOTE this is the LOSSLESS floor only. The lossy floor
+# (`ContentRouterConfig.min_chars_for_block_compression`, default 500) is
+# unchanged: lowering that would push 200-499-char blocks into the *lossy*
+# compressors, which is a different and much riskier bet. Small blocks already
+# bypass the lossy floor when a lossless fold wins (`_has_lossless_fold`).
+#
+# NOTE also that "lossless" here means INFORMATION-preserving, not BYTE-
+# preserving — see `BYTE_SENSITIVE_EXCLUDE_TOOLS`, whose outputs are held out of
+# the folds entirely at every size.
+LOSSLESS_FOLD_MIN_CHARS = 80
+
+# Excluded tools whose result text must reach the model BYTE-FOR-BYTE.
+#
+# The excluded-tool folds are *information*-preserving, not *byte*-preserving:
+# `_minify_json_data_lossless` returns the same parsed object with different
+# bytes, and the `log` fold drops ANSI and collapses repeated lines (its inverse
+# `expand_runs` recovers the lines, not the original bytes). That is a fine
+# trade for output the model only reads.
+#
+# It is NOT a fine trade for a file READ. `Read` is excluded from compression
+# precisely because `Edit(old_string=...)` matches LITERAL FILE BYTES: if the
+# model copies an `old_string` out of a rewritten Read result — minified JSON,
+# de-duplicated lines, stripped ANSI — the edit silently fails to match the
+# file. So no fold may run on these, at any size. (This is stricter than the
+# LOSSLESS_FOLD_MIN_CHARS floor and independent of it: the C11 floor of 80 only
+# controls WHEN the folds are attempted; this controls WHOSE output they may
+# touch at all.)
+#
+# Distinct from `DEFAULT_VERBATIM_EXCLUDE_TOOLS` (WebSearch/WebFetch), which is
+# a stronger, permanent hold: those results are never compressed even once they
+# age out of the read-protection window. This set does NOT widen protection —
+# it only removes the folds from the window an `Edit` can actually be built
+# from. Where a deployment enables age-based decay
+# (`protect_recent_reads_fraction > 0`), an old Read still falls through to
+# lossy compression exactly as before, with CCR retrieval covering a miss.
+#
+# Matched with `is_tool_excluded`, so entries are case-insensitive and MCP
+# wrappers (`mcp__fs__read_file`) resolve through their bare-name alias.
+BYTE_SENSITIVE_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "Read",
+        "read",
+        "read_file",
+        "ReadFile",
+        "NotebookRead",
+        "notebook_read",
+    }
+)
+
+
+def _tool_output_is_byte_sensitive(tool_name: str) -> bool:
+    """True when this tool's result must stay byte-identical (see the set above)."""
+    if not tool_name:
+        return False
+    return is_tool_excluded(tool_name, BYTE_SENSITIVE_EXCLUDE_TOOLS)
+
+
+# Outer dict is keyed by ``id(router)`` so two routers active on the same
+# context (a pipeline holding more than one, a nested standalone router) keep
+# separate state. The value pairs a WEAK reference to the owning router with
+# that router's ``attribute name -> value`` store: the weakref keeps the scope
+# from pinning a router alive AND lets a lookup reject a stale entry whose
+# ``id()`` was recycled by a later allocation.
+_REQUEST_SCOPE: ContextVar[dict[int, tuple[weakref.ref[Any], dict[str, Any]]]] = ContextVar(
+    "headroom_router_request_scope"
+)
+
+#: Ceiling on distinct routers tracked in one context before the scope is
+#: recycled. Requests normally involve a single router; the cap only bounds the
+#: pathological case of many short-lived routers on one long-lived thread.
+_REQUEST_SCOPE_MAX_ROUTERS = 16
+
+#: Attribute holding the no-scope fallback store on each router instance.
+_SCOPE_FALLBACK_ATTR = "_request_scope_fallback"
+
+
+class _RequestScoped:
+    """Descriptor storing an attribute in the active per-request scope.
+
+    Behaves exactly like a normal instance attribute when this router has no
+    scope open on the current context (direct ``compress()`` use, a different
+    router instance, post-``apply()`` inspection from another thread), but
+    isolates concurrent ``apply()`` calls from one another when one is.
+    """
+
+    __slots__ = ("_default_factory", "_name")
+
+    def __init__(self, default_factory: Callable[[], Any]) -> None:
+        self._default_factory = default_factory
+        self._name = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._name = name
+
+    @staticmethod
+    def _store(obj: Any) -> dict[str, Any]:
+        scope = _REQUEST_SCOPE.get(None)
+        if scope is not None:
+            entry = scope.get(id(obj))
+            # Identity check: an entry whose owner has been collected (and whose
+            # id() this object happens to have reused) must not be inherited.
+            if entry is not None and entry[0]() is obj:
+                return entry[1]
+        fallback: dict[str, Any] | None = obj.__dict__.get(_SCOPE_FALLBACK_ATTR)
+        if fallback is None:
+            fallback = {}
+            obj.__dict__[_SCOPE_FALLBACK_ATTR] = fallback
+        return fallback
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        store = self._store(obj)
+        if self._name not in store:
+            store[self._name] = self._default_factory()
+        return store[self._name]
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        self._store(obj)[self._name] = value
+
+
+def _open_router_request_scope(
+    router: Any,
+) -> Token[dict[int, tuple[weakref.ref[Any], dict[str, Any]]]]:
+    """Install a fresh routing scope for ``router`` on the current context.
+
+    The outer map is COPIED and re-``set()`` rather than mutated in place. A
+    context is propagated by SHALLOW copy (``copy_context()``, and therefore
+    ``asyncio.to_thread`` / ``loop.run_in_executor`` / ``Task``), so a caller
+    that already has a scope open — e.g. a direct ``apply()`` on the event-loop
+    context followed by two concurrent ``asyncio.to_thread(router.apply, ...)``
+    calls — hands BOTH workers the same dict object. Mutating it would let the
+    second worker's slot assignment replace the first worker's still-in-use
+    entry, putting the first request back on the second's target ratio,
+    tool-args map and read protection: exactly the cross-request bleed the
+    request scope exists to prevent. Copy-then-``set`` gives every scope opening
+    a private outer map, so the two workers can never observe each other.
+    """
+    inherited = _REQUEST_SCOPE.get(None)
+    if inherited is None or len(inherited) > _REQUEST_SCOPE_MAX_ROUTERS:
+        scope: dict[int, tuple[weakref.ref[Any], dict[str, Any]]] = {}
+    else:
+        # Drop entries whose owning router has been collected while copying, so
+        # a long-lived context can't accumulate dead slots (and can't hand a
+        # recycled ``id()`` a stale store).
+        scope = {rid: entry for rid, entry in inherited.items() if entry[0]() is not None}
+    scope[id(router)] = (weakref.ref(router), {})
+    return _REQUEST_SCOPE.set(scope)
+
+
+def _close_router_request_scope(
+    router: Any,
+    token: Token[dict[int, tuple[weakref.ref[Any], dict[str, Any]]]],
+) -> None:
+    """Reset request state, retaining only small post-call diagnostics."""
+    scope = _REQUEST_SCOPE.get(None)
+    entry = scope.get(id(router)) if scope is not None else None
+    diagnostics: dict[str, Any] = {}
+    if entry is not None and entry[0]() is router:
+        store = entry[1]
+        for name in (
+            "_runtime_target_ratio",
+            "_runtime_force_kompress",
+            "_runtime_skip_kompress",
+            "_runtime_kompress_model",
+            "_runtime_compression_policy",
+        ):
+            if name in store:
+                diagnostics[name] = store[name]
+
+    _REQUEST_SCOPE.reset(token)
+    fallback = router.__dict__.setdefault(_SCOPE_FALLBACK_ATTR, {})
+    fallback.update(diagnostics)
 
 
 class ContentRouter(Transform):
@@ -1700,6 +2047,21 @@ class ContentRouter(Transform):
     # (fewer lossy chains, safer); 0 = keep the lossy pass on any improvement.
     _DEFAULT_LOSSY_MIN_EXTRA_SAVINGS = 0.05
 
+    # --- F6: per-request routing context (see `_RequestScoped` above). These
+    # are assigned per request from `apply()`'s kwargs and read from the
+    # (possibly parallel) compression pass; keeping them on the shared instance
+    # let concurrent requests clobber each other's routing decisions.
+    _runtime_target_ratio = _RequestScoped(lambda: None)
+    _runtime_force_kompress = _RequestScoped(lambda: False)
+    _runtime_skip_kompress = _RequestScoped(lambda: False)
+    _runtime_kompress_model = _RequestScoped(lambda: None)
+    _runtime_compression_policy = _RequestScoped(lambda: None)
+    _runtime_tokenizer = _RequestScoped(lambda: None)
+    _tool_call_args = _RequestScoped(dict)
+    _tool_call_commands = _RequestScoped(dict)
+    _protect_read_tool_ids = _RequestScoped(set)
+    _protect_read_msg_indices = _RequestScoped(set)
+
     def __init__(
         self,
         config: ContentRouterConfig | None = None,
@@ -1726,7 +2088,22 @@ class ContentRouter(Transform):
         if self.config.lossless:
             self.config.ccr_inject_marker = False
             self.config.smart_crusher_lossless_only = True
+            # Tool-input compaction is CCR-backed by construction: it replaces
+            # arguments with a `hash=` marker redeemable only through
+            # `headroom_retrieve`, which lossless mode suppresses. Leaving it on
+            # would strand the arguments — a lossy outcome in the mode whose
+            # whole contract is losslessness.
+            if self.config.tool_input_compaction.enabled:
+                self.config.tool_input_compaction = ToolInputCompactionConfig(enabled=False)
         self._observer = observer
+        # Reused by deadline-bound pass-2 compression.  A single bounded pool
+        # prevents timed-out compressor threads from growing without limit
+        # across requests; initialization is lazy because many router uses
+        # never enter the parallel compression path.
+        self._stage_compression_executor_lock = threading.Lock()
+        self._stage_compression_executor: _DaemonBoundedExecutor | None = None
+        self._stage_compression_executor_workers = 0
+        self._stage_compression_admission_capacity = 0
 
         # Name-addressable compressor inventory: built-in metadata + opt-in
         # discovery of `headroom.compressor` entry points. Inventory only —
@@ -1765,9 +2142,9 @@ class ContentRouter(Transform):
         self._relevance_scorer_tried: bool = False
         self._relevance_prewarm_started: bool = False
         # tool_call_id → compact args text, populated by _build_tool_name_map.
-        self._tool_call_args: dict[str, str] = {}
+        self._tool_call_args = {}
         # tool_call_id → raw shell command (bash-search fold), same population.
-        self._tool_call_commands: dict[str, str] = {}
+        self._tool_call_commands = {}
 
         # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
         # ONNX). Its inference scales O(tokens) and runs synchronously on the
@@ -1836,7 +2213,7 @@ class ContentRouter(Transform):
         # proxy) keep pre-F2.2 behaviour: TOIN writes are not gated.
         # Same pattern the existing ``_runtime_target_ratio`` /
         # ``_runtime_kompress_model`` fields below use.
-        self._runtime_compression_policy: Any = None
+        self._runtime_compression_policy = None
 
         self._cache = CompressionCache()
 
@@ -2065,6 +2442,55 @@ class ContentRouter(Transform):
         t0 = time.perf_counter()
         result = self.compress(content, context=context, bias=bias)
         return result, (time.perf_counter() - t0) * 1000
+
+    def _get_stage_compression_executor(self, max_workers: int) -> _DaemonBoundedExecutor:
+        """Return the process-shared, bounded, abandonable pass-2 executor.
+
+        Standalone integrations construct a fresh pipeline/router for every
+        call, so a per-router pool would leak another permanently waiting
+        worker set on every request. Sharing by configured concurrency caps
+        both idle workers and timeout debt process-wide, while daemon workers
+        still let the process terminate if compressor code never returns.
+        """
+        with self._stage_compression_executor_lock:
+            if self._stage_compression_executor is None:
+                self._stage_compression_executor = _shared_stage_compression_executor(max_workers)
+                self._stage_compression_executor_workers = max_workers
+                # Bound total retained work to running workers plus one small
+                # pending wave.
+                self._stage_compression_admission_capacity = max_workers * 2
+            return self._stage_compression_executor
+
+    def _submit_stage_compression(
+        self,
+        max_workers: int,
+        content: str,
+        context: str,
+        bias: float,
+        *,
+        block_for_capacity: bool,
+    ) -> Future[tuple[RouterCompressionResult, float]] | None:
+        """Submit only when the shared executor has bounded admission capacity.
+
+        Timed-out futures deliberately remain in the executor's bounded queue;
+        running and retained request contents can never exceed two worker
+        waves, even while every worker is wedged.
+
+        F6: the worker runs inside a COPY of the submitting context, so it sees
+        this request's routing scope (target ratio, tool-args map, read
+        protection) rather than whatever the shared, long-lived executor thread
+        happened to be left holding by an earlier request.
+        """
+        executor = self._get_stage_compression_executor(max_workers)
+        ctx = copy_context()
+        return executor.submit(
+            ctx.run,
+            self._timed_compress,
+            content,
+            context,
+            bias,
+            block=block_for_capacity,
+        )
 
     def compress(
         self,
@@ -2496,9 +2922,23 @@ class ContentRouter(Transform):
                 cand = compact_lossless(content, kind)
             except Exception:
                 continue
-            if len(cand) < len(best):
+            if self._lossless_candidate_is_smaller(content, cand) and len(cand) < len(best):
                 best, best_label = cand, f"lossless_{kind}"
         return best, best_label
+
+    def _lossless_candidate_ratio(self, original: str, candidate: str) -> float | None:
+        tokenizer = self._runtime_tokenizer
+        if tokenizer is None:
+            return len(candidate) / max(1, len(original))
+        try:
+            original_tokens = tokenizer.count_text(original)
+            return tokenizer.count_text(candidate) / original_tokens if original_tokens else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _lossless_candidate_is_smaller(self, original: str, candidate: str) -> bool:
+        ratio = self._lossless_candidate_ratio(original, candidate)
+        return ratio is not None and ratio < 1.0
 
     @staticmethod
     def _looks_like_diff(content: str) -> bool:
@@ -2807,6 +3247,7 @@ class ContentRouter(Transform):
         language: str | None = None,
         question: str | None = None,
         bias: float = 1.0,
+        _allow_embedded: bool = True,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
 
@@ -2827,6 +3268,37 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
+        # Before anything else: if this block is not a single JSON value but
+        # CONTAINS balanced JSON span(s), route each span through this very
+        # dispatch and splice the result back (surrounding bytes kept exact).
+        # This is how nested/embedded JSON reaches the JSON compressors at all —
+        # today's linear splitter never sees it. Each span goes through the
+        # UNCHANGED path, so SmartCrusher/CodeCompressor register their
+        # `<<ccr:…>>` markers exactly as for a whole-block JSON (CCR is hash-
+        # keyed → location-agnostic). `_allow_embedded=False` on the recursive
+        # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
+        # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
+        # stable, and a strict no-op when the block has no embedded JSON.
+        if _allow_embedded:
+            from headroom.transforms.recursive_json import route_embedded_json
+
+            def _dispatch_span(span: str) -> str | None:
+                strat = self._strategy_from_detection_type(_detect_content(span).content_type)
+                text, _t, _c = self._apply_strategy_to_content(
+                    span,
+                    strat,
+                    context,
+                    question=question,
+                    bias=bias,
+                    _allow_embedded=False,
+                )
+                return text if text != span else None
+
+            routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+            if routed is not None:
+                return routed, _estimate_tokens(routed), ["embedded_json"]
+
         # Track original tokens for TOIN recording
         original_tokens = _estimate_tokens(content)
         compressed: str | None = None
@@ -4279,7 +4751,20 @@ class ContentRouter(Transform):
         tokenizer: Tokenizer,
         **kwargs: Any,
     ) -> TransformResult:
-        """Apply intelligent routing to messages.
+        """Apply intelligent routing with request-local state."""
+        scope_token = _open_router_request_scope(self)
+        try:
+            return self._apply_in_request_scope(messages, tokenizer, **kwargs)
+        finally:
+            _close_router_request_scope(self, scope_token)
+
+    def _apply_in_request_scope(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        **kwargs: Any,
+    ) -> TransformResult:
+        """Apply intelligent routing to messages inside an open scope.
 
         Args:
             messages: Messages to transform.
@@ -4289,20 +4774,24 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        self._runtime_tokenizer = tokenizer
+        # Shared CCR store for the pre-processing passes below. is None (not
+        # truthiness) so falsy test doubles are honored; guarded import keeps
+        # the passes running in stripped builds.
+        injected_store = kwargs.get("compression_store")
+        if injected_store is None and (
+            self.config.read_lifecycle.enabled or self.config.tool_input_compaction.enabled
+        ):
+            try:
+                from ..cache.compression_store import get_compression_store
+
+                injected_store = get_compression_store()
+            except ImportError:
+                pass
+
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
             from .read_lifecycle import ReadLifecycleManager
-
-            # is None (not truthiness) so falsy test doubles are honored;
-            # guarded import keeps read_lifecycle running in stripped builds.
-            injected_store = kwargs.get("compression_store")
-            if injected_store is None:
-                try:
-                    from ..cache.compression_store import get_compression_store
-
-                    injected_store = get_compression_store()
-                except ImportError:
-                    pass
 
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
@@ -4319,6 +4808,21 @@ class ContentRouter(Transform):
         else:
             lifecycle_transforms = []
             lifecycle_ccr_hashes = []
+
+        # Pre-process: completed tool-call INPUT compaction (opt-in).
+        if self.config.tool_input_compaction.enabled:
+            from .tool_input_compactor import ToolInputCompactor
+
+            tic_result = ToolInputCompactor(
+                self.config.tool_input_compaction,
+                compression_store=injected_store,
+            ).apply(
+                messages,
+                frozen_message_count=kwargs.get("frozen_message_count", 0),
+            )
+            messages = tic_result.messages
+            lifecycle_transforms.extend(tic_result.transforms_applied)
+            lifecycle_ccr_hashes.extend(tic_result.ccr_hashes)
 
         # Runtime overrides from CompressConfig (via kwargs from compress())
         # These override self.config defaults for this call only.
@@ -4341,16 +4845,16 @@ class ContentRouter(Transform):
             self.config.min_chars_for_block_compression,
         )
         # Store runtime options on self for access by _route_and_compress_block
-        self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
-        self._runtime_force_kompress: bool = bool(
+        self._runtime_target_ratio = kwargs.get("target_ratio")
+        self._runtime_force_kompress = bool(
             kwargs.get("force_kompress", self.config.force_kompress_all)
         )
         # skip_kompress: run everything EXCEPT the Kompress ML stage this
         # call. Used by the cold-start fast pass so the request-path pass
         # stays sub-second; units routed to Kompress take the same fallback
         # they take when the model isn't ready. Wins over force_kompress.
-        self._runtime_skip_kompress: bool = bool(kwargs.get("skip_kompress", False))
-        self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
+        self._runtime_skip_kompress = bool(kwargs.get("skip_kompress", False))
+        self._runtime_kompress_model = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
         # ``policy.toin_read_only``. ``None`` when the caller didn't
@@ -4411,7 +4915,7 @@ class ContentRouter(Transform):
         # mark the observation's message index so it is passed verbatim — so
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
-        self._protect_read_msg_indices: set[int] = set()
+        self._protect_read_msg_indices = set()
         if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
             "0",
             "",
@@ -4665,8 +5169,9 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(content)
+                        # output can still be losslessly compacted. Byte-
+                        # sensitive tools (Read) are held out by tool_name.
+                        compacted = self._lossless_compact_excluded(content, tool_name)
                         if compacted is not None:
                             folded, kind = compacted
                             result_slots[i] = {**message, "content": folded}
@@ -4692,8 +5197,9 @@ class ContentRouter(Transform):
                 # output. Fold it instead of the lossy strategy path.
                 bash_folded = self._bash_search_fold(tool_name, tool_call_id, content)
                 if bash_folded is not None:
-                    result_slots[i] = {**message, "content": bash_folded}
-                    transforms_applied.append("router:bash:lossless_search")
+                    folded_text, folded_label = bash_folded
+                    result_slots[i] = {**message, "content": folded_text}
+                    transforms_applied.append(f"router:bash:{folded_label}")
                     route_counts["bash_lossless_search"] = (
                         route_counts.get("bash_lossless_search", 0) + 1
                     )
@@ -4907,67 +5413,194 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
-            max_workers = min(
-                len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
-            )
+            configured_workers = max(1, int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4")))
+            max_workers = min(len(pending_tasks), configured_workers)
             t_parallel_start = time.perf_counter()
 
+            # Issue #7: ``HEADROOM_COMPRESSION_DEADLINE_MS`` has to bound the WHOLE
+            # pass-2 compression stage, not just the single-cache-miss special case.
+            # Previously the watchdog was armed only when ``len(pending_tasks) == 1``:
+            # with two or more cache misses the inline loop ran unbounded and the
+            # thread-pool branch blocked on ``Future.result()`` with no timeout, so a
+            # single wedged compressor hung the request forever and the documented
+            # mitigation env var appeared to do nothing. The deadline is now a stage
+            # budget: whatever has not finished when it expires fails OPEN (the block
+            # is forwarded uncompressed) instead of blocking.
+            stage_deadline_s = _compression_deadline_seconds()
+            stage_expiry = (t_parallel_start + stage_deadline_s) if stage_deadline_s else None
+
+            def _stage_passthrough(content: str) -> RouterCompressionResult:
+                return RouterCompressionResult(
+                    compressed=content,
+                    original=content,
+                    strategy_used=CompressionStrategy.PASSTHROUGH,
+                )
+
+            def _stage_remaining() -> float | None:
+                """Seconds left in the stage budget (``None`` = deadline disabled)."""
+                if stage_expiry is None:
+                    return None
+                return max(0.0, stage_expiry - time.perf_counter())
+
+            transient_fallback_slots: set[int] = set()
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                for slot_idx, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                     t0 = time.perf_counter()
-                    deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
-                    if deadline_s:
-                        box: dict[str, Any] = {}
-
-                        def _run(
-                            _box: dict[str, Any] = box,
-                            _content: str = task_content,
-                            _context: str = task_ctx,
-                            _bias: float = task_bias,
-                        ) -> None:
-                            try:
-                                _box["result"] = self.compress(
-                                    _content, context=_context, bias=_bias
-                                )
-                            except BaseException as exc:  # noqa: BLE001
-                                _box["error"] = exc
-
-                        # ponytail: daemon watchdog cannot stop native GIL holds; native layer owns that fix.
-                        worker = threading.Thread(
-                            target=_run, name="headroom-single-compress-watchdog", daemon=True
+                    deadline_s = _stage_remaining()
+                    if deadline_s == 0.0:
+                        # Budget already spent by an earlier task — don't even start.
+                        logger.warning(
+                            "ContentRouter compression stage budget (%.1fs) exhausted; "
+                            "failing open via PASSTHROUGH",
+                            stage_deadline_s,
                         )
-                        worker.start()
-                        worker.join(deadline_s)
-                        if worker.is_alive():
+                        task_results.append((_stage_passthrough(task_content), 0.0))
+                        transient_fallback_slots.add(slot_idx)
+                        continue
+                    if deadline_s is not None:
+                        future = self._submit_stage_compression(
+                            configured_workers,
+                            task_content,
+                            task_ctx,
+                            task_bias,
+                            block_for_capacity=False,
+                        )
+                        if future is None:
                             logger.warning(
-                                "ContentRouter single-cache-miss compression exceeded %.1fs; "
-                                "failing open via PASSTHROUGH",
+                                "ContentRouter compression executor is saturated; "
+                                "failing open via PASSTHROUGH"
+                            )
+                            task_results.append((_stage_passthrough(task_content), 0.0))
+                            transient_fallback_slots.add(slot_idx)
+                            continue
+                        try:
+                            r, compress_ms = future.result(timeout=deadline_s)
+                        except FuturesTimeoutError:
+                            logger.warning(
+                                "ContentRouter inline compression exceeded its %.1fs share of "
+                                "the compression stage budget; failing open via PASSTHROUGH",
                                 deadline_s,
                             )
-                            r = RouterCompressionResult(
-                                compressed=task_content,
-                                original=task_content,
-                                strategy_used=CompressionStrategy.PASSTHROUGH,
+                            # If this call was waiting in the shared queue,
+                            # remove it now; its request can no longer use the
+                            # output. A callable already running cannot be
+                            # cancelled and remains bounded by the worker pool.
+                            self._get_stage_compression_executor(configured_workers).cancel_pending(
+                                [future]
                             )
-                        elif "error" in box:
-                            raise box["error"]
-                        else:
-                            r = box["result"]
+                            r = _stage_passthrough(task_content)
+                            compress_ms = (time.perf_counter() - t0) * 1000
+                            transient_fallback_slots.add(slot_idx)
                     else:
                         r = self.compress(task_content, context=task_ctx, bias=task_bias)
-                    compress_ms = (time.perf_counter() - t0) * 1000
+                        compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
-                # Parallel compression via thread pool
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
-                        futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                # Parallel compression via thread pool. The stage budget has to
+                # bound this branch too — it is the default one (HEADROOM_COMPRESS_WORKERS
+                # defaults to 4). An unbounded ``Future.result()``, plus the implicit
+                # ``shutdown(wait=True)`` that ``ThreadPoolExecutor.__exit__`` performs,
+                # is what let a single wedged compressor block the request forever.
+                # Collect within the remaining budget, fail open for whatever has not
+                # landed, and reuse one bounded pool so stuck workers cannot grow
+                # without limit across requests.
+                task_results_by_index: list[tuple[RouterCompressionResult, float] | None] = [
+                    None
+                ] * len(pending_tasks)
+                in_flight: dict[Future[tuple[RouterCompressionResult, float]], int] = {}
+                next_task_index = 0
+                stage_executor = self._get_stage_compression_executor(configured_workers)
+
+                def _submit_available() -> None:
+                    """Fill the bounded queue, leaving overflow for a later wave."""
+                    nonlocal next_task_index
+                    while next_task_index < len(pending_tasks):
+                        _, task_content, task_ctx, task_bias, _, _ = pending_tasks[next_task_index]
+                        future = self._submit_stage_compression(
+                            configured_workers,
+                            task_content,
+                            task_ctx,
+                            task_bias,
+                            # With no deadline, preserve the historical behavior
+                            # of waiting for capacity. A finite stage must retain
+                            # the ability to fail open at its budget.
+                            block_for_capacity=stage_expiry is None,
                         )
-                    task_results = [f.result() for f in futures]
+                        if future is None:
+                            break
+                        in_flight[future] = next_task_index
+                        next_task_index += 1
+
+                def _future_result_or_cancel_siblings(
+                    future: Future[tuple[RouterCompressionResult, float]],
+                ) -> tuple[RouterCompressionResult, float]:
+                    """Propagate one failure only after cancelling retained siblings."""
+                    try:
+                        return future.result()
+                    except BaseException:  # noqa: BLE001 - preserve compressor exception
+                        stage_executor.cancel_pending(list(in_flight))
+                        raise
+
+                _submit_available()
+                while in_flight:
+                    done, _ = wait(
+                        tuple(in_flight),
+                        timeout=_stage_remaining(),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        break
+                    for future in done:
+                        task_index = in_flight[future]
+                        task_results_by_index[task_index] = _future_result_or_cancel_siblings(
+                            future
+                        )
+                        in_flight.pop(future)
+                    # A queue that was full on the first wave now has room.
+                    # Admit the next work instead of permanently rejecting it.
+                    _submit_available()
+
+                # Catch completions racing the deadline, then fail open only
+                # work that is still running, queued, or not yet admitted.
+                for future, task_index in list(in_flight.items()):
+                    if future.done():
+                        task_results_by_index[task_index] = _future_result_or_cancel_siblings(
+                            future
+                        )
+                        in_flight.pop(future)
+
+                # Results cannot be used once the shared deadline has elapsed.
+                # Cancel admitted work that is still queued so it does not run
+                # an obsolete second wave and starve later requests. Already
+                # running callables remain bounded by the shared worker count.
+                if in_flight:
+                    stage_executor.cancel_pending(list(in_flight))
+
+                unfinished = [
+                    index
+                    for index, task_result in enumerate(task_results_by_index)
+                    if task_result is None
+                ]
+                if unfinished:
+                    logger.warning(
+                        "ContentRouter parallel compression exceeded the %.1fs "
+                        "compression stage budget or executor capacity; failing "
+                        "open via PASSTHROUGH for unfinished blocks",
+                        stage_deadline_s,
+                    )
+                    for task_index in unfinished:
+                        slot_idx, task_content, _, _, _, _ = pending_tasks[task_index]
+                        transient_fallback_slots.add(slot_idx)
+                        task_results_by_index[task_index] = (
+                            _stage_passthrough(task_content),
+                            0.0,
+                        )
+
+                task_results = [
+                    task_result for task_result in task_results_by_index if task_result is not None
+                ]
 
             parallel_ms = (time.perf_counter() - t_parallel_start) * 1000
             compressor_timing["parallel_compress_total"] = parallel_ms
@@ -4982,6 +5615,16 @@ class ContentRouter(Transform):
                 compressor_timing[strategy_key] = (
                     compressor_timing.get(strategy_key, 0.0) + compress_ms
                 )
+
+                # Deadline/capacity passthrough is a transient request outcome,
+                # not evidence that this content is non-compressible. Preserve
+                # it verbatim without poisoning the skip cache, so a later
+                # request can retry after the executor recovers.
+                if slot_idx in transient_fallback_slots:
+                    result_slots[slot_idx] = message
+                    route_counts.setdefault("compression_stage_fallback", 0)
+                    route_counts["compression_stage_fallback"] += 1
+                    continue
 
                 # Lossless folds (search/log/diff via compact_lossless) shrink by
                 # collapsing repeated path prefixes, but the gate's default ratio
@@ -5173,7 +5816,9 @@ class ContentRouter(Transform):
             timing=compressor_timing,
         )
 
-    def _lossless_compact_excluded(self, content: Any) -> tuple[str, str] | None:
+    def _lossless_compact_excluded(
+        self, content: Any, tool_name: str = ""
+    ) -> tuple[str, str] | None:
         """Information-preserving compaction for a protected (excluded) tool output.
 
         Excluded tools are kept out of *lossy* compression for accuracy. This
@@ -5186,29 +5831,47 @@ class ContentRouter(Transform):
         * LOG (build/test/app logs) -> ANSI strip + run-collapse. Recoverable
           modulo non-semantic ANSI color (``expand_runs`` restores the lines).
         * JSON -> whitespace-minify. **Data-lossless** (``json.loads`` equals the
-          original object) — same information, fewer tokens. NOT byte-exact, so a
-          read-then-``Edit(old_string=…)`` on the *same* JSON file could miss; the
-          data is fully preserved.
+          original object) — same information, fewer tokens. NOT byte-exact.
+
+        None of these is byte-exact, so a *file read* is held out entirely:
+        ``tool_name`` in :data:`BYTE_SENSITIVE_EXCLUDE_TOOLS` (``Read`` and
+        friends) returns ``None`` before any fold runs, at any size. ``Read`` is
+        excluded from compression exactly because a later ``Edit(old_string=…)``
+        matches literal file bytes, and an ``old_string`` copied out of a
+        rewritten result silently fails to match the file. Callers that cannot
+        name the tool get the folds (the pre-existing behaviour).
 
         Returns ``(compacted, kind)`` when a recognized shape actually shrinks,
         else ``None``. Source code and glob path-lists match nothing -> verbatim.
-        Always safe to run (information-preserving) so there is no feature gate.
         Never raises.
         """
         if not isinstance(content, str):
+            return None
+        if _tool_output_is_byte_sensitive(tool_name):
+            # Byte-exactness beats every token saving available here. This runs
+            # BEFORE the provider seam too: the provider contract only promises
+            # information-preservation ("byte-recoverable, or data-lossless for
+            # structured data"), which is exactly the guarantee that is too weak
+            # for a file read, and the router cannot verify a third party's
+            # rewrite.
             return None
         provider = get_lossless_provider()
         if provider is not None:
             try:
                 # A registered provider is authoritative for excluded-tool
                 # compaction; fall back to the built-in folds only if it raises.
-                return provider(content)
+                candidate = provider(content)
+                if candidate is not None and self._lossless_candidate_is_smaller(
+                    content, candidate[0]
+                ):
+                    return candidate
+                return None
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "lossless provider failed; using built-in compaction",
                     exc_info=True,
                 )
-        if len(content) < 200:
+        if len(content) < LOSSLESS_FOLD_MIN_CHARS:
             return None
         try:
             from .lossless_compaction import compact_lossless
@@ -5216,12 +5879,19 @@ class ContentRouter(Transform):
             det = _try_detect_search(content)
             if det is not None and det.content_type is ContentType.SEARCH_RESULTS:
                 out = compact_lossless(content, "search")
-                return (out, "search") if len(out) < len(content) else None
+                return (
+                    (out, "search") if self._lossless_candidate_is_smaller(content, out) else None
+                )
             if _try_detect_log(content) is not None:
                 out = compact_lossless(content, "log")
-                return (out, "log") if len(out) < len(content) else None
+                return (out, "log") if self._lossless_candidate_is_smaller(content, out) else None
             minified = self._minify_json_data_lossless(content)
-            return (minified, "json") if minified is not None else None
+            return (
+                (minified, "json")
+                if minified is not None
+                and self._lossless_candidate_is_smaller(content, minified)
+                else None
+            )
         except Exception:  # noqa: BLE001
             return None
 
@@ -5241,7 +5911,9 @@ class ContentRouter(Transform):
         minified = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         return minified if len(minified) < len(content) else None
 
-    def _bash_search_fold(self, tool_name: str, tool_id: str, content: Any) -> str | None:
+    def _bash_search_fold(
+        self, tool_name: str, tool_id: str, content: Any
+    ) -> tuple[str, str] | None:
         """Byte-lossless fold for a read-only search run through a shell tool.
 
         ``bash`` is not excluded, so its output normally takes the lossy strategy
@@ -5253,9 +5925,22 @@ class ContentRouter(Transform):
         gated command (``grep -l`` path-lists, ``grep -c`` counts) simply falls
         through to the normal path with no accuracy risk.
 
-        Returns the folded text (smaller, recoverable) or ``None`` to fall through.
+        The ``search`` fold decides WHETHER to pre-empt — it shrinking is the
+        proof that the output really is ``path:line:content`` search output — but
+        it does NOT decide WHICH fold is emitted. This path ``continue``s past
+        the normal per-block route, whose STAGE 0 (:meth:`_lossless_first`) picks
+        the best of every lossless fold; emitting the ``search`` fold
+        unconditionally handed a block whose ``log``/``paths``/``text`` fold
+        folds harder the strictly worse one, for no accuracy gain. Measured at
+        +840 tokens on a 400-turn transcript of small ``grep -rn`` results once
+        the C11 floor admitted small blocks to this path. Comparing costs one
+        extra pure-stdlib fold pass on blocks that were going to be folded
+        anyway, and can never lose: the returned candidate is by construction no
+        larger than the ``search`` fold.
+
+        Returns ``(folded text, lossless label)`` or ``None`` to fall through.
         """
-        if not isinstance(content, str) or len(content) < 200:
+        if not isinstance(content, str) or len(content) < LOSSLESS_FOLD_MIN_CHARS:
             return None
         if tool_name.lower() not in self.config.bash_tool_names:
             return None
@@ -5268,7 +5953,17 @@ class ContentRouter(Transform):
             folded = compact_lossless(content, "search")
         except Exception:  # noqa: BLE001
             return None
-        return folded if len(folded) < len(content) else None
+        if not self._lossless_candidate_is_smaller(content, folded):
+            return None
+        best, label = self._lossless_first(content, CompressionStrategy.SEARCH)
+        # `lossless_diff` is the one fold that is purely subtractive with no
+        # exact-inverse check (it drops `index <hex>..<hex>` lines). This path
+        # never emitted it before and must not start: a `grep`ped diff can trip
+        # `_looks_like_diff` and lose a real matched line. Every other fold
+        # self-verifies, so it is safe to take whichever of them wins.
+        if label is not None and label != "lossless_diff" and len(best) < len(folded):
+            return best, label
+        return folded, "lossless_search"
 
     def _get_tool_bias(self, tool_name: str) -> float:
         """Look up compression bias for a tool name.
@@ -5586,8 +6281,9 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(block.get("content"))
+                        # output can still be losslessly compacted. Byte-
+                        # sensitive tools (Read) are held out by tool_name.
+                        compacted = self._lossless_compact_excluded(block.get("content"), tool_name)
                         if compacted is not None:
                             folded, kind = compacted
                             new_blocks.append({**block, "content": folded})
@@ -5647,17 +6343,18 @@ class ContentRouter(Transform):
                 # instead of taking the lossy strategy path.
                 bash_folded = self._bash_search_fold(tool_name, tool_use_id, tool_text)
                 if bash_folded is not None:
+                    folded_text, folded_label = bash_folded
                     new_blocks.append(
                         {
                             **block,
                             "content": (
-                                [{"type": "text", "text": bash_folded}]
+                                [{"type": "text", "text": folded_text}]
                                 if _tr_list_form
-                                else bash_folded
+                                else folded_text
                             ),
                         }
                     )
-                    transforms_applied.append("router:bash:lossless_search")
+                    transforms_applied.append(f"router:bash:{folded_label}")
                     if route_counts is not None:
                         route_counts["bash_lossless_search"] = (
                             route_counts.get("bash_lossless_search", 0) + 1
@@ -5915,13 +6612,8 @@ class ContentRouter(Transform):
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-        # Lossless-anchored acceptance (byte-measured): a byte/data-lossless fold
-        # (search --heading, log run-collapse) has ZERO accuracy cost, so it must
-        # never be rejected by the WORD-ratio gate below — heading/indent folds
-        # cut tokens while word count stays flat or even rises. Accept on a real
-        # BYTE reduction (there is no tokenizer in scope here; byte length is a
-        # faithful token proxy for these folds) and store a byte-based ratio so
-        # the Tier-2 result cache reuses it on later turns.
+        # Lossless-anchored acceptance uses the request tokenizer rather than the
+        # word-ratio gate below. A byte-shorter fold can still cost more tokens.
         #
         # Two shapes take this path:
         #   • Pure fold  (chain == [lossless_*])           — byte-exact, always safe.
@@ -5935,9 +6627,17 @@ class ContentRouter(Transform):
         _chain = getattr(result, "strategy_chain", None) or []
         _starts_lossless = bool(_chain) and _chain[0].startswith("lossless_")
         _is_pure_lossless = _starts_lossless and all(s.startswith("lossless_") for s in _chain)
-        _byte_accept = _starts_lossless and (_is_pure_lossless or not self.config.ccr_inject_marker)
-        if _byte_accept and len(result.compressed) < len(content):
-            _ll_ratio = len(result.compressed) / max(1, len(content))
+        _lossless_accept = _starts_lossless and (
+            _is_pure_lossless or not self.config.ccr_inject_marker
+        )
+        _ll_ratio = self._lossless_candidate_ratio(content, result.compressed)
+        if _lossless_accept and (_ll_ratio is None or _ll_ratio >= 1.0):
+            self._cache.mark_skip(content_key)
+            if route_counts is not None:
+                route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
+            return None, False
+        if _lossless_accept:
+            assert _ll_ratio is not None
             _ll_label = _chain[0] if _is_pure_lossless else "+".join(_chain)
             self._cache.put(content_key, result.compressed, _ll_ratio, _ll_label)
             transforms_applied.append(f"router:{strategy_label}:{_ll_label}")

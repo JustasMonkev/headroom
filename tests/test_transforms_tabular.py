@@ -362,6 +362,64 @@ def test_compress_spreadsheet_empty_workbook_returns_empty(tmp_path) -> None:
     assert result.tokens_saved == 0
 
 
+def test_rows_to_csv_uses_lf_and_trims_bounding_box() -> None:
+    """CRLF, phantom trailing rows and empty trailing columns are all dropped."""
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    rows = [
+        ["id", "name", None, None],
+        [1, "a", None, None],
+        [None, None, None, None],
+        [None, None, None, None],
+    ]
+    text = _rows_to_csv(rows)
+    assert "\r" not in text
+    assert text == "id,name\n1,a"
+
+
+def test_rows_to_csv_keeps_falsy_values() -> None:
+    """``0`` / ``False`` are data, not padding — the box must include them."""
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    assert _rows_to_csv([["a", "b"], [0, False]]) == "a,b\n0,False"
+
+
+def test_rows_to_csv_keeps_interior_blank_rows_and_columns() -> None:
+    """Only *trailing* emptiness is trimmed; interior gaps keep their position."""
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    rows = [["a", None, "c", None], [None, None, None, None], ["d", None, "f", None]]
+    assert _rows_to_csv(rows) == "a,,c\n,,\nd,,f"
+
+
+def test_rows_to_csv_all_blank_is_empty() -> None:
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    assert _rows_to_csv([[None, ""], ["  ", None]]) == ""
+
+
+@pytest.mark.skipif(not _HAS_OPENPYXL, reason="openpyxl not installed")
+def test_load_spreadsheet_drops_phantom_dimension_padding(tmp_path) -> None:
+    """A sheet whose declared dimensions overshoot the data renders only the data."""
+    import openpyxl
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws.append(["id", "name"])
+    ws.append([1, "a"])
+    # Touch a far cell then clear it: the stored dimension stays oversized.
+    ws.cell(row=200, column=12).value = "x"
+    ws.cell(row=200, column=12).value = None
+    path = tmp_path / "padded.xlsx"
+    wb.save(path)
+
+    text = load_spreadsheet(path)["Data"]
+    assert text == "id,name\n1,a"
+
+
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:
     from headroom.transforms.spreadsheet_ingest import load_spreadsheet
 

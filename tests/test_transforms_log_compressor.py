@@ -113,7 +113,16 @@ def test_select_dedupe_add_context_and_format_output(monkeypatch: pytest.MonkeyP
         "total": 9,
         "selected": 6,
     }
-    assert output.endswith("[3 lines omitted: 1 ERROR, 1 FAIL, 2 WARN, 1 INFO]")
+    # The footer counts what was OMITTED, not the whole log. Every ERROR,
+    # FAIL and WARN here is present in the output above, so no level is named
+    # (and INFO is never named — nobody retrieves a log for its INFO lines).
+    assert output.endswith("[3 lines compressed away]")
+
+    # A level with lines left over IS named, and only by the leftover count.
+    dropped_errors = [LogLine(0, f"ERROR e{i}", level=LogLevel.ERROR, score=1.0) for i in range(5)]
+    assert compressor._omission_summary(dropped_errors[:2], dropped_errors) == (
+        "3 lines compressed away: 3 ERROR"
+    )
 
 
 def test_log_compressor_compress_and_ccr_paths() -> None:
@@ -176,3 +185,47 @@ def test_store_in_ccr_and_result_properties(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert result.tokens_saved_estimate > 0
     assert result.lines_omitted == 15
+
+
+def test_folded_duplicates_are_not_also_counted_as_omitted() -> None:
+    """A ``×N`` survivor already represents its duplicates.
+
+    Mirror of Rust ``folded_duplicates_are_not_also_counted_as_omitted``.
+    Identical-line folding keeps one ``ERROR boom ×5`` line; the footer used to
+    subtract ``all - selected`` and so advertise the other four as compressed
+    away, contradicting the body and inviting a retrieval for errors that are
+    already on screen.
+    """
+    from headroom.transforms.log_compressor import LogCompressor, LogCompressorConfig
+
+    lines = [f"INFO step {i} ok" for i in range(40)]
+    lines += ["ERROR boom"] * 5
+    lines += [f"INFO step {i} ok" for i in range(40, 80)]
+
+    compressor = LogCompressor(LogCompressorConfig())
+    result = compressor.compress("\n".join(lines), 1.0)
+
+    assert "ERROR boom ×5" in result.compressed
+    footer = next((ln for ln in result.compressed.splitlines() if "compressed away" in ln), "")
+    assert "ERROR" not in footer, f"footer double-counts folded duplicates: {footer!r}"
+
+
+def test_literal_fold_suffix_is_counted_as_one_line() -> None:
+    lines = [
+        LogLine(0, "ERROR boom", level=LogLevel.ERROR),
+        LogLine(1, "ERROR boom", level=LogLevel.ERROR),
+        LogLine(2, "ERROR boom ×2", level=LogLevel.ERROR),
+    ]
+
+    assert LogCompressor._omission_summary([lines[2]], lines) == (
+        "2 lines compressed away: 2 ERROR"
+    )
+
+
+def test_python_fold_preserves_original_counting_source() -> None:
+    compressor = LogCompressor()
+    lines = [LogLine(i, "ERROR boom", level=LogLevel.ERROR) for i in range(5)]
+    folded, _, _ = compressor._dedupe_identical(lines, 5)
+
+    assert folded[0].content == "ERROR boom ×5"
+    assert LogCompressor._omission_summary(folded, lines) == "4 lines compressed away"

@@ -2,7 +2,11 @@
 
 import json
 
+import pytest
+
 from headroom.ccr import (
+    CCR_RETRIEVE_DESCRIPTION,
+    CCR_SYSTEM_INSTRUCTIONS,
     CCR_TOOL_NAME,
     CCRToolInjector,
     create_ccr_tool_definition,
@@ -253,8 +257,10 @@ class TestCCRToolInjector:
         injector.scan_for_markers(messages)
         updated = injector.inject_into_system_message(messages)
 
-        assert "Compressed Context Available" in updated[0]["content"]
-        assert "abc123def456abc123def456" in updated[0]["content"]
+        assert CCR_SYSTEM_INSTRUCTIONS in updated[0]["content"]
+        assert updated[0]["content"].startswith("You are helpful.")
+        # A7: hashes must NOT be echoed into the system prompt.
+        assert "abc123def456abc123def456" not in updated[0]["content"]
 
     def test_process_request_full_flow(self):
         """process_request handles complete injection flow."""
@@ -278,7 +284,7 @@ class TestCCRToolInjector:
         assert updated_tools is not None
         assert len(updated_tools) == 1
         assert updated_tools[0]["name"] == CCR_TOOL_NAME
-        assert "Compressed Context Available" in updated_messages[0]["content"]
+        assert CCR_SYSTEM_INSTRUCTIONS in updated_messages[0]["content"]
 
 
 class TestParseToolCall:
@@ -509,33 +515,37 @@ class TestSmartCrusherCcrMarkers:
 
 
 class TestSystemInstructions:
-    """Test system instruction generation."""
+    """Test system instruction generation (A7)."""
 
-    def test_create_instructions_single_hash(self):
-        """Instructions include single hash."""
+    def test_create_instructions_is_one_terse_line(self):
+        """The block is a single line naming the tool."""
         instructions = create_system_instructions(["hash123"])
 
-        assert "hash123" in instructions
+        assert instructions == CCR_SYSTEM_INSTRUCTIONS
         assert CCR_TOOL_NAME in instructions
-        assert "Compressed Context Available" in instructions
+        assert "\n" not in instructions
+        # ~20 tokens, down from ~158.
+        assert len(instructions) < 120
 
-    def test_create_instructions_multiple_hashes(self):
-        """Instructions include multiple hashes."""
-        hashes = ["hash1", "hash2", "hash3"]
-        instructions = create_system_instructions(hashes)
+    def test_create_instructions_are_byte_stable_across_hash_sets(self):
+        """The rendered text must NOT depend on which hashes are live.
 
-        for h in hashes:
-            assert h in instructions
+        The old block listed the live hashes, so the system prompt mutated on
+        every turn and busted the provider's system-prompt prefix cache — for
+        information already carried by the inline markers.
+        """
+        a = create_system_instructions(["hash1"])
+        b = create_system_instructions([f"hash{i}" for i in range(10)])
+        c = create_system_instructions([])
 
-    def test_create_instructions_truncates_many_hashes(self):
-        """Instructions truncate when many hashes present."""
-        hashes = [f"hash{i}" for i in range(10)]
-        instructions = create_system_instructions(hashes)
+        assert a == b == c
 
-        # First 5 should be present, rest truncated
-        assert "hash0" in instructions
-        assert "hash4" in instructions
-        assert "..." in instructions
+    def test_create_instructions_omits_hash_list(self):
+        """No hash from the caller may leak into the (cached) system prompt."""
+        instructions = create_system_instructions(["deadbeefcafe", "0123456789ab"])
+
+        assert "deadbeefcafe" not in instructions
+        assert "0123456789ab" not in instructions
 
 
 class TestAlternativeMarkerFormats:
@@ -620,3 +630,115 @@ class TestAlternativeMarkerFormats:
 
         assert len(hashes) == 1
         assert "fedcba9876543210fedcba98" in hashes
+
+
+class TestStructuredSystemContentInjection:
+    """A7: structured (list) system content used to be skipped entirely.
+
+    ``inject_into_system_message`` fell through to an ``else`` branch that
+    appended the message unchanged, so Anthropic-style callers — which send
+    ``system`` as a list of content blocks — silently got no instructions at all.
+    """
+
+    _MARKER = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+
+    def _injector(self):
+        injector = CCRToolInjector(inject_system_instructions=True)
+        injector.scan_for_markers([{"role": "tool", "content": self._MARKER}])
+        return injector
+
+    def test_appends_text_block_to_structured_system_content(self):
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "You are helpful."}]},
+            {"role": "tool", "content": self._MARKER},
+        ]
+
+        updated = self._injector().inject_into_system_message(messages)
+
+        blocks = updated[0]["content"]
+        assert isinstance(blocks, list)
+        assert len(blocks) == 2
+        # Original block untouched (cache-safe prefix).
+        assert blocks[0] == {"type": "text", "text": "You are helpful."}
+        assert blocks[1] == {"type": "text", "text": CCR_SYSTEM_INSTRUCTIONS}
+
+    def test_structured_injection_preserves_cache_control_blocks(self):
+        original = [
+            {"type": "text", "text": "Base prompt."},
+            {"type": "text", "text": "Cached.", "cache_control": {"type": "ephemeral"}},
+        ]
+        messages = [
+            {"role": "system", "content": original},
+            {"role": "tool", "content": self._MARKER},
+        ]
+
+        updated = self._injector().inject_into_system_message(messages)
+
+        assert updated[0]["content"][:2] == original
+
+    def test_structured_injection_is_idempotent(self):
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "You are helpful."}]},
+            {"role": "tool", "content": self._MARKER},
+        ]
+
+        once = self._injector().inject_into_system_message(messages)
+        twice = self._injector().inject_into_system_message(once)
+
+        assert twice[0]["content"] == once[0]["content"]
+
+    def test_string_injection_is_idempotent(self):
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "tool", "content": self._MARKER},
+        ]
+
+        once = self._injector().inject_into_system_message(messages)
+        twice = self._injector().inject_into_system_message(once)
+
+        assert twice[0]["content"] == once[0]["content"]
+        assert once[0]["content"].count(CCR_SYSTEM_INSTRUCTIONS) == 1
+
+    def test_missing_system_message_gets_one(self):
+        messages = [{"role": "tool", "content": self._MARKER}]
+
+        updated = self._injector().inject_into_system_message(messages)
+
+        assert updated[0] == {"role": "system", "content": CCR_SYSTEM_INSTRUCTIONS}
+
+    def test_unknown_content_shape_is_left_untouched(self):
+        messages = [
+            {"role": "system", "content": None},
+            {"role": "tool", "content": self._MARKER},
+        ]
+
+        updated = self._injector().inject_into_system_message(messages)
+
+        assert updated[0] == {"role": "system", "content": None}
+
+
+class TestSharedRetrieveDescription:
+    """A3/A4: one constant across providers AND across proxy/MCP."""
+
+    def test_all_providers_share_the_same_description(self):
+        descriptions = {
+            create_ccr_tool_definition("openai")["function"]["description"],
+            create_ccr_tool_definition("anthropic")["description"],
+            create_ccr_tool_definition("google")["description"],
+        }
+
+        assert descriptions == {CCR_RETRIEVE_DESCRIPTION}
+
+    def test_no_param_level_description(self):
+        for tool in (
+            create_ccr_tool_definition("openai")["function"]["parameters"],
+            create_ccr_tool_definition("anthropic")["input_schema"],
+            create_ccr_tool_definition("google")["parameters"],
+        ):
+            assert tool["properties"]["hash"] == {"type": "string"}
+            assert tool["required"] == ["hash"]
+
+    def test_mcp_server_reuses_the_same_constant(self):
+        mcp_server = pytest.importorskip("headroom.ccr.mcp_server")
+
+        assert mcp_server.CCR_RETRIEVE_DESCRIPTION is CCR_RETRIEVE_DESCRIPTION

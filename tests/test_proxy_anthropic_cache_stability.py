@@ -473,7 +473,7 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         assert sent["messages"][2]["content"].endswith("MEMCTX")
 
 
-def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
+def test_ccr_system_instruction_injection_remains_enabled_when_prefix_frozen(monkeypatch) -> None:
     captured = {"inject_system": None}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
@@ -504,6 +504,10 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
 
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
+
+            def adopt_hashes(self, hashes):  # noqa: ANN001
+                self.detected_hashes.extend(h for h in hashes if h not in self.detected_hashes)
+                self.has_compressed_content = bool(self.detected_hashes)
 
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
@@ -537,7 +541,7 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
         )
 
         assert response.status_code == 200
-        assert captured["inject_system"] is False
+        assert captured["inject_system"] is True
 
 
 def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
@@ -571,6 +575,10 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
 
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
+
+            def adopt_hashes(self, hashes):  # noqa: ANN001
+                self.detected_hashes.extend(h for h in hashes if h not in self.detected_hashes)
+                self.has_compressed_content = bool(self.detected_hashes)
 
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
