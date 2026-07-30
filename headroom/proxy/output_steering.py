@@ -5,12 +5,59 @@ from __future__ import annotations
 from typing import Any
 
 from headroom.proxy.output_verbosity_policy import (
-    STEERING_SENTINEL as _STEERING_SENTINEL,
-)
-from headroom.proxy.output_verbosity_policy import (
+    contains_steering_block,
     replace_or_append_steering_block,
     steering_text,
 )
+
+
+def _resteer_content_parts(
+    parts: list[Any], key: str, text: str, *, text_parts_only: bool = False
+) -> bool | None:
+    """Collapse structured steering blocks to one current block.
+
+    Structured system content used to be matched with
+    ``startswith(STEERING_SENTINEL)``, which after D4 shortened the sentinel
+    meant these paths silently stopped recognizing pre-D4
+    ``<headroom_output_shaping>`` blocks: the stale block stayed and a second
+    one was appended beside it, so two conflicting verbosity levels were sent —
+    and paid for — on every turn. Going through
+    :func:`replace_or_append_steering_block` gives the structured paths the
+    same legacy migration the plain-string path already had.
+    """
+    found = False
+    changed = False
+    kept: list[Any] = []
+    for part in parts:
+        value = part.get(key) if isinstance(part, dict) else None
+        if (
+            (text_parts_only and isinstance(part, dict) and part.get("type") != "text")
+            or not isinstance(value, str)
+            or not contains_steering_block(value)
+        ):
+            kept.append(part)
+            continue
+        updated, part_changed = replace_or_append_steering_block(value, text if not found else "")
+        found = True
+        changed = changed or part_changed
+        if updated:
+            if part_changed:
+                part[key] = updated
+            kept.append(part)
+        else:
+            if "cache_control" in part:
+                # Keep the removed part's later cache boundary at the nearest
+                # surviving predecessor; its TTL supersedes any older marker there.
+                for predecessor in reversed(kept):
+                    if isinstance(predecessor, dict):
+                        predecessor["cache_control"] = part["cache_control"]
+                        break
+            changed = True
+    if not found:
+        return None
+    if len(kept) != len(parts):
+        parts[:] = kept
+    return changed
 
 
 def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
@@ -35,17 +82,9 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
         ]
         return True
     if isinstance(system, list):
-        for block in system:
-            # Guard the text is a string before ``startswith``: a malformed
-            # client block (``{"type": "text", "text": null}``) would otherwise
-            # raise ``AttributeError`` here and 500 the request. The OpenAI chat
-            # sibling below already guards this exact case.
-            block_text = block.get("text") if isinstance(block, dict) else None
-            if isinstance(block_text, str) and block_text.startswith(_STEERING_SENTINEL):
-                if block_text == text:
-                    return False
-                block["text"] = text
-                return True
+        changed = _resteer_content_parts(system, "text", text)
+        if changed is not None:
+            return changed
         system.append({"type": "text", "text": text})
         return True
     return False
@@ -97,17 +136,9 @@ def apply_openai_chat_verbosity_steering(
         return changed
     if isinstance(content, list):
         # OpenAI also accepts a content-part list ([{"type": "text", ...}]).
-        for part in content:
-            if (
-                isinstance(part, dict)
-                and part.get("type") == "text"
-                and isinstance(part.get("text"), str)
-                and part["text"].startswith(_STEERING_SENTINEL)
-            ):
-                if part["text"] == text:
-                    return False
-                part["text"] = text
-                return True
+        part_changed = _resteer_content_parts(content, "text", text, text_parts_only=True)
+        if part_changed is not None:
+            return part_changed
         content.append({"type": "text", "text": text})
         return True
     return False

@@ -394,6 +394,19 @@ class TestUsagePollGating:
 
         assert asyncio.run(run()) is False
 
+    def test_maybe_schedule_skips_offline_mode(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+        async def run():
+            return maybe_schedule_usage_poll(
+                {
+                    "authorization": "Bearer a.b.c",
+                    "chatgpt-account-id": "acct",
+                }
+            )
+
+        assert asyncio.run(run()) is False
+
     def test_maybe_schedule_creates_task_and_throttles(self, monkeypatch):
         # Replace the network fetch with a fast no-op coroutine.
         calls: list[str] = []

@@ -15,6 +15,14 @@ from fastapi.testclient import TestClient
 from headroom.hooks import CompressionHooks
 from headroom.proxy.savings_tracker import HEADROOM_SAVINGS_PATH_ENV_VAR
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+
+@pytest.fixture(autouse=True)
+def _clean_turn_hooks():
+    clear_turn_hooks()
+    yield
+    clear_turn_hooks()
 
 
 def test_anthropic_hooks_do_not_break_extract_user_query_lookup(tmp_path, monkeypatch):
@@ -101,3 +109,78 @@ def test_anthropic_hooks_do_not_break_extract_user_query_lookup(tmp_path, monkey
             f"compression should reduce tokens: before={tokens_before} after={tokens_after}"
         )
         assert int(response.headers["x-headroom-tokens-saved"]) > 0
+
+
+def test_anthropic_tool_references_are_validated_after_request_hooks():
+    """A hook that removes a tool cannot leave its reference in the outbound body."""
+
+    class DropTool:
+        name = "drop_tool"
+
+        def on_request(self, ctx):
+            ctx.tools = [
+                tool
+                for tool in (ctx.tools or [])
+                if isinstance(tool, dict) and tool.get("name") != "drop_me"
+            ]
+
+    register_turn_hook(DropTool())
+    outbound_bodies: list[dict] = []
+
+    async def fake_retry(method, url, headers, body, *args, **kwargs):
+        import copy
+
+        outbound_bodies.append(copy.deepcopy(body))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            log_requests=False,
+        )
+    )
+    with TestClient(app) as client:
+        client.app.state.proxy._retry_request = fake_retry
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 128,
+                "messages": [
+                    {"role": "user", "content": "find a tool"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_reference", "tool_name": "keep_me"},
+                            {"type": "tool_reference", "tool_name": "drop_me"},
+                        ],
+                    },
+                ],
+                "tools": [
+                    {"name": "keep_me", "input_schema": {"type": "object"}},
+                    {"name": "drop_me", "input_schema": {"type": "object"}},
+                ],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(outbound_bodies) == 1
+    outbound = outbound_bodies[0]
+    assert [tool["name"] for tool in outbound["tools"]] == ["keep_me"]
+    references = outbound["messages"][1]["content"]
+    assert [ref["tool_name"] for ref in references] == ["keep_me"]
+    transforms = response.headers.get("x-headroom-transforms", "")
+    assert "tool_reference_repair" in transforms
+    assert "turn_hook" not in transforms

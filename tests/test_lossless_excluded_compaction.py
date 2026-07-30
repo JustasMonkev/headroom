@@ -9,7 +9,10 @@ using only reversible / data-preserving transforms:
 * JSON           -> whitespace-minify         [data-lossless; same object, NOT byte-exact]
 
 Source code and glob path-lists match nothing -> untouched. Always on
-(information-preserving, so it needs no feature gate) in every path.
+(information-preserving, so it needs no feature gate) in every path — EXCEPT for
+byte-sensitive tools (`Read` and friends), whose results must reach the model
+byte-for-byte because `Edit(old_string=...)` matches literal file bytes. Those
+are held out of every fold at every size.
 """
 
 from __future__ import annotations
@@ -21,7 +24,12 @@ import pytest
 from headroom.providers import OpenAIProvider
 from headroom.tokenizer import Tokenizer
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.lossless_compaction import expand_runs, search_unheading, strip_ansi
+from headroom.transforms.lossless_compaction import (
+    compact_lossless,
+    expand_runs,
+    search_fold_recovers,
+    strip_ansi,
+)
 from headroom.transforms.lossless_provider import (
     get_lossless_provider,
     set_lossless_provider,
@@ -62,7 +70,7 @@ def test_grep_search_fold_is_byte_lossless():
     out, kind = _compact(GREP)
     assert kind == "search"
     assert len(out) < len(GREP)
-    assert search_unheading(out) == GREP  # byte-exact
+    assert search_fold_recovers(out, GREP)  # byte-exact
 
 
 def test_log_compaction_recovers_modulo_ansi():
@@ -103,17 +111,38 @@ def _run(content: str, tool: str, tokenizer):
 def test_pipeline_folds_grep_and_recovers(tokenizer):
     out, transforms = _run(GREP, "grep", tokenizer)
     assert "router:excluded:lossless_search" in transforms
-    assert search_unheading(out) == GREP
+    assert search_fold_recovers(out, GREP)
 
 
-def test_pipeline_compacts_log_read(tokenizer):
-    out, transforms = _run(LOG, "read", tokenizer)
+def test_pipeline_compacts_log_output(tokenizer):
+    # NOT a `read`: the log fold drops ANSI and collapses repeated lines, which
+    # is information-preserving but not byte-preserving — see the byte-fidelity
+    # tests below.
+    out, transforms = _run(LOG, "glob", tokenizer)
     assert "router:excluded:lossless_log" in transforms
     assert expand_runs(out) == strip_ansi(LOG)
 
 
-def test_pipeline_minifies_json_read(tokenizer):
-    out, transforms = _run(JSON, "read", tokenizer)
+def test_pipeline_rejects_byte_smaller_token_larger_fold(tokenizer):
+    lines = []
+    for i in range(30):
+        line = f"aaaaaaaa{i:02d}"
+        lines += [line, line]
+    for i in range(10):
+        lines[i * 2] = f"INFO {lines[i * 2]}"
+    content = "\n".join(lines) + "\n"
+    folded = compact_lossless(content, "log")
+    assert len(folded) < len(content)
+    assert tokenizer.count_text(folded) > tokenizer.count_text(content)
+
+    out, transforms = _run(content, "grep", tokenizer)
+
+    assert out == content
+    assert "router:excluded:lossless_log" not in transforms
+
+
+def test_pipeline_minifies_json_output(tokenizer):
+    out, transforms = _run(JSON, "glob", tokenizer)
     assert "router:excluded:lossless_json" in transforms
     assert json.loads(out) == json.loads(JSON)  # data-lossless (same object)
 
@@ -121,6 +150,31 @@ def test_pipeline_minifies_json_read(tokenizer):
 def test_pipeline_leaves_source_read_untouched(tokenizer):
     out, _ = _run(CODE, "read", tokenizer)
     assert out == CODE
+
+
+# --- byte fidelity: a protected file READ is never rewritten ----------------
+#
+# The folds above are INFORMATION-preserving, not BYTE-preserving. `Read` is
+# excluded from compression precisely because a later `Edit(old_string=...)`
+# matches literal file bytes, so an `old_string` copied out of a minified /
+# run-collapsed Read result silently fails to match the file. Byte-sensitive
+# tools are therefore held out of every fold, at every size.
+
+
+@pytest.mark.parametrize("payload", [JSON, LOG])
+def test_pipeline_leaves_recent_read_byte_identical(payload, tokenizer):
+    out, transforms = _run(payload, "read", tokenizer)
+    assert out == payload
+    assert not any(t.startswith("router:excluded:lossless") for t in transforms), transforms
+
+
+def test_unit_holdout_is_keyed_on_the_tool_name():
+    router = ContentRouter(ContentRouterConfig())
+    # Same content, same size: only the tool name decides.
+    assert router._lossless_compact_excluded(JSON, "Grep") is not None
+    assert router._lossless_compact_excluded(JSON, "Read") is None
+    assert router._lossless_compact_excluded(LOG, "Read") is None
+    assert router._lossless_compact_excluded(GREP, "Read") is None
 
 
 # --- pluggable lossless provider seam ---------------------------------------
@@ -137,7 +191,7 @@ def test_default_no_provider_uses_builtin():
     # Unset (default) → built-in folds run; GREP compacts via search-heading.
     assert get_lossless_provider() is None
     out, kind = _compact(GREP)
-    assert kind == "search" and search_unheading(out) == GREP
+    assert kind == "search" and search_fold_recovers(out, GREP)
 
 
 def test_registered_provider_is_authoritative():
@@ -157,4 +211,4 @@ def test_provider_exception_falls_back_to_builtin():
     set_lossless_provider(boom)
     # Falls back to the built-in fold rather than crashing or passing through raw.
     out, kind = _compact(GREP)
-    assert kind == "search" and search_unheading(out) == GREP
+    assert kind == "search" and search_fold_recovers(out, GREP)

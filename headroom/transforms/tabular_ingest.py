@@ -176,7 +176,7 @@ class TabularCompressor:
 
         headers, rows, fmt = parsed
         records = to_records(headers, rows)
-        json_str = json.dumps(records, ensure_ascii=False)
+        json_str = json.dumps(records, separators=(",", ":"), ensure_ascii=False)
 
         # Lazy import keeps the Rust dependency off the import path until a
         # tabular payload actually arrives.

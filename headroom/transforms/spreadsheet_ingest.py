@@ -18,12 +18,55 @@ from pathlib import Path
 __all__ = ["load_spreadsheet"]
 
 
+def _is_blank(cell: object) -> bool:
+    """True for cells that carry no data (``None`` or whitespace-only text).
+
+    ``0`` and ``False`` are real values, so only ``None`` and blank strings
+    count — an ``is None`` check alone would keep ``""`` padding cells.
+    """
+    if cell is None:
+        return True
+    return isinstance(cell, str) and not cell.strip()
+
+
+def _bounding_box(rows: list[list[object]]) -> tuple[int, int]:
+    """Return ``(n_rows, n_cols)`` of the populated region of ``rows``.
+
+    openpyxl's read-only mode trusts the sheet's declared dimensions, which
+    editors routinely over-report — a 12×4 table can arrive as 800×26, and every
+    phantom row renders as a ``,,,,`` line. Trailing empty rows *and* trailing
+    empty columns are trimmed so the CSV covers only real data.
+    """
+    last_row = 0
+    last_col = 0
+    for r_idx, row in enumerate(rows, start=1):
+        row_last_col = 0
+        for c_idx, cell in enumerate(row, start=1):
+            if not _is_blank(cell):
+                row_last_col = c_idx
+        if row_last_col:
+            last_row = r_idx
+            last_col = max(last_col, row_last_col)
+    return last_row, last_col
+
+
 def _rows_to_csv(rows: list[list[object]]) -> str:
-    """Render rows to CSV text, dropping fully empty trailing rows."""
+    """Render rows to CSV text, dropping fully empty trailing rows and columns.
+
+    The writer is pinned to ``\\n`` line endings: csv's default ``excel``
+    dialect emits ``\\r\\n``, which costs a token per row and leaves a dangling
+    ``\\r`` on the final line after stripping.
+    """
+    n_rows, n_cols = _bounding_box(rows)
+    if not n_rows or not n_cols:
+        return ""
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    for row in rows:
-        writer.writerow(["" if cell is None else cell for cell in row])
+    writer = csv.writer(buf, lineterminator="\n")
+    for row in rows[:n_rows]:
+        trimmed = list(row[:n_cols])
+        if len(trimmed) < n_cols:
+            trimmed.extend([None] * (n_cols - len(trimmed)))
+        writer.writerow(["" if cell is None else cell for cell in trimmed])
     return buf.getvalue().strip("\n")
 
 

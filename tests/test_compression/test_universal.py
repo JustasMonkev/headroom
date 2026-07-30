@@ -123,7 +123,7 @@ class TestUniversalCompressor:
     def test_compress_json_content(self, compressor):
         """Test compression of JSON content."""
         content = json.dumps(
-            {"users": [{"id": i, "name": f"User {i}", "bio": "x" * 100} for i in range(10)]}
+            {"users": [{"id": i, "name": f"User {i}", "bio": "x" * 300} for i in range(10)]}
         )
 
         result = compressor.compress(content)
@@ -132,6 +132,44 @@ class TestUniversalCompressor:
         assert result.handler_used == "json"
         # Compression should reduce size
         assert len(result.compressed) < len(content)
+
+    def test_short_spans_are_left_verbatim(self, compressor):
+        """Spans under `_MIN_SPAN_TO_COMPRESS` (50) keep their bytes.
+
+        The floor is set on value, not on safety — the net-win guard below is
+        what makes a low floor safe — but it still exists: fragmenting a span
+        that short is not worth an elision marker.
+        """
+        # 45-char bios: every non-structural span lands under the floor.
+        content = json.dumps({"users": [{"id": i, "bio": "note " * 9} for i in range(10)]})
+
+        result = compressor.compress(content)
+
+        assert result.compressed == content
+        assert "…[c]…" not in result.compressed
+
+    def test_spans_over_the_floor_compress(self, compressor):
+        """…and just over it they do compress. Pins the 50 floor from above.
+
+        Raising the floor to 100 turned this into a no-op, and on real inputs
+        that was a measured loss: log spans after entropy preservation sit in
+        the 50-100 char band, so a 100-char floor disabled the compressor
+        exactly where it had the most to remove (600-line log: 20,415 tokens
+        at 50 vs 29,999 — no-op — at 100).
+        """
+        content = json.dumps({"users": [{"id": i, "bio": "note " * 12} for i in range(10)]})
+
+        result = compressor.compress(content)
+
+        assert "…[c]…" in result.compressed
+        assert len(result.compressed) < len(content)
+
+    def test_no_span_is_ever_replaced_by_something_longer(self, compressor):
+        """The per-span net-win guard, which is what makes a low floor safe."""
+        for filler in ("note " * 9, "note " * 12, "x" * 60, "y" * 400):
+            content = json.dumps({"users": [{"id": i, "bio": filler} for i in range(10)]})
+            result = compressor.compress(content)
+            assert len(result.compressed) <= len(content), filler
 
     def test_compress_code_content(self, compressor):
         """Test compression of code content."""

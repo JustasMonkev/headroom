@@ -81,7 +81,7 @@ def test_repeated_codex_read_folds_body_keeps_varying_header():
     assert items[2]["output"] == _wrap("492f0f", "0.0000") + BODY
     # later read: identical body folded to a pointer; the per-call header stays verbatim
     later = items[5]["output"]
-    assert "[↑" in later
+    assert "L same as msg " in later
     assert later.startswith("Chunk ID: a1b2c3\nWall time: 0.0100")
     assert "def paginate_orders" not in later  # body folded away
     # lossless: the folded body is still fully present earlier in the request

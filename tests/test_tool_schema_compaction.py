@@ -12,6 +12,7 @@ from __future__ import annotations
 from headroom.proxy.tool_schema_compaction import (
     compact_tool_schema_value,
     compact_tools,
+    invalidate_cache,
 )
 
 # ---------------------------------------------------------------------------
@@ -255,6 +256,29 @@ class TestCompactTools:
         assert result["max_tokens"] == 1024
         assert len(result["messages"]) == 1
 
+    def test_initial_miss_result_cannot_poison_layer1_cache(self) -> None:
+        invalidate_cache()
+        payload = {
+            "tools": [
+                {
+                    "name": "search",
+                    "description": "  Search   repositories  ",
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                    },
+                }
+            ]
+        }
+
+        first, modified, _, _ = compact_tools(payload)
+        assert modified
+        first["tools"][0]["name"] = "poisoned"
+
+        second, modified, _, _ = compact_tools(payload)
+        assert modified
+        assert second["tools"][0]["name"] == "search"
+
     def test_large_github_like_tool_set(self) -> None:
         """Simulate a large tool set (like GitHub MCP with 44 tools)."""
         tools = []
@@ -438,6 +462,31 @@ class TestCompactToolDescriptions:
         assert result["model"] == "claude-sonnet-4-20250514"
         assert result["tools"][0]["name"] == "get_weather"
         assert result["tools"][0]["input_schema"]["properties"]["city"]["type"] == "string"
+
+    def test_initial_miss_result_cannot_poison_layer2_cache(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+
+        invalidate_cache()
+        payload = {
+            "tools": [
+                {
+                    "name": "search",
+                    "description": (
+                        "Search every repository in the organization. "
+                        "Supports advanced filters and pagination."
+                    ),
+                    "input_schema": {"type": "object"},
+                }
+            ]
+        }
+
+        first, modified, _, _ = compact_tool_descriptions(payload, max_chars=45)
+        assert modified
+        first["tools"][0]["description"] = "poisoned"
+
+        second, modified, _, _ = compact_tool_descriptions(payload, max_chars=45)
+        assert modified
+        assert second["tools"][0]["description"] != "poisoned"
 
     def test_large_tool_set_savings(self) -> None:
         """44 GitHub-like tools with verbose descriptions should see significant savings."""

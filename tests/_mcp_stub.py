@@ -21,12 +21,24 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
     class DummyServer:
         def __init__(self, name: str) -> None:
             self.name = name
+            # Captured handlers, so tests can exercise the registered
+            # list_tools/call_tool coroutines without the real SDK.
+            self.list_tools_handler = None
+            self.call_tool_handler = None
 
         def list_tools(self):
-            return lambda fn: fn
+            def register(fn):
+                self.list_tools_handler = fn
+                return fn
+
+            return register
 
         def call_tool(self):
-            return lambda fn: fn
+            def register(fn):
+                self.call_tool_handler = fn
+                return fn
+
+            return register
 
         def create_initialization_options(self):
             return {}
@@ -34,10 +46,16 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
     class DummyTool:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
+            # Mirror the real mcp.types.Tool attribute surface so tests can
+            # assert on tool metadata (name/description/inputSchema).
+            for key, value in kwargs.items():
+                setattr(self, key, value)
 
     class DummyTextContent:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
+            for key, value in kwargs.items():
+                setattr(self, key, value)
 
     async def dummy_stdio_server():
         raise RuntimeError("stdio_server should not run in unit tests")

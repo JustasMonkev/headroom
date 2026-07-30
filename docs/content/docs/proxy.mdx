@@ -294,10 +294,36 @@ See [Metrics](/docs/metrics) for the Prometheus and Grafana setup.
 | Flag / env | Default | Effect |
 |---|---|---|
 | `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
-| `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
+| `--offline` / `HEADROOM_OFFLINE` | `false` | Disable Headroom's **auxiliary** egress (telemetry, update checks, license reporting, model downloads). Does **not** block provider forwarding — see below. |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
 | `HEADROOM_TLS_STRICT` | strict | Set `0` to relax CA-constraint checks behind a corporate TLS-inspection proxy. |
+
+#### What offline mode guarantees
+
+Headroom runs locally and **never sends your prompts to a Headroom-hosted service** — there
+is no Headroom cloud in the request path.
+
+It is still a proxy, though: after compressing a request it forwards that request to the
+upstream you configured. If that upstream is Anthropic, OpenAI, Qwen, or any other remote
+API, your prompt reaches that provider. Traffic stays on the machine only when the upstream
+is itself local (Ollama, vLLM, LM Studio, …).
+
+`--offline` / `HEADROOM_OFFLINE=1` therefore scopes to Headroom's **auxiliary** egress:
+
+| Gated by `HEADROOM_OFFLINE` | Not gated |
+|---|---|
+| Telemetry beacon | Provider forwarding (`/v1/messages`, `/v1/chat/completions`, …) |
+| Update / release check | Explicitly enabled exporters (OpenTelemetry, Langfuse) |
+| License / usage reporting | Remote memory or vector backends you configure |
+| HuggingFace model downloads (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`) | |
+
+<Callout type="warn" title="Offline mode is not an egress firewall">
+Setting `HEADROOM_OFFLINE=1` while pointing Headroom at a remote provider still sends
+prompts to that provider. For a true air gap, combine it with a local upstream
+(`--openai-api-url http://127.0.0.1:8000`, see [Local LLM prefill](/docs/local-llm-prefill))
+or with a network-level egress block.
+</Callout>
 
 ### Performance
 

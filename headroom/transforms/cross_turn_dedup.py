@@ -34,9 +34,28 @@ from dataclasses import dataclass
 __all__ = ["DedupBlock", "dedup_blocks", "is_prefix_monotonic"]
 
 # A run must be at least this many lines AND this many chars to be worth a
-# pointer. Small dups are left alone (fragmenting context is not worth it) —
-# and a larger floor keeps the pointer comfortably shorter than the span it
-# replaces, so a fold is always a net byte win.
+# pointer. Small dups are left alone: fragmenting context is not worth it.
+#
+# The char floor is a *heuristic* prefilter, not the growth guarantee. A
+# 45-char span could become a 49-char pointer and `chars_removed` would go
+# negative while still being reported as savings; the fix for that is the
+# explicit `len(ptr) < len(span_text)` check in :func:`dedup_blocks`, which
+# holds at any floor. (Probe: floor lowered to 1 over 11-char 3-line spans —
+# 0 folds, worst per-block delta +0 chars. The guard refuses them all.)
+#
+# So the floor is free to be set on value rather than on safety, and 40 is
+# where the value is. Raising it to 120 was measured as a loss on both axes:
+#
+#     min_chars   chars removed   folds   usec/run (600 blocks)
+#            40    11,329 (9.0%)    427     10,900
+#            80     4,796 (3.8%)    109     28,152
+#           120         0 (0.0%)      0     37,097
+#
+# The CPU column runs the *wrong* way from the intuition that a higher floor
+# does less work: a folded span is dropped from the verbatim corpus, so every
+# fold shrinks the anchor index the remaining blocks are matched against. A
+# floor that folds nothing pays full matching cost on every block and buys
+# nothing with it.
 DEFAULT_MIN_LINES = 3
 DEFAULT_MIN_CHARS = 40
 # Cap anchor candidates examined per line so a hot line (e.g. ``    return``)
@@ -118,6 +137,44 @@ def _is_trivial(line: str) -> bool:
     }
 
 
+def _escape_anchor(text: str) -> str:
+    """Make an anchor unambiguous inside the ``[...]``-delimited pointer.
+
+    The pointer is closed by a literal ``]``, so an anchor that CONTAINS one —
+    ``values[index] = result``, an entirely ordinary line of code, or any JSON /
+    array-subscript payload — would otherwise be indistinguishable from the
+    terminator. A reader (or the documented pointer regex, which stops at the
+    first unescaped ``]``) would recover only ``values[index``, so the anchor no
+    longer names the line it points at and the "lossless in-context reference"
+    promise breaks.
+
+    This used to be masked by the ``{anchor!r}`` quoting that wrapped the anchor
+    in ``repr()`` quotes; removing that quoting (a token win) exposed it.
+
+    Backslash-escape both ``]`` and ``\\`` itself — escaping only ``]`` would
+    make a trailing backslash ambiguous with an escape introducer. Costs one
+    character per occurrence and nothing at all for the overwhelmingly common
+    bracket-free anchor. :func:`_unescape_anchor` is the exact inverse.
+    """
+    return text.replace("\\", "\\\\").replace("]", "\\]")
+
+
+def _unescape_anchor(text: str) -> str:
+    """Inverse of :func:`_escape_anchor` — used by the recovery path."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _pointer(span: list[str], ref_turn: int, delta: int = 0) -> str:
     """A one-line, obviously-a-reference marker naming the in-context original.
 
@@ -135,12 +192,25 @@ def _pointer(span: list[str], ref_turn: int, delta: int = 0) -> str:
     # left uncompressed. Trimming the pointer + MIN_LINES=3 lets those pay off
     # (~4.3% -> ~6% lossless on Opus). Still no hash= token (in-context recovery)
     # and keeps a short first-line anchor so the model can locate the original.
+    #
+    # Two characters that used to be here are gone. ``↑`` is a non-ASCII glyph
+    # that tokenizes to 2-3 tokens on its own and carried no information the
+    # words "same as msg" don't; ``!r`` quoting wrapped the anchor in quotes
+    # that fragment its tokenization (and doubled up whenever the anchor itself
+    # contained a quote). The leading ``[`` plus ``L same as msg`` already make
+    # the line unmistakably a marker.
+    #
+    # The anchor is escaped (see `_escape_anchor`): the pointer is closed by a
+    # literal ``]``, so an anchor containing one must not be able to terminate
+    # it early. Truncation happens on the RAW text so the visible budget is
+    # unchanged; escaping is applied after.
     anchor = next((_num_and_key(ln)[2].strip() for ln in span if ln.strip()), "")
     if len(anchor) > 20:
         anchor = anchor[:17] + "..."
+    anchor = _escape_anchor(anchor)
     if delta:
-        return f"[↑{len(span)}L same as msg {ref_turn} {delta:+d}L: {anchor!r}]"
-    return f"[↑{len(span)}L same as msg {ref_turn}: {anchor!r}]"
+        return f"[{len(span)}L same as msg {ref_turn} {delta:+d}L: {anchor}]"
+    return f"[{len(span)}L same as msg {ref_turn}: {anchor}]"
 
 
 def _index_lines(
@@ -259,9 +329,14 @@ def dedup_blocks(
                 if m is not None and m[0] >= min_lines:
                     span = lines[i : i + m[0]]
                     span_text = "\n".join(span)
-                    if len(span_text) >= min_chars:
-                        ref_turn = blocks[m[1]].turn
-                        ptr = _pointer(span, ref_turn, m[3])
+                    ref_turn = blocks[m[1]].turn
+                    ptr = _pointer(span, ref_turn, m[3]) if len(span_text) >= min_chars else ""
+                    # The floors are heuristics; THIS is the guarantee. The
+                    # pointer's length is data-dependent (turn ordinal, delta,
+                    # anchor), so no static floor can promise it is shorter than
+                    # what it replaces. Without this check a fold could add
+                    # bytes and still be counted as savings.
+                    if ptr and len(ptr) < len(span_text):
                         out.append(ptr)
                         # Folded span is NOT verbatim in this block's output:
                         # mark None so it can't seed a later contiguous match,

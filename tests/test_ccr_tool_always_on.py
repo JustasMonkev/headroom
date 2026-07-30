@@ -235,33 +235,28 @@ def test_no_session_id_falls_back_to_per_turn_decision():
 # here MUST be deliberate — bumping the schema mid-session busts every
 # active session's prompt cache (the tool list bytes are part of the
 # cache key).
+#
+# Snapshot bumped once for A3 (docs/token-efficiency-review.md): the same
+# 478-char description was duplicated across the OpenAI/Anthropic/Google
+# branches; it is now one shared terse constant with no param-level
+# description. ~129 tok -> ~61 tok per request, sticky-on.
 _ANTHROPIC_CCR_TOOL_SNAPSHOT_BYTES = (
     b'{"name":"headroom_retrieve",'
-    b'"description":"Retrieve original uncompressed content that was '
-    b"compressed to save tokens. Use this when you need more data than "
-    b"what's shown in compressed tool results. The hash is provided in "
-    b'compression markers like [N items compressed... hash=abc123].",'
+    b'"description":"Get the original uncompressed content for a hash '
+    b'shown in a compression marker.",'
     b'"input_schema":{"type":"object",'
-    b'"properties":{'
-    b'"hash":{"type":"string",'
-    b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"}"
-    b'},"required":["hash"]}}'
+    b'"properties":{"hash":{"type":"string"}},'
+    b'"required":["hash"]}}'
 )
 
 _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
     b'{"type":"function",'
     b'"function":{"name":"headroom_retrieve",'
-    b'"description":"Retrieve original uncompressed content that was '
-    b"compressed to save tokens. Use this when you need more data than "
-    b"what's shown in compressed tool results. The hash is provided in "
-    b'compression markers like [N items compressed... hash=abc123].",'
+    b'"description":"Get the original uncompressed content for a hash '
+    b'shown in a compression marker.",'
     b'"parameters":{"type":"object",'
-    b'"properties":{'
-    b'"hash":{"type":"string",'
-    b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"}"
-    b'},"required":["hash"]}}}'
+    b'"properties":{"hash":{"type":"string"}},'
+    b'"required":["hash"]}}}'
 )
 
 

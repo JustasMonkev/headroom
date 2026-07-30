@@ -304,6 +304,27 @@ class TestCopilotQuotaSnapshot:
 
 class TestCopilotQuotaPollLoopLeak:
     @pytest.mark.asyncio
+    async def test_offline_mode_disables_startup_and_polling(self, monkeypatch):
+        from headroom.subscription import copilot_quota as module
+        from headroom.subscription.copilot_quota import _CopilotQuotaTracker
+
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        monkeypatch.setattr(
+            module,
+            "discover_github_token",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("offline mode attempted GitHub token discovery")
+            ),
+        )
+        tracker = _CopilotQuotaTracker()
+
+        assert tracker.is_available() is False
+        await tracker.start()
+        await tracker._maybe_poll()
+
+        assert tracker._task is None
+
+    @pytest.mark.asyncio
     async def test_poll_loop_does_not_leak_event_wait_tasks(self, monkeypatch):
         """Regression for the ``asyncio.shield(event.wait())`` pattern.
 

@@ -159,8 +159,11 @@ def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> Non
     assert storage.get("two") == second
     assert storage.get("missing") is None
 
+    # Paging is newest-first (sort desc, THEN offset/limit), matching
+    # SQLiteStorage's ORDER BY timestamp DESC LIMIT ? OFFSET ?: matches are
+    # ["three" (now), "two" (1h ago)], so offset=1 pages past "three".
     results = storage.query(start_time=now - timedelta(hours=1, minutes=30), offset=1, limit=1)
-    assert [item.request_id for item in results] == ["three"]
+    assert [item.request_id for item in results] == ["two"]
     assert storage.query(model="claude")[0].request_id == "two"
     assert storage.query(mode="optimize")[0].request_id == "two"
     assert storage.query(end_time=now - timedelta(hours=1, minutes=30))[0].request_id == "one"
@@ -292,3 +295,73 @@ def test_sqlite_storage_get_conn_reuses_connection_and_create_storage_entrypoint
         lambda group: [SimpleNamespace(name="custom", load=lambda: lambda url: created)],
     )
     assert create_storage("custom://db") is created
+
+
+def test_jsonl_paging_matches_sqlite_and_stays_bounded(tmp_path: Path) -> None:
+    """JSONL paging mirrors SQLite (newest-first) across offsets/limits, and
+    the bounded-heap implementation handles edge cases (offset past the end,
+    zero-size pages) identically."""
+    jsonl = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite = SQLiteStorage(str(tmp_path / "metrics.db"))
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    for i in range(10):
+        m = _metrics(str(i), now - timedelta(hours=9 - i))
+        jsonl.save(m)
+        sqlite.save(m)
+
+    for offset, limit in [(0, 3), (2, 3), (0, 100), (9, 5), (20, 3), (0, 1)]:
+        got_jsonl = [m.request_id for m in jsonl.query(limit=limit, offset=offset)]
+        got_sqlite = [m.request_id for m in sqlite.query(limit=limit, offset=offset)]
+        assert got_jsonl == got_sqlite, (offset, limit)
+
+    assert jsonl.query(limit=0) == []
+    sqlite.close()
+
+
+def test_jsonl_query_handles_mixed_timestamp_awareness(tmp_path: Path) -> None:
+    """parse_timestamp keeps a '+00:00' offset but strips 'Z', so a long-lived
+    file can mix naive and aware timestamps; ordering must not raise
+    TypeError and must treat naive as UTC."""
+    from datetime import timezone
+
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    naive = _metrics("naive", datetime(2026, 4, 23, 12, 0, 0))
+    aware = _metrics("aware", datetime(2026, 4, 23, 13, 0, 0, tzinfo=timezone.utc))
+    storage.save(naive)
+    storage.save(aware)
+
+    results = storage.query(limit=10)
+    assert [m.request_id for m in results] == ["aware", "naive"]
+    assert [m.request_id for m in storage.query(limit=1)] == ["aware"]
+
+
+def test_jsonl_time_filters_handle_mixed_awareness(tmp_path: Path) -> None:
+    """Aware filter bounds against naive records (and vice versa) must not
+    raise TypeError — paging exhausts the history, so one mismatched record
+    would break every filtered page."""
+    from datetime import timezone
+
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    storage.save(_metrics("naive", datetime(2026, 4, 23, 12, 0, 0)))
+    storage.save(_metrics("aware", datetime(2026, 4, 23, 13, 0, 0, tzinfo=timezone.utc)))
+
+    aware_bound = datetime(2026, 4, 23, 12, 30, 0, tzinfo=timezone.utc)
+    naive_bound = datetime(2026, 4, 23, 12, 30, 0)
+    for bound in (aware_bound, naive_bound):
+        assert [m.request_id for m in storage.query(start_time=bound)] == ["aware"]
+        assert [m.request_id for m in storage.query(end_time=bound)] == ["naive"]
+        assert storage.count(start_time=bound) == 1
+        assert storage.get_summary_stats(start_time=bound)["total_requests"] == 1
+
+
+def test_jsonl_iter_all_skips_undecodable_lines(tmp_path: Path) -> None:
+    """A torn multibyte write must skip only the damaged line, not raise from
+    inside the file iterator and break every page."""
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    storage.save(_metrics("ok1", datetime(2026, 4, 23, 12, 0, 0)))
+    with open(storage.file_path, "ab") as fh:
+        fh.write(b'{"id":"torn","model":"gpt\xff4o"}\n')
+    storage.save(_metrics("ok2", datetime(2026, 4, 23, 13, 0, 0)))
+
+    assert [m.request_id for m in storage.query(limit=10)] == ["ok2", "ok1"]
+    assert storage.count() == 2

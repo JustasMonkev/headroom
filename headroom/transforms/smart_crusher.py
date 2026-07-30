@@ -66,6 +66,18 @@ logger = logging.getLogger(__name__)
 # `crates/headroom-core/.../compaction/mod.rs`.
 _SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
 
+# The `<headroom:tool_digest sha256="…">` marker is carried in
+# `TransformResult.markers_inserted`, never in message content.
+#
+# It is provenance metadata: a digest of the pre-compression bytes. Nothing
+# reads it back — a repo-wide grep for `tool_digest` / `extract_markers` finds
+# only `utils.py` (which builds and parses it) and `tests/test_utils.py`. In
+# message content it cost ~16-18 tokens on EVERY crushed tool result (~650
+# tokens across a 40-result transcript), all of it billed to the model for
+# something no code path consumes. Out-of-band it is free and still available
+# to any caller that wants it.
+_TOOL_DIGEST_IS_OUT_OF_BAND = True
+
 
 # ─── CCR sentinel ─────────────────────────────────────────────────────────
 #
@@ -657,7 +669,7 @@ class SmartCrusher(Transform):
             # (Python's `json.dumps` and serde_json don't necessarily
             # agree on e.g. non-ASCII escaping).
             result = dict(result)
-            result["items"] = json.dumps(kept)
+            result["items"] = json.dumps(kept, separators=(",", ":"), ensure_ascii=False)
         if not lost:
             return result
 
@@ -712,7 +724,11 @@ class SmartCrusher(Transform):
             kept, lost = self._splice_missing_protected(protected, parsed)
             # Only reserialize when something was actually spliced in —
             # see the matching comment in `_apply_audit_safe_protection`.
-            candidate = json.dumps(kept) if len(kept) != len(parsed) else crushed
+            candidate = (
+                json.dumps(kept, separators=(",", ":"), ensure_ascii=False)
+                if len(kept) != len(parsed)
+                else crushed
+            )
         else:
             lost = sum(
                 max(0, len(p.findall(original_content)) - len(p.findall(crushed)))
@@ -1235,7 +1251,15 @@ class SmartCrusher(Transform):
     ) -> TransformResult:
         """Transform-protocol entry point. Walks every tool/tool_result
         message, applies SmartCrusher to large enough payloads, and
-        replaces the message content with `<crushed>\\n<digest_marker>`.
+        replaces the message content with the crushed text.
+
+        The `<headroom:tool_digest sha256="…">` marker is NOT appended to the
+        message any more (`_TOOL_DIGEST_IS_OUT_OF_BAND`): it is a provenance
+        digest with no consumer outside `utils.extract_markers` and its tests,
+        so every crushed message paid ~16-18 tokens for metadata the model was
+        billed for and nothing read. It is still computed and returned in
+        `TransformResult.markers_inserted`, which is where callers that want
+        the digest can find it.
 
         Pure orchestration — the per-message compression delegates to
         Rust via `_smart_crush_content`.
@@ -1290,8 +1314,9 @@ class SmartCrusher(Transform):
                             content, query_context
                         )
                         if was_modified:
+                            # Out-of-band only — see `_TOOL_DIGEST_IS_OUT_OF_BAND`.
                             marker = create_tool_digest_marker(compute_short_hash(content))
-                            msg["content"] = crushed + "\n" + marker
+                            msg["content"] = crushed
                             crushed_count += 1
                             _record(msg.get("tool_call_id"))
                             markers_inserted.append(marker)
@@ -1323,8 +1348,9 @@ class SmartCrusher(Transform):
                         tool_content, query_context
                     )
                     if was_modified:
+                        # Out-of-band only — see `_TOOL_DIGEST_IS_OUT_OF_BAND`.
                         marker = create_tool_digest_marker(compute_short_hash(tool_content))
-                        content[i]["content"] = crushed + "\n" + marker
+                        content[i]["content"] = crushed
                         crushed_count += 1
                         _record(block.get("tool_use_id"))
                         markers_inserted.append(marker)

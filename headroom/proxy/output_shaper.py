@@ -37,6 +37,12 @@ block to the tail of the ``instructions`` string, and
 :func:`route_responses_effort` lowers an explicitly-present
 ``reasoning.effort`` on mechanical continuations. :func:`shape_responses_request`
 is the Responses-format counterpart of :func:`shape_request`.
+
+On models with native output controls (``text.verbosity``), the native knob
+replaces instruction steering rather than stacking on top of it: the steering
+paragraph is never appended for those requests, and ``text.verbosity`` is set
+to ``low`` only on mechanical continuations — new user asks and error
+continuations keep the verbosity the client asked for.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from headroom.proxy.output_effort_policy import (
 )
 from headroom.proxy.output_effort_policy import (
     LEGACY_THINKING_FLOOR,
+    TEXT_VERBOSITY_RANK,
     can_create_openai_text_verbosity,
     clamp_legacy_thinking_budget,
     lower_effort_value,
@@ -260,10 +267,65 @@ def route_openai_reasoning_effort(
     return []
 
 
-def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
-    """Set or lower OpenAI ``text.verbosity`` conservatively."""
+def _native_output_controls_available(
+    body: dict[str, Any],
+    *,
+    first_party_target: bool = False,
+) -> bool:
+    """Whether this request can be shaped via native OpenAI output controls.
+
+    True when ``text.verbosity`` can safely be created for this
+    model/upstream pair, or when the client already sent a recognized
+    ``text.verbosity`` value (presence proves the target accepts the
+    parameter, whoever the target is). Requests with native controls skip the
+    instruction-steering paragraph entirely: the native knob shapes output
+    without spending input tokens, and never appending keeps ``instructions``
+    byte-stable across every turn of the conversation.
+
+    The corollary of the upstream gate in
+    :func:`can_create_openai_text_verbosity` is that a non-first-party
+    upstream falls back here to the portable steering paragraph, so output
+    shaping still happens on gateways — it just uses the lever that works
+    everywhere.
+    """
+    if can_create_openai_text_verbosity(
+        body.get("model"),
+        first_party_target=first_party_target,
+    ):
+        return True
     text_config = body.get("text")
-    can_create = can_create_openai_text_verbosity(body.get("model"))
+    if isinstance(text_config, dict):
+        verbosity = text_config.get("verbosity")
+        return isinstance(verbosity, str) and verbosity in TEXT_VERBOSITY_RANK
+    return False
+
+
+def route_openai_text_verbosity(
+    body: dict[str, Any],
+    kind: TurnKind,
+    *,
+    first_party_target: bool = False,
+) -> list[str]:
+    """Set or lower OpenAI ``text.verbosity`` on mechanical continuations only.
+
+    New user asks and error continuations keep their original verbosity —
+    forcing ``low`` onto a fresh question degrades answers the user actually
+    wants to read. ``text`` is a per-request parameter, not prompt prefix, so
+    varying it by turn kind has no prefix-cache cost.
+
+    ``first_party_target`` gates only *creating* the field (see
+    :func:`can_create_openai_text_verbosity`). Lowering a verbosity the client
+    itself supplied is never upstream-gated: the client already proved the
+    target accepts ``text.verbosity`` by sending it, so the saving is free and
+    available on every gateway.
+    """
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return []
+    text_config = body.get("text")
+    can_create = can_create_openai_text_verbosity(
+        body.get("model"),
+        first_party_target=first_party_target,
+    )
     if text_config is None:
         if not can_create:
             return []
@@ -289,8 +351,16 @@ def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
     level_override: int | None = None,
+    *,
+    first_party_target: bool = False,
 ) -> ShapeResult:
-    """Apply OpenAI Responses output-shaping levers in place."""
+    """Apply OpenAI Responses output-shaping levers in place.
+
+    ``first_party_target`` is the verified identity of the *effective upstream*
+    for this request (``is_first_party_openai_target(resolved_url)``), not the
+    request dialect. It gates creation of the OpenAI-native ``text.verbosity``
+    field only; every other lever here is portable and runs regardless.
+    """
     if settings is None:
         settings = OutputShaperSettings.from_env()
     result = ShapeResult()
@@ -299,12 +369,26 @@ def shape_openai_responses_request(
 
     assert result.labels is not None  # __post_init__ guarantees
 
+    kind = classify_openai_responses_input(body.get("input"))
+    native_controls = _native_output_controls_available(
+        body,
+        first_party_target=first_party_target,
+    )
+
+    # Steering paragraph and native output controls are alternatives, not a
+    # stack (F5): when the model supports text.verbosity, the native knob
+    # shapes output without spending input tokens, so the steering block is
+    # never appended for those requests — which also keeps ``instructions``
+    # byte-stable across the whole conversation.
     level = settings.verbosity_level if level_override is None else level_override
-    if level > 0 and apply_openai_responses_verbosity_steering(body, level):
+    if (
+        level > 0
+        and not native_controls
+        and apply_openai_responses_verbosity_steering(body, level)
+    ):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
 
-    kind = classify_openai_responses_input(body.get("input"))
     if settings.effort_router_enabled:
         labels = route_openai_reasoning_effort(body, kind, settings)
         if labels:
@@ -312,7 +396,11 @@ def shape_openai_responses_request(
             result.labels.extend(labels)
             logger.debug("OpenAIOutputShaper: turn=%s mutations=%s", kind.value, labels)
 
-    labels = route_openai_text_verbosity(body)
+    labels = route_openai_text_verbosity(
+        body,
+        kind,
+        first_party_target=first_party_target,
+    )
     if labels:
         result.changed = True
         result.labels.extend(labels)

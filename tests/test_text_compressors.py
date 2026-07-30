@@ -138,7 +138,14 @@ class TestSearchCompressor:
         assert "function_" in result.compressed
 
     def test_keeps_first_and_last(self):
-        """First and last matches are preserved."""
+        """First and last matches are preserved.
+
+        Asserted as content, not as layout: a single-file result is rendered
+        `rg --heading` style (path once, then `line:content` rows), so the
+        flat `path:line:content` spelling no longer appears. The invariant
+        this test exists for is *which matches survive*, not how they are
+        spelled — tests/test_search_compressor.py pins the shape.
+        """
         content = "\n".join([f"src/file.py:{i}:line {i}" for i in range(1, 101)])
 
         compressor = SearchCompressor(
@@ -149,8 +156,9 @@ class TestSearchCompressor:
         )
         result = compressor.compress(content)
 
-        assert "src/file.py:1:line 1" in result.compressed
-        assert "src/file.py:100:line 100" in result.compressed
+        assert "src/file.py" in result.compressed
+        assert "1:line 1" in result.compressed
+        assert "100:line 100" in result.compressed
 
     def test_prioritizes_errors(self):
         """Error lines are prioritized."""
@@ -164,15 +172,28 @@ class TestSearchCompressor:
 
         assert "ERROR: something failed" in result.compressed
 
-    def test_small_results_unchanged(self):
-        """Small search results pass through unchanged."""
+    def test_small_results_lose_nothing(self):
+        """Small search results keep every match and every byte of content.
+
+        They are no longer byte-identical: two matches in one file repeat the
+        path, and auto-grouping (`AUTO_GROUP_MIN_MATCHES = 2`) hoists it into
+        a heading. That is lossless re-rendering, and it is a measured win
+        even at this size — 16 → 12 `o200k_base` tokens here, and 500 → 380
+        on 20 files x 2 matches. What must hold is that nothing is dropped,
+        summarised, or sent to CCR.
+        """
         content = "src/file.py:1:def foo():\nsrc/file.py:2:    pass"
 
         compressor = SearchCompressor()
         result = compressor.compress(content)
 
-        assert result.compression_ratio == 1.0
-        assert result.compressed == content
+        assert result.original_match_count == 2
+        assert result.compressed_match_count == 2
+        assert result.summaries == {}
+        assert result.cache_key is None
+        assert result.compressed == "src/file.py\n1:def foo():\n2:    pass"
+        # Re-rendered, never grown.
+        assert result.compression_ratio <= 1.0
 
 
 class TestLogCompressor:

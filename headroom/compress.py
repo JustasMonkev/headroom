@@ -56,6 +56,7 @@ Examples:
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from dataclasses import dataclass, field, replace
@@ -227,6 +228,29 @@ def compress(
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
 
+    # Captured before any hook runs: the fail-open handler below promises
+    # "returning original messages", but `messages` gets rebound by
+    # hooks.pre_compress / pipeline extensions — a hook that forgets to
+    # return the list would otherwise make the fail-open path hand None
+    # (or a hook-mangled list) to the provider. A deep snapshot, not an
+    # alias: a hook may mutate the list or its dicts IN PLACE and then a
+    # later stage may raise, and an alias would forward the mutated request
+    # anyway. Only paid when third-party code (hooks / extensions) actually
+    # gets a mutable reference — the plain path never mutates the input.
+    if hooks is not None or pipeline_extensions.enabled:
+        try:
+            original_messages = copy.deepcopy(messages)
+        except Exception:
+            # Messages can carry non-deepcopyable payloads (locks, open file
+            # handles, provider objects with a raising __deepcopy__). The
+            # snapshot is best-effort hardening — it must never itself abort
+            # the request, so fall back to aliasing: fail-open then can't
+            # undo an in-place hook mutation, but it still returns the
+            # caller's list.
+            original_messages = messages
+    else:
+        original_messages = messages
+
     try:
         # Compute biases from hooks if provided
         biases = None
@@ -354,7 +378,7 @@ def compress(
         )
         logger.warning("Compression failed, returning original messages: %s", e)
         return CompressResult(
-            messages=messages,
+            messages=original_messages,
             tokens_before=0,
             tokens_after=0,
             tokens_saved=0,

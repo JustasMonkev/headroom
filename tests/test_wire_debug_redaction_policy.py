@@ -45,6 +45,20 @@ def test_wire_debug_key_matching_normalizes_dashes_and_case() -> None:
     assert not should_redact_key("token_count")
 
 
+def test_wire_debug_redacts_codex_attestation_header() -> None:
+    redacted = redact_for_wire_debug(
+        {
+            "x-oai-attestation": "signed-attestation",
+            "x-codex-window-id": "window-id",
+        }
+    )
+
+    assert redacted == {
+        "x-oai-attestation": WIRE_DEBUG_REDACTED,
+        "x-codex-window-id": "window-id",
+    }
+
+
 def test_wire_debug_redacts_proxy_authorization() -> None:
     redacted = redact_for_wire_debug(
         {"Proxy-Authorization": "Basic dXNlcjpwYXNz", "user-agent": "codex/1.0"}

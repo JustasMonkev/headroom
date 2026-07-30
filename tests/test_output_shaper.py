@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from headroom.proxy.output_shaper import (
     LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
@@ -25,6 +27,7 @@ from headroom.proxy.output_shaper import (
     shape_request,
     steering_text,
 )
+from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
 
 ENABLED = OutputShaperSettings(enabled=True)
 
@@ -147,7 +150,7 @@ class TestVerbositySteering:
         apply_verbosity_steering(body, 2)
         assert apply_verbosity_steering(body, 4) is True
         steering_blocks = [
-            b for b in body["system"] if b["text"].startswith("<headroom_output_shaping>")
+            b for b in body["system"] if b["text"].startswith(STEERING_SENTINEL)
         ]
         assert len(steering_blocks) == 1
         assert steering_blocks[0]["text"] == steering_text(4)
@@ -325,7 +328,7 @@ class TestOpenAIResponsesSteering:
         body = {"instructions": f"System.\n\n{steering_text(1)}"}
 
         assert apply_openai_responses_verbosity_steering(body, 2) is True
-        assert body["instructions"].count("<headroom_output_shaping>") == 1
+        assert body["instructions"].count(STEERING_SENTINEL) == 1
         assert steering_text(1) not in body["instructions"]
         assert steering_text(2) in body["instructions"]
 
@@ -361,26 +364,73 @@ class TestOpenAIResponsesReasoning:
 
 
 class TestOpenAIResponsesTextVerbosity:
-    def test_text_verbosity_set_for_gpt5_family(self):
-        body = {"model": "gpt-5.1"}
-        labels = route_openai_text_verbosity(body)
+    def test_text_verbosity_set_at_or_above_the_feature_cutoff(self):
+        # Native output controls engage only on gpt >= MIN_GPT_FEATURE_VERSION.
+        body = {"model": "gpt-5.5"}
+        labels = route_openai_text_verbosity(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            first_party_target=True,
+        )
         assert labels == ["output_shaper:text_verbosity:unset->low"]
         assert body["text"] == {"verbosity": "low"}
 
-    def test_text_verbosity_not_injected_for_non_gpt5(self):
-        body = {"model": "gpt-4o"}
-        assert route_openai_text_verbosity(body) == []
+    @pytest.mark.parametrize("model", ["gpt-4o", "gpt-5", "gpt-5.1", "gpt-5.4", "o3"])
+    def test_text_verbosity_not_injected_below_the_feature_cutoff(self, model):
+        # Below the cutoff the request still flows — we just never CREATE the
+        # native knob (models that lack it 400 on the field).
+        body = {"model": model}
+        assert (
+            route_openai_text_verbosity(
+                body,
+                TurnKind.MECHANICAL_CONTINUATION,
+                first_party_target=True,
+            )
+            == []
+        )
         assert "text" not in body
 
     def test_existing_text_verbosity_is_lowered_for_any_model(self):
         body = {"model": "gpt-4o", "text": {"verbosity": "medium"}}
-        labels = route_openai_text_verbosity(body)
+        labels = route_openai_text_verbosity(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            first_party_target=True,
+        )
         assert labels == ["output_shaper:text_verbosity:medium->low"]
         assert body["text"]["verbosity"] == "low"
 
-    def test_shape_openai_responses_combines_steering_native_knobs(self):
+    def test_text_verbosity_untouched_on_new_user_ask(self):
+        # Fresh questions keep the verbosity the client asked for — the
+        # low-verbosity knob only applies to mechanical continuations.
+        body = {"model": "gpt-5.5", "text": {"verbosity": "medium"}}
+        assert (
+            route_openai_text_verbosity(
+                body,
+                TurnKind.NEW_USER_ASK,
+                first_party_target=True,
+            )
+            == []
+        )
+        assert body["text"]["verbosity"] == "medium"
+
+    def test_text_verbosity_untouched_on_error_continuation(self):
+        body = {"model": "gpt-5.5", "text": {"verbosity": "high"}}
+        assert (
+            route_openai_text_verbosity(
+                body,
+                TurnKind.ERROR_CONTINUATION,
+                first_party_target=True,
+            )
+            == []
+        )
+        assert body["text"]["verbosity"] == "high"
+
+    def test_shape_openai_responses_native_knobs_replace_steering(self):
+        # F5: on models with native output controls, text.verbosity replaces
+        # the steering paragraph — no instruction bytes are spent.
         body = {
-            "model": "gpt-5",
+            "model": "gpt-5.5",
             "input": [
                 {
                     "type": "function_call_output",
@@ -392,16 +442,157 @@ class TestOpenAIResponsesTextVerbosity:
             "reasoning": {"effort": "xhigh"},
             "text": {"verbosity": "medium"},
         }
-        result = shape_openai_responses_request(body, ENABLED)
+        result = shape_openai_responses_request(body, ENABLED, first_party_target=True)
 
         assert result.changed is True
         assert result.labels == [
-            "output_shaper:verbosity:L2",
             "output_shaper:reasoning_effort:xhigh->low",
             "output_shaper:text_verbosity:medium->low",
         ]
-        assert steering_text(2) in body["instructions"]
+        assert body["instructions"] == "System."
+        assert steering_text(2) not in body["instructions"]
         assert body["reasoning"]["effort"] == "low"
+        assert body["text"]["verbosity"] == "low"
+
+    def test_shape_openai_responses_steering_kept_without_native_controls(self):
+        # Models without text.verbosity support still get the steering
+        # paragraph — it is the only output-shaping lever there.
+        body = {
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                }
+            ],
+            "instructions": "System.",
+        }
+        result = shape_openai_responses_request(body, ENABLED, first_party_target=True)
+
+        assert result.changed is True
+        assert result.labels == ["output_shaper:verbosity:L2"]
+        assert steering_text(2) in body["instructions"]
+        assert "text" not in body
+
+    def test_shape_openai_responses_native_new_ask_leaves_body_untouched(self):
+        # New user ask on a native-controls model: no steering, no verbosity
+        # override — the request goes through unshaped (except effort, which
+        # is already gated on mechanical turns).
+        body = {
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": "explain X"}],
+            "instructions": "System.",
+            "text": {"verbosity": "medium"},
+        }
+        result = shape_openai_responses_request(body, ENABLED, first_party_target=True)
+
+        assert result.changed is False
+        assert body["instructions"] == "System."
+        assert body["text"]["verbosity"] == "medium"
+
+
+class TestOpenAITextVerbosityUpstreamScoping:
+    """``text.verbosity`` may only be CREATED against a verified OpenAI target.
+
+    A ``/v1/responses`` turn routed through ``x-headroom-base-url`` keeps the
+    OpenAI wire format while the upstream is an arbitrary compatible gateway.
+    The shared model parser accepts vendor-prefixed ids (``openai/gpt-5.5``) —
+    exactly what those gateways use — so the model gate alone no longer keeps
+    the native field away from them.
+    """
+
+    MECHANICAL_INPUT = [
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+    ]
+
+    @pytest.mark.parametrize("model", ["openai/gpt-5.5", "gpt-5.5", "openai/gpt-6"])
+    def test_gateway_upstream_never_gains_a_created_text_verbosity(self, model):
+        body = {"model": model}
+        labels = route_openai_text_verbosity(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            first_party_target=False,
+        )
+        assert labels == []
+        assert "text" not in body
+
+    @pytest.mark.parametrize("model", ["openai/gpt-5.5", "gpt-5.5", "openai/gpt-6"])
+    def test_first_party_upstream_still_gains_text_verbosity(self, model):
+        body = {"model": model}
+        labels = route_openai_text_verbosity(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            first_party_target=True,
+        )
+        assert labels == ["output_shaper:text_verbosity:unset->low"]
+        assert body["text"] == {"verbosity": "low"}
+
+    def test_gateway_upstream_does_not_fill_in_an_empty_text_block(self):
+        # `text` present but verbosity unset is still a CREATE of the field.
+        body = {"model": "openai/gpt-5.5", "text": {"format": {"type": "text"}}}
+        labels = route_openai_text_verbosity(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            first_party_target=False,
+        )
+        assert labels == []
+        assert "verbosity" not in body["text"]
+
+    @pytest.mark.parametrize("supplied,expected", [("high", "low"), ("medium", "low")])
+    def test_client_supplied_verbosity_is_still_lowered_on_a_gateway(
+        self,
+        supplied,
+        expected,
+    ):
+        # Lowering is never upstream-gated: the client already proved the
+        # target accepts `text.verbosity` by sending it.
+        body = {"model": "openai/gpt-5.5", "text": {"verbosity": supplied}}
+        labels = route_openai_text_verbosity(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            first_party_target=False,
+        )
+        assert labels == [f"output_shaper:text_verbosity:{supplied}->{expected}"]
+        assert body["text"]["verbosity"] == expected
+
+    def test_unknown_upstream_fails_closed(self):
+        # No `first_party_target` argument at all: the default must not create
+        # the field. Failing closed costs only the native lever.
+        body = {"model": "openai/gpt-5.5"}
+        assert route_openai_text_verbosity(body, TurnKind.MECHANICAL_CONTINUATION) == []
+        assert "text" not in body
+
+    def test_gateway_falls_back_to_portable_steering(self):
+        # The native knob and the steering paragraph are alternatives; losing
+        # the native one on a gateway must hand shaping back to the portable
+        # lever rather than dropping output shaping entirely.
+        body = {
+            "model": "openai/gpt-5.5",
+            "input": list(self.MECHANICAL_INPUT),
+            "instructions": "System.",
+        }
+        result = shape_openai_responses_request(body, ENABLED, first_party_target=False)
+
+        assert result.changed is True
+        assert result.labels == ["output_shaper:verbosity:L2"]
+        assert steering_text(2) in body["instructions"]
+        assert "text" not in body
+
+    def test_gateway_with_client_verbosity_keeps_native_path_and_no_steering(self):
+        # Client-supplied verbosity proves the gateway accepts the field, so
+        # the native lever stays in charge and instructions stay byte-stable.
+        body = {
+            "model": "openai/gpt-5.5",
+            "input": list(self.MECHANICAL_INPUT),
+            "instructions": "System.",
+            "text": {"verbosity": "high"},
+        }
+        result = shape_openai_responses_request(body, ENABLED, first_party_target=False)
+
+        assert result.changed is True
+        assert result.labels == ["output_shaper:text_verbosity:high->low"]
+        assert body["instructions"] == "System."
         assert body["text"]["verbosity"] == "low"
 
 

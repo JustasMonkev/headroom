@@ -739,4 +739,362 @@ class TestOutputFormatting:
         result = compressor.compress(content)
 
         # Should have omission summary
-        assert "lines omitted" in result.compressed
+        assert "compressed away" in result.compressed
+
+
+class TestC2EmissionWaste:
+    """Footer merge, honest omission counts, byte-identical dedup, tight context.
+
+    All four are properties of the Rust implementation `compress()` delegates
+    to; the Python shim helpers mirror them for the legacy direct-call surface.
+    """
+
+    @staticmethod
+    def _compress(content, **cfg):
+        base = {"min_lines_for_ccr": 5, "enable_ccr": False}
+        base.update(cfg)
+        return LogCompressor(config=LogCompressorConfig(**base)).compress(content)
+
+    def test_single_fused_footer_instead_of_two_lines(self):
+        """CCR mode emits ONE trailing line carrying both facts, not two."""
+        lines = [f"INFO: step {i}" for i in range(200)]
+        lines.append("ERROR: boom")
+        result = LogCompressor(
+            config=LogCompressorConfig(min_lines_for_ccr=50, enable_ccr=True)
+        ).compress("\n".join(lines))
+
+        assert result.cache_key is not None
+        trailing = [ln for ln in result.compressed.splitlines() if ln.startswith("[")]
+        assert len(trailing) == 1, trailing
+        # Both facts on the one line, and the scanner token is intact.
+        assert "lines compressed away" in trailing[0]
+        assert "Retrieve more: hash=" in trailing[0]
+        assert "lines compressed to" not in result.compressed
+
+    def test_fused_footer_is_still_seen_by_the_ccr_marker_scanner(self):
+        """The merge must not cost the model its retrieve tool (#1006).
+
+        `ccr/tool_injection.py` only recognises a bracket marker containing the
+        word `compressed`. After the merge this footer is the ONLY place the
+        retrieval hash appears, so a footer that said "omitted" would leave the
+        model holding a hash the retrieve tool was never injected for.
+        """
+        from headroom.ccr.tool_injection import CCRToolInjector
+
+        lines = [f"INFO: step {i}" for i in range(200)]
+        lines.append("ERROR: boom")
+        result = LogCompressor(
+            config=LogCompressorConfig(min_lines_for_ccr=50, enable_ccr=True)
+        ).compress("\n".join(lines))
+        assert result.cache_key is not None
+
+        patterns = CCRToolInjector()._marker_patterns
+        assert any(p.search(result.compressed) for p in patterns), result.compressed[-200:]
+
+    def test_footer_does_not_advertise_errors_that_are_still_present(self):
+        """The old footer counted ALL lines, so it named errors printed above."""
+        lines = [f"INFO: step {i}" for i in range(200)]
+        lines.insert(10, "ERROR: the only error")
+        result = self._compress("\n".join(lines))
+
+        assert "ERROR: the only error" in result.compressed
+        footer = next(ln for ln in result.compressed.splitlines() if "compressed away" in ln)
+        assert "ERROR" not in footer, footer
+
+    def test_footer_never_mentions_info(self):
+        lines = [f"INFO: step {i}" for i in range(300)]
+        result = self._compress("\n".join(lines))
+        footer = next(ln for ln in result.compressed.splitlines() if "compressed away" in ln)
+        assert "INFO" not in footer, footer
+
+    def test_byte_identical_errors_fold_with_a_count(self):
+        content = "\n".join(["ERROR: connection refused"] * 40 + [f"INFO: x{i}" for i in range(40)])
+        result = self._compress(content)
+
+        assert result.compressed.count("ERROR: connection refused") == 1
+        assert "ERROR: connection refused ×40" in result.compressed
+
+    @staticmethod
+    def _same_error_different_context():
+        """Two byte-identical ERROR lines, each followed by a *different* reason."""
+        lines = [f"INFO worker {i} ok" for i in range(30)]
+        lines += [
+            "ERROR request failed",
+            "  caused by: database connection refused",
+            "  host=db-primary port=5432",
+        ]
+        lines += [f"INFO worker {i} ok" for i in range(30, 60)]
+        lines += [
+            "ERROR request failed",
+            "  caused by: permission denied for user svc",
+            "  role=svc-reader",
+        ]
+        lines += [f"INFO worker {i} ok" for i in range(60, 90)]
+        return "\n".join(lines)
+
+    def test_every_occurrence_of_a_folded_error_keeps_its_own_context(self):
+        """Identical error text is not identical failure.
+
+        Line-level dedup marked the later occurrence suppressed, and context was
+        expanded only around the survivor — so the output was
+        ``ERROR request failed ×2`` plus the database detail, with the
+        permission detail gone from the window entirely. The count still folds;
+        the surroundings of every occurrence are kept.
+        """
+        result = self._compress(self._same_error_different_context())
+
+        assert "database connection refused" in result.compressed
+        assert "permission denied" in result.compressed, result.compressed
+        # The error text is still emitted once, with its count.
+        assert result.compressed.count("ERROR request failed") == 1
+        assert "ERROR request failed ×2" in result.compressed
+        assert result.compression_ratio < 0.5
+
+    def test_identical_error_with_identical_context_still_folds_to_one(self):
+        """The token win must survive: same error AND same surroundings -> ×N."""
+        block = ["running the batch", "ERROR connection refused", "  retrying", "  giving up"]
+        content = "\n".join(block * 4 + [f"INFO tick {i}" for i in range(60)])
+        result = self._compress(content)
+
+        assert "ERROR connection refused ×4" in result.compressed
+        assert result.compressed.count("ERROR connection refused") == 1
+
+    def test_occurrence_expansion_is_bounded(self):
+        """One error repeated 500 times must not open 500 context windows."""
+        lines = []
+        for i in range(500):
+            lines.append("ERROR boom")
+            lines.append(f"detail line {i}")
+        result = self._compress("\n".join(lines), max_errors=10, max_total_lines=100)
+
+        body = result.compressed.splitlines()
+        assert len(body) <= 101, len(body)
+        assert "ERROR boom ×500" in result.compressed
+
+    def test_python_mirror_tracks_occurrences_and_expands_each(self):
+        """The legacy Python shim must mirror the Rust behaviour exactly."""
+        compressor = LogCompressor(config=LogCompressorConfig())
+        all_lines = [
+            LogLine(0, "before a", level=LogLevel.INFO),
+            LogLine(1, "ERROR boom", level=LogLevel.ERROR),
+            LogLine(2, "after a", level=LogLevel.INFO),
+            LogLine(3, "before b", level=LogLevel.INFO),
+            LogLine(4, "ERROR boom", level=LogLevel.ERROR),
+            LogLine(5, "after b", level=LogLevel.INFO),
+        ]
+        errors = [all_lines[1], all_lines[4]]
+        kept, suppressed, occurrences = compressor._dedupe_identical(errors, 10)
+
+        assert len(kept) == 1
+        assert kept[0].content == "ERROR boom ×2"
+        assert suppressed == {4}
+        assert occurrences == {1: [4]}
+
+        selected = compressor._add_context(all_lines, list(kept), suppressed, occurrences)
+        got = {line.content for line in selected}
+        # Both occurrences' neighbours, not just the survivor's.
+        assert "after a" in got
+        assert "after b" in got
+        # …and the folded duplicate itself never rides back in.
+        assert all(line.line_number != 4 for line in selected)
+
+        # Cap 0 (buckets that are never context-expanded) tracks nothing.
+        _, _, none_tracked = compressor._dedupe_identical([all_lines[1], all_lines[4]], 0)
+        assert none_tracked == {}
+
+    def test_errors_differing_in_an_id_are_all_kept(self):
+        """`_dedupe_similar` would collapse these; byte-identical dedup must not."""
+        errors = [f"FAILED test_apply[case-{i}]: assert 0 == 1" for i in range(8)]
+        content = "\n".join(errors + [f"INFO: x{i}" for i in range(60)])
+        result = self._compress(content, max_errors=20)
+
+        for i in range(8):
+            assert f"case-{i}]" in result.compressed, f"case-{i} was hidden"
+
+    def test_identical_traces_collapse_to_one_with_a_count(self):
+        trace = [
+            "Traceback (most recent call last):",
+            '  File "app.py", line 12, in run',
+            "ValueError: bad input",
+        ]
+        # A non-trace line separates the groups (blank lines stay *inside* a
+        # Python traceback, so they would not end one).
+        lines = []
+        for i in range(6):
+            lines.append(f"running case {i}")
+            lines.extend(trace)
+        content = "\n".join(lines + [f"INFO: x{i}" for i in range(40)])
+        result = self._compress(content)
+
+        # The exact group boundary depends on the trace state machine, so the
+        # assertion is on the property: repeats collapse into a counted marker
+        # and the frame list is not printed six times.
+        assert "[same trace ×" in result.compressed
+        assert result.compressed.count('File "app.py", line 12, in run') <= 2
+
+    def test_trace_annotation_does_not_corrupt_folded_error_counts(self):
+        compressor = LogCompressor()
+        all_lines = [
+            LogLine(0, "fatal error: concurrent map writes", LogLevel.ERROR, True),
+            LogLine(1, "runtime.throw()", is_stack_trace=True),
+            LogLine(2, "fatal error: concurrent map writes", LogLevel.ERROR, True),
+            LogLine(3, "runtime.throw()", is_stack_trace=True),
+        ]
+        errors, _, _ = compressor._dedupe_identical([all_lines[0], all_lines[2]], 10)
+        traces, _ = compressor._dedupe_identical_traces(
+            [[all_lines[0], all_lines[1]], [all_lines[2], all_lines[3]]]
+        )
+        selected = sorted({*errors, *traces[0]}, key=lambda line: line.line_number)
+
+        assert all_lines[0].content == "fatal error: concurrent map writes"
+        assert compressor._omission_summary(selected, all_lines) == "2 lines compressed away"
+        assert compressor._omission_summary(traces[0], all_lines) == "2 lines compressed away"
+
+        literal = [
+            LogLine(0, "fatal error: boom [same trace ×2]", LogLevel.ERROR),
+            LogLine(1, "fatal error: boom", LogLevel.ERROR),
+            LogLine(2, "fatal error: boom", LogLevel.ERROR),
+        ]
+        assert (
+            compressor._omission_summary([literal[0]], literal)
+            == "2 lines compressed away: 2 ERROR"
+        )
+
+    def test_traces_differing_by_a_line_number_are_both_kept(self):
+        def trace(n):
+            return [
+                "running a case",
+                "Traceback (most recent call last):",
+                f'  File "app.py", line {n}, in run',
+                "ValueError: bad input",
+            ]
+
+        content = "\n".join(trace(12) + trace(99) + [f"INFO: x{i}" for i in range(40)])
+        result = self._compress(content)
+
+        assert "[same trace" not in result.compressed
+        assert "line 12" in result.compressed
+        assert "line 99" in result.compressed
+
+    def test_pytest_banners_do_not_drag_in_their_neighbours(self):
+        """`====` banners match the summary patterns; they must not expand."""
+        lines = []
+        for i in range(12):
+            lines.append(f"=========================== block {i} ============================")
+            lines.extend(f"noise line {i}.{j}" for j in range(8))
+        content = "\n".join(lines)
+        result = self._compress(content, max_total_lines=100)
+
+        # No ERROR/FAIL anywhere, so no context expansion should have happened:
+        # only the banner lines themselves survive.
+        body = [ln for ln in result.compressed.splitlines() if not ln.startswith("[")]
+        assert all(ln.startswith("====") for ln in body), body
+
+    def test_context_window_is_asymmetric_around_errors(self):
+        lines = [f"line {i}" for i in range(60)]
+        lines[30] = "ERROR: boom"
+        result = self._compress("\n".join(lines), max_total_lines=100)
+        kept = set(result.compressed.splitlines())
+
+        assert "ERROR: boom" in kept
+        assert "line 29" in kept  # 1 before
+        assert "line 31" in kept and "line 32" in kept  # 2 after
+        assert "line 28" not in kept
+        assert "line 33" not in kept
+
+    def test_warning_keeps_multiline_diagnostic_context(self):
+        lines = [f"INFO before {i}" for i in range(30)]
+        lines.extend(
+            [
+                "warning: unused variable `value`",
+                "  --> src/main.rs:12:9",
+                "12 |     let value = 1;",
+                "   |         ^^^^^ help: prefix it with an underscore",
+            ]
+        )
+        lines.extend(f"INFO after {i}" for i in range(30))
+
+        result = self._compress("\n".join(lines), max_total_lines=100)
+
+        assert "src/main.rs:12:9" in result.compressed
+        assert "12 |     let value = 1;" in result.compressed
+        assert "^^^^^ help" in result.compressed
+
+
+class TestFailureDetailSurvives:
+    """The narrow context window must not cost the *reason* a test failed.
+
+    On a real pytest run the assertion text lives in the FAILURES block, many
+    lines away from anything the level classifier recognises as a failure.
+    Keeping it as *context* around a FAIL line made it a hostage of the window
+    width; it is now selected on its own merit (`_is_failure_detail`), so these
+    tests pin content, not window arithmetic.
+    """
+
+    PYTEST_RUN = "\n".join(
+        [
+            "=" * 30 + " test session starts " + "=" * 30,
+            "platform linux -- Python 3.12.3, pytest-8.2.0",
+            "collected 62 items",
+            "",
+        ]
+        + [f"tests/test_core.py::test_case_{i} PASSED" for i in range(58)]
+        + [
+            "",
+            "=" * 35 + " FAILURES " + "=" * 35,
+            "_" * 27 + " test_invoice_totals " + "_" * 27,
+            "",
+            "    def test_invoice_totals():",
+            "        inv = build_invoice(items=[Item('a', 3), Item('b', 4)])",
+            ">       assert inv.total == 700",
+            "E       assert 690 == 700",
+            "E        +  where 690 = Invoice(id='inv_31', total=690).total",
+            "",
+            "tests/test_billing.py:88: AssertionError",
+            "=" * 27 + " short test summary info " + "=" * 27,
+            "FAILED tests/test_billing.py::test_invoice_totals",
+            "1 failed, 58 passed in 2.31s",
+        ]
+    )
+
+    @staticmethod
+    def _compress(content, **cfg):
+        base = {"min_lines_for_ccr": 5, "enable_ccr": False}
+        base.update(cfg)
+        return LogCompressor(config=LogCompressorConfig(**base)).compress(content)
+
+    def test_assertion_detail_survives_a_pytest_run(self):
+        result = self._compress(self.PYTEST_RUN)
+
+        # *That* it failed …
+        assert "FAILED" in result.compressed
+        # … and *why*, which is the part a narrow context window used to drop.
+        assert "assert 690 == 700" in result.compressed
+        assert "AssertionError" in result.compressed
+        # … attributed to the test it belongs to.
+        assert "test_invoice_totals" in result.compressed
+        # Still a real win, not a pass-through.
+        assert result.compression_ratio < 0.5
+
+    def test_exception_line_survives_without_a_nearby_error_keyword(self):
+        """`ValueError: ...` has no word-boundary `Error`, so the level
+        classifier never sees it. It must survive anyway."""
+        lines = [f"processing record {i}" for i in range(80)]
+        lines[40] = "ValueError: unparseable timestamp in column 'created_at'"
+        result = self._compress("\n".join(lines))
+
+        assert "ValueError: unparseable timestamp" in result.compressed
+
+    def test_detector_does_not_over_fire_on_ordinary_prose(self):
+        """Cheap prefix checks must not turn a quiet log into a no-op."""
+        lines = [
+            "Everything is fine",
+            "E",
+            "E ok",
+            "INFO: recovered from an Error",
+            "reassert the lock",
+        ] * 20
+        result = self._compress("\n".join(lines))
+
+        body = [ln for ln in result.compressed.splitlines() if not ln.startswith("[")]
+        assert len(body) < len(lines), "nothing was compressed away"

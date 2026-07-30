@@ -36,7 +36,7 @@ from .models import (
     SessionEvent,
     ToolCall,
 )
-from .writer import extract_marker_block
+from .writer import _normalize_heading, extract_marker_block
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +414,27 @@ def _format_tool_call(tc: ToolCall) -> str:
 # LLM Call — Sonnet 4.6 with structured output
 # =============================================================================
 
+# Closed vocabulary of section headings (E2 in docs/token-efficiency-review.md).
+# Section dedup used to compare LLM-free-written headings verbatim, so
+# "Environment", "Environment Rules" and "Environment Setup" accumulated side by
+# side in the context file forever. The writer now normalizes headings before
+# comparing (headroom.learn.writer._normalize_heading), and the model is
+# constrained to this list so the rendered headings stay stable too.
+SECTION_VOCABULARY: tuple[str, ...] = (
+    "Environment",
+    "Commands",
+    "File Paths",
+    "Search Scope",
+    "Build and Test",
+    "Workflow",
+    "Preferences",
+    "Failure Modes",
+    "Loop Guardrails",
+)
+_SECTION_BY_KEY = {_normalize_heading(section): section for section in SECTION_VOCABULARY}
+
+_SECTION_VOCABULARY_LIST = ", ".join(f'"{s}"' for s in SECTION_VOCABULARY)
+
 _SYSTEM_PROMPT = """\
 You are an expert at analyzing coding agent sessions to extract actionable patterns.
 
@@ -447,6 +468,12 @@ Rules:
 - Keep recommendations concise — each should be 1-3 lines of markdown
 - Do NOT produce tautological rules (e.g., "use python3 not python3")
 - Do NOT produce rules about things that only happened once (transient errors)
+- Every "section" MUST be copied verbatim from this closed list, with no
+  additions, suffixes or rewording: __SECTION_VOCABULARY__.
+  Pick the closest match and put the rule there; do NOT invent a new heading
+  and do NOT emit variants like "Environment Rules" or "Environment Setup".
+  Emit each heading at most once — merge everything that belongs under it into
+  that one section's bullets.
 
 Prior Learned Patterns:
 - The input may contain a "Prior Learned Patterns" section showing what is
@@ -470,7 +497,7 @@ Return ONLY valid JSON matching this schema — no other text:
 {
   "context_file_rules": [
     {
-      "section": "string — section heading (e.g., 'Environment', 'File Paths', 'Commands')",
+      "section": "string — a heading copied verbatim from the closed list above",
       "content": "string — markdown content, 1-3 bullet points",
       "estimated_tokens_saved": "integer — tokens saved per session if rule existed",
       "evidence_count": "integer — number of occurrences supporting this rule"
@@ -478,7 +505,7 @@ Return ONLY valid JSON matching this schema — no other text:
   ],
   "memory_file_rules": [
     {
-      "section": "string — section heading",
+      "section": "string — a heading copied verbatim from the closed list above",
       "content": "string — markdown content, 1-3 bullet points",
       "estimated_tokens_saved": "integer",
       "evidence_count": "integer"
@@ -486,6 +513,11 @@ Return ONLY valid JSON matching this schema — no other text:
   ]
 }
 """
+
+# Substituted after the literal: the prompt body contains JSON braces, so
+# str.format() is not usable here.
+_SYSTEM_PROMPT = _SYSTEM_PROMPT.replace("__SECTION_VOCABULARY__", _SECTION_VOCABULARY_LIST)
+assert "__SECTION_VOCABULARY__" not in _SYSTEM_PROMPT
 
 
 def _strip_fenced_json(raw: str) -> dict:
@@ -844,7 +876,7 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     for rule in raw.get("context_file_rules", []):
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
+        section = _SECTION_BY_KEY.get(_normalize_heading(rule.get("section", "").strip()), "")
         content = rule.get("content", "").strip()
         if not section or not content:
             continue
@@ -862,7 +894,7 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     for rule in raw.get("memory_file_rules", []):
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
+        section = _SECTION_BY_KEY.get(_normalize_heading(rule.get("section", "").strip()), "")
         content = rule.get("content", "").strip()
         if not section or not content:
             continue
@@ -877,10 +909,37 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
             )
         )
 
+    # E2: the model is told to use a closed heading vocabulary, but it can still
+    # emit "Environment" and "Environment Rules" in one response. Fold
+    # equivalent headings together (per target) before they ever reach the
+    # writer, keeping the first heading's spelling.
+    recommendations = _merge_equivalent_sections(recommendations)
+
     # Sort by estimated token savings
     recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
 
     return recommendations
+
+
+def _merge_equivalent_sections(recommendations: list[Recommendation]) -> list[Recommendation]:
+    """Fold recommendations whose headings normalize to the same key."""
+    merged: dict[tuple[RecommendationTarget, str], Recommendation] = {}
+    order: list[tuple[RecommendationTarget, str]] = []
+    for rec in recommendations:
+        key = (rec.target, _normalize_heading(rec.section))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = rec
+            order.append(key)
+            continue
+        if rec.content and rec.content not in existing.content:
+            existing.content = f"{existing.content}\n{rec.content}"
+        existing.evidence_count += rec.evidence_count
+        existing.estimated_tokens_saved += rec.estimated_tokens_saved
+        existing.confidence = max(existing.confidence, rec.confidence)
+        existing.is_loop_guardrail = existing.is_loop_guardrail or rec.is_loop_guardrail
+        existing.loop_occurrences = max(existing.loop_occurrences, rec.loop_occurrences)
+    return [merged[k] for k in order]
 
 
 def _safe_int(val: object) -> int:

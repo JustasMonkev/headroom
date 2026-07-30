@@ -22,7 +22,7 @@ from headroom.transforms.content_router import (
     RouterCompressionResult,
     RoutingDecision,
 )
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import search_fold_recovers
 
 # =============================================================================
 # Test Fixtures
@@ -946,6 +946,7 @@ class TestExcludeTools:
         # MCP wrapper aliases can still be excluded by their bare tool name.
         assert is_tool_excluded("mcp_HeadroomZai_headroom_retrieve", {"headroom_retrieve"})
         assert is_tool_excluded("mcp__Headroom__headroom_retrieve", {"headroom_retrieve"})
+        assert is_tool_excluded("mcp_my_fs_read_file", {"read_file"})
         # Empty set never excludes.
         assert not is_tool_excluded("Read", set())
 
@@ -1061,7 +1062,7 @@ class TestExcludeTools:
         # Excluded from lossy compression; search results get a byte-lossless
         # heading fold. Verify byte-exact recovery (Anthropic block format).
         original = messages[1]["content"][0]["content"]
-        assert search_unheading(tool_result_block["content"]) == original
+        assert search_fold_recovers(tool_result_block["content"], original)
         assert "router:excluded:lossless_search" in result.transforms_applied
 
     def test_anthropic_tool_result_runtime_window_allows_old_excluded_tools(self, tokenizer):
@@ -1235,7 +1236,17 @@ class TestExcludeTools:
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
         # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep outputs)
-        for tool in ("Read", "Glob", "Grep", "Write", "Edit"):
+        for tool in (
+            "Read",
+            "ReadFile",
+            "read_file",
+            "NotebookRead",
+            "notebook_read",
+            "Glob",
+            "Grep",
+            "Write",
+            "Edit",
+        ):
             assert tool in DEFAULT_EXCLUDE_TOOLS, f"{tool} should be in DEFAULT_EXCLUDE_TOOLS"
             assert tool.lower() in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool.lower()} should be in DEFAULT_EXCLUDE_TOOLS"
