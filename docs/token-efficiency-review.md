@@ -480,6 +480,20 @@ with regression tests:
   an encode and falls back to ASCII escaping for exactly that case —
   normal CJK/emoji stays on the cheap unescaped path.
 
+A third pass refined two of these for shared-backend concurrency:
+
+- **Replacement atomicity.** The growing-re-store fix originally
+  delete-then-evict-then-set; on a shared SQLite backend the delete commits
+  immediately (concurrent retrievals see a false miss) and a
+  silently-failed `set()` would strand the marker. The eviction pass now
+  counts only the growth *delta* and protects the key being replaced; the
+  old row is never removed before the atomic overwrite lands.
+- **Heap coverage on `(created_at, key)` pairs.** Key-only coverage misses
+  a same-key re-store by another worker: the key is covered but the local
+  tuple's timestamp is stale, so the eviction loop would pop it, fail the
+  timestamp comparison, and exhaust the heap without freeing anything.
+  Coverage now compares full pairs from the same expiry pass.
+
 ### Round-3 test status
 
 `diff`/`cache`/`CCR`/`read-lifecycle`/`response-handler`/`token-headroom`

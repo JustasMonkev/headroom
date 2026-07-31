@@ -388,13 +388,18 @@ class CompressionStore:
                 # GROWS the entry adds bytes the duplicate fast path never
                 # counted — without this, repeated growing re-stores keep the
                 # store above `max_bytes` with no new key ever arriving to
-                # trigger eviction. Delete-then-evict-then-set so the bound
-                # sees the store without the old entry and cannot evict the
-                # very key being replaced. Same-size/shrinking re-stores (the
-                # common mirror-bridge duplicate) skip the eviction scan.
+                # trigger eviction. The old row is NOT deleted first: on a
+                # shared SQLite backend that delete commits immediately, so
+                # concurrent retrievals would see a false miss, and a
+                # silently-failed `set()` would leave the marker permanently
+                # unredeemable. Instead the eviction pass counts only the
+                # size DELTA and protects the key being replaced, and the
+                # overwrite below stays a single atomic `set()`.
+                # Same-size/shrinking re-stores (the common mirror-bridge
+                # duplicate) skip the eviction scan.
                 if self._entry_nbytes(entry) > self._entry_nbytes(existing):
-                    self._backend.delete(hash_key)
-                    self._evict_if_needed(pending_bytes=self._entry_nbytes(entry))
+                    delta = self._entry_nbytes(entry) - self._entry_nbytes(existing)
+                    self._evict_if_needed(pending_bytes=delta, replacing_key=hash_key)
 
             self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
@@ -713,36 +718,47 @@ class CompressionStore:
             pass
         return nbytes
 
-    def _evict_if_needed(self, pending_bytes: int = 0) -> None:
+    def _evict_if_needed(self, pending_bytes: int = 0, replacing_key: str | None = None) -> None:
         """Evict old entries if at capacity. Must be called with lock held.
 
         MEDIUM FIX #16: Use heap for O(log n) eviction instead of O(n) scan.
         CRITICAL FIX: Track and clean stale heap entries to prevent memory leak.
 
         Args:
-            pending_bytes: UTF-8 size of the entry the caller is about to
-                insert. The byte bound is enforced on `stored + pending`, so
-                the store is back under `max_bytes` *after* the insertion —
+            pending_bytes: UTF-8 size the caller is about to add — the full
+                entry for a new key, or the growth delta for a replacement.
+                The byte bound is enforced on `stored + pending`, so the
+                store is back under `max_bytes` *after* the insertion —
                 enforcing on stored bytes alone would let every insert land
                 one entry over the advertised bound.
+            replacing_key: Set when the caller is about to OVERWRITE this
+                existing key (growing re-store). The byte loop never evicts
+                it (the overwrite supersedes it atomically; evicting it here
+                would make its marker unredeemable if the later ``set()``
+                fails), and the count loop is skipped entirely — a
+                replacement does not change the entry count, so count
+                eviction would destroy an unrelated live entry.
         """
         # Remove expired entries and collect the live byte total and live
-        # keys in the same `items()` pass — a second full-backend scan per
-        # insert would read and deserialize every payload twice on the
-        # SQLite backend.
-        live_bytes, live_keys = self._clean_expired()
+        # (created_at, key) pairs in the same `items()` pass — a second
+        # full-backend scan per insert would read and deserialize every
+        # payload twice on the SQLite backend.
+        live_bytes, live_pairs = self._clean_expired()
 
-        # The heap only records keys THIS process stored. After a restart on
+        # The heap only records what THIS process stored. After a restart on
         # a persistent backend (or with other workers writing rows), the
         # backend can hold live entries the heap has never seen — eviction
-        # would then skip them forever. Coverage is checked by KEY, not by
-        # cardinality (PR #21 review): another worker deleting one row and
-        # inserting another leaves the count unchanged while the local heap
-        # still lacks the new live key. `live_keys` came from the expiry pass
-        # above; the heap-key set is O(heap) over 24-char strings.
-        if live_keys:
-            heap_keys = {key for _, key in self._eviction_heap}
-            if any(key not in heap_keys for key in live_keys):
+        # would then skip them forever. Coverage is checked on
+        # (created_at, key) PAIRS, not keys or cardinality (PR #21 review,
+        # twice): a same-count key swap by another worker preserves the
+        # count, and a same-KEY re-store with a new timestamp preserves key
+        # coverage while invalidating the local tuple — the eviction loop
+        # would pop it, fail the timestamp comparison, and exhaust the heap
+        # without freeing anything. `live_pairs` came from the expiry pass
+        # above; the heap set is O(heap) over small tuples.
+        if live_pairs:
+            heap_pairs = set(self._eviction_heap)
+            if any(pair not in heap_pairs for pair in live_pairs):
                 self._rebuild_heap()
 
         # CRITICAL FIX: Rebuild heap if too many stale entries
@@ -764,12 +780,18 @@ class CompressionStore:
         # marker in the conversation unredeemable.
         min_count = 0 if pending_bytes > 0 else 1
         approx_bytes = live_bytes + pending_bytes
+        protected: list[tuple[float, str]] = []
         while (
             approx_bytes > self._max_bytes
             and self._backend.count() > min_count
             and self._eviction_heap
         ):
             created_at, hash_key = heapq.heappop(self._eviction_heap)
+            if replacing_key is not None and hash_key == replacing_key:
+                # Never evict the key being replaced — set it aside and
+                # restore it after the loop so its heap tuple survives.
+                protected.append((created_at, hash_key))
+                continue
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
                 if self._enable_feedback and entry.retrieval_count == 0:
@@ -778,6 +800,13 @@ class CompressionStore:
                 self._backend.delete(hash_key)
             elif self._stale_heap_entries > 0:
                 self._stale_heap_entries -= 1
+        for item in protected:
+            heapq.heappush(self._eviction_heap, item)
+
+        if replacing_key is not None:
+            # Replacements do not change the entry count — the count loop
+            # below would evict an unrelated live entry for no room gained.
+            return
 
         # If still at capacity, remove oldest entries using heap
         while self._backend.count() >= self._max_entries and self._eviction_heap:
@@ -801,32 +830,34 @@ class CompressionStore:
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
 
-    def _clean_expired(self) -> tuple[int, list[str]]:
+    def _clean_expired(self) -> tuple[int, list[tuple[float, str]]]:
         """Remove expired entries. Must be called with lock held.
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
 
         Returns:
-            ``(live_bytes, live_keys)`` — the UTF-8 byte total and the keys of
-            the surviving (live) entries, measured on the same ``items()``
-            pass. Callers enforcing the byte bound and verifying heap key
-            coverage must not pay for a second full-backend scan.
+            ``(live_bytes, live_pairs)`` — the UTF-8 byte total and the
+            ``(created_at, key)`` pairs of the surviving (live) entries,
+            measured on the same ``items()`` pass. Callers enforcing the byte
+            bound and verifying heap coverage must not pay for a second
+            full-backend scan; pairs (not bare keys) let coverage detect
+            same-key re-stores by other workers.
         """
         expired_keys: list[str] = []
-        live_keys: list[str] = []
+        live_pairs: list[tuple[float, str]] = []
         live_bytes = 0
         for key, entry in self._backend.items():
             if entry.is_expired():
                 expired_keys.append(key)
             else:
-                live_keys.append(key)
+                live_pairs.append((entry.created_at, key))
                 live_bytes += self._entry_nbytes(entry)
         for key in expired_keys:
             self._backend.delete(key)
             # CRITICAL FIX: Increment stale counter - the heap still has an entry
             # for this key that will be stale when we try to evict
             self._stale_heap_entries += 1
-        return live_bytes, live_keys
+        return live_bytes, live_pairs
 
     def _rebuild_heap(self) -> None:
         """Rebuild heap from current store entries. Must be called with lock held.

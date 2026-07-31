@@ -1494,3 +1494,73 @@ class TestRound2ReviewFixes:
             "heap coverage must be verified by key: same-count key swaps by "
             "another worker leave the live row unevictable"
         )
+
+
+class TestRound3ReviewFixes:
+    """Third-round PR #21 review fixes: replacement atomicity and
+    timestamp-aware heap coverage."""
+
+    def test_failed_replacement_set_keeps_old_row(self):
+        """The old row must survive a growing re-store whose backend write
+        silently fails (SQLiteBackend.set logs-and-returns on transient
+        errors) — deleting it first would strand the marker permanently."""
+        from headroom.cache.backends import InMemoryBackend
+
+        class FlakyBackend(InMemoryBackend):
+            drop_next_set = False
+
+            def set(self, key, entry):
+                if self.drop_next_set:
+                    self.drop_next_set = False
+                    return  # simulate SQLiteBackend's swallowed write error
+                super().set(key, entry)
+
+        backend = FlakyBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=10_000, backend=backend)
+        key = store.store(original="o" * 100, compressed="[]", explicit_hash="ab" * 12)
+        assert store.retrieve(key) is not None
+
+        backend.drop_next_set = True
+        store.store(original="o" * 100, compressed="c" * 500, explicit_hash="ab" * 12)
+
+        entry = store.retrieve(key)
+        assert entry is not None, (
+            "growing re-store with a failed backend write must leave the "
+            "old (valid) row retrievable, not deleted"
+        )
+        assert entry.compressed_content == "[]"
+
+    def test_same_key_restore_by_other_worker_stays_evictable(self):
+        """Key-only coverage misses a same-key re-store with a fresh
+        created_at: the local heap tuple fails the timestamp comparison and
+        the byte loop exhausts the heap without freeing anything."""
+        import time as _time
+
+        from headroom.cache.backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=1000, backend=backend)
+        h1 = store.store(original="a" * 600, compressed="[]")
+
+        # Another worker re-stores the same hash with a new timestamp.
+        replaced = CompressionEntry(
+            hash=h1,
+            original_content="a" * 600,
+            compressed_content="[]",
+            original_tokens=0,
+            compressed_tokens=0,
+            original_item_count=1,
+            compressed_item_count=1,
+            tool_name=None,
+            tool_call_id=None,
+            query_context=None,
+            created_at=_time.time() + 10,
+        )
+        backend.set(h1, replaced)
+
+        h2 = store.store(original="b" * 600, compressed="[]")
+        assert store.retrieve(h2) is not None
+        assert store.retrieve(h1) is None, (
+            "coverage must compare (created_at, key) pairs: a same-key "
+            "re-store by another worker left the row unevictable"
+        )
