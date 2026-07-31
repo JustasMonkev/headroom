@@ -480,7 +480,17 @@ with regression tests:
   an encode and falls back to ASCII escaping for exactly that case —
   normal CJK/emoji stays on the cheap unescaped path.
 
-A third pass refined two of these for shared-backend concurrency:
+A fifth reviewer pass pushed the design to its final, simpler form:
+**bounds are now enforced AFTER the write, on actual stored state**, with
+the just-written key protected. This removed the pending-bytes/growth-delta
+modeling entirely (and the expired-mid-flight special case with it) and
+closed the last atomicity gap — pre-write eviction deleted victim rows for
+a write a transient SQLite error could then silently drop; post-write, a
+silently-failed write means the store didn't grow and victims are evicted
+only if the store was already over bound. `_clean_expired` likewise only
+drops a row from the returned totals once its delete is confirmed.
+
+Earlier passes (superseded by the above but recorded for the reasoning):
 
 - **Replacement atomicity.** The growing-re-store fix originally
   delete-then-evict-then-set; on a shared SQLite backend the delete commits
