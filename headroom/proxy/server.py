@@ -4891,9 +4891,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     ),
                 }
 
-        # Format tool result for provider
+        # Format tool result for provider. `result_content` is what the model
+        # is billed for on every later turn: compact separators, and no
+        # telemetry echo (`*_item_count` stays in the caller-facing `data`
+        # field below, mirroring the mcp_server D2 fix).
         tool_call_id = tool_call.get("id", "")
-        result_content = json.dumps(retrieval_data, indent=2)
+        model_facing = {
+            k: v
+            for k, v in retrieval_data.items()
+            if k not in ("original_item_count", "compressed_item_count")
+        }
+        result_content = json.dumps(model_facing, separators=(",", ":"), ensure_ascii=False)
 
         if provider == "anthropic":
             tool_result = {

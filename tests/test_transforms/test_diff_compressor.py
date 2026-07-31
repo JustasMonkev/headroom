@@ -306,8 +306,9 @@ class TestOutputFormatting:
         assert "files changed" in result.compressed
         assert "hunks omitted" in result.compressed
 
-    def test_preserves_diff_format(self):
-        """Output preserves valid unified diff format."""
+    def test_plain_modification_drops_redundant_file_lines(self):
+        """C3: for an in-place modification, `--- a/p` / `+++ b/p` restate the
+        path the `diff --git a/p b/p` header already carries and are dropped."""
         content = """diff --git a/test.py b/test.py
 --- a/test.py
 +++ b/test.py
@@ -325,11 +326,35 @@ class TestOutputFormatting:
         )
         result = compressor.compress(content)
 
-        # Should have all standard diff markers
         assert "diff --git" in result.compressed
-        assert "---" in result.compressed
-        assert "+++" in result.compressed
         assert "@@" in result.compressed
+        # Redundant path restatements removed for plain modifications.
+        assert "--- a/test.py" not in result.compressed
+        assert "+++ b/test.py" not in result.compressed
+
+    def test_new_file_keeps_full_git_triple(self):
+        """C3: creates (and deletes/renames) keep `---`/`+++` — `/dev/null`
+        carries information the header does not."""
+        content = """diff --git a/new.py b/new.py
+new file mode 100644
+--- /dev/null
++++ b/new.py
+@@ -0,0 +1,3 @@
++def created():
++    pass
++    return True
+"""
+        compressor = DiffCompressor(
+            config=DiffCompressorConfig(
+                min_lines_for_ccr=5,
+                enable_ccr=False,
+            )
+        )
+        result = compressor.compress(content)
+
+        assert "diff --git" in result.compressed
+        assert "--- /dev/null" in result.compressed
+        assert "+++ b/new.py" in result.compressed
 
 
 class TestEdgeCases:

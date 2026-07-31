@@ -205,7 +205,8 @@ class CCRResponseHandler:
                             "ttl_seconds", entry_status["default_ttl_seconds"]
                         ),
                     },
-                    indent=2,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
                 )
                 return CCRToolResult(
                     tool_call_id=ccr_call.tool_call_id,
@@ -216,13 +217,16 @@ class CCRResponseHandler:
             # Retrieval is by hash: always return the full original content.
             entry = store.retrieve(ccr_call.hash_key)
             if entry:
+                # Model-facing payload: compact separators, no telemetry echo.
+                # `original_item_count` is already carried out-of-band on
+                # CCRToolResult.items_retrieved (D2 parity with mcp_server).
                 content = json.dumps(
                     {
                         "hash": ccr_call.hash_key,
                         "original_content": entry.original_content,
-                        "original_item_count": entry.original_item_count,
                     },
-                    indent=2,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
                 )
                 return CCRToolResult(
                     tool_call_id=ccr_call.tool_call_id,
@@ -243,7 +247,8 @@ class CCRResponseHandler:
                     "status": miss_status["status"],
                     "ttl_seconds": miss_status.get("ttl_seconds"),
                 },
-                indent=2,
+                separators=(",", ":"),
+                ensure_ascii=False,
             )
             return CCRToolResult(
                 tool_call_id=ccr_call.tool_call_id,
@@ -258,7 +263,8 @@ class CCRResponseHandler:
                     "error": f"Retrieval failed: {str(e)}",
                     "hash": ccr_call.hash_key,
                 },
-                indent=2,
+                separators=(",", ":"),
+                ensure_ascii=False,
             )
             return CCRToolResult(
                 tool_call_id=ccr_call.tool_call_id,

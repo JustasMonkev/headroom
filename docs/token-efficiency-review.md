@@ -349,9 +349,96 @@ Layer 1 (schema compaction) adds `count(original) − count(L1)` to `tokens_save
 
 ## Dead code to remove
 
-- `CCRConfig.marker_template` (`config.py:571-578`) — zero consumers (see B5).
-- `summarize_dropped_items` (`compression_summary.py:20-77`) — only test callers; its would-be consumer is the dead template above. Delete, or fix its format before ever wiring it in.
-- `tool_digest` marker machinery in prompt content (see B1) — keep the hash out-of-band.
+- `CCRConfig.marker_template` (`config.py:571-578`) — zero consumers (see B5). *Removed.*
+- `summarize_dropped_items` (`compression_summary.py:20-77`) — only test callers; its would-be consumer is the dead template above. Delete, or fix its format before ever wiring it in. *Removed in round 3, along with its private helpers and the two LLM-eval test files that existed only to exercise it.*
+- `tool_digest` marker machinery in prompt content (see B1) — keep the hash out-of-band. *Done.*
+
+---
+
+## G. Round 3 — remaining items closed out (2026-07-31)
+
+A follow-up pass implemented what was still open, re-measured with the bundled
+`o200k_base` tokenizer, and ran a Haiku sub-agent review (three lenses:
+injected text, compressor emissions, hygiene/perf) for anything the first two
+rounds missed. Status of everything that was left:
+
+### Implemented
+
+- **B6-lite — read-lifecycle/maturation marker prose tersened.**
+  `read_lifecycle.py`, `read_maturation.py`. The full-sentence markers were cut
+  to terse forms that keep the load-bearing `Retrieve original: hash=` anchor
+  (so no matcher moved) and keep the one piece of advice that changes model
+  behavior — a STALE read must be *re-read*, not retrieved. Measured per
+  marker: stale 57 → 50, superseded 56 → 45, maturation 52 → 45 tok
+  (−7…−11 each; the path + 24-hex hash dominate what remains). Verified: the
+  `tool_injection` scanner, `parser.CCR_RETRIEVAL_MARKER_RE`, and the
+  `compression_units` marker-preserving regex all match the new forms.
+
+- **C3 — diff compressor drops `--- a/p` / `+++ b/p` for plain
+  modifications.** `diff_compressor.rs` `format_output`. Emitted only when
+  *not* provably redundant: creates/deletes/renames/binary files, `/dev/null`,
+  quoted paths, and prefix mismatches all keep the full git triple. Measured:
+  −22 tok per plain-modified file, −440 tok on a 20-file diff. Rust unit
+  tests updated (`compressed_line_count` 129 → 113 on the 8-file synthetic),
+  the Python extension rebuilt, the 27 `diff_compressor` parity fixtures
+  re-recorded, and the Rust parity harness re-run: 27/27 matched.
+
+- **D1/D2 stragglers (found by the Haiku hygiene reviewer).** Five
+  model-facing CCR response paths still pretty-printed with `indent=2`:
+  `ccr/response_handler.py` (×4) and the `/v1/retrieve/tool_call` endpoint in
+  `proxy/server.py`. All now use compact separators; the success payloads also
+  drop the `original_item_count`/`compressed_item_count` telemetry echo
+  (`items_retrieved` still travels out-of-band on `CCRToolResult`, and the
+  endpoint's caller-facing `data` field keeps the full dict — only the
+  model-facing `tool_result.content` slimmed). Measured: −16 tok per
+  retrieval, −12 per miss. The evals-only `indent=2` sites the reviewer also
+  flagged are not model-facing in production and were left alone.
+
+- **F7 — cache hardening (the parts that pay).**
+  `compression_cache.py`: byte-weighted LRU bound (`max_bytes`, default
+  64 MB) alongside the 10k-entry bound, and opportunistic pruning of the
+  previously unbounded `_first_seen` map (entries older than the defer TTL
+  can never answer "defer" again). `compression_store.py`: byte-weighted
+  eviction bound (`max_bytes`, default 256 MB) computed lazily inside
+  `_evict_if_needed` — the `_clean_expired` pass there already pays for the
+  `items()` walk, and `len(str)` is O(1), so accounting stays out of the hot
+  path. Defaults sit far above the measured 28 MB peak of a 200-turn
+  session: these are guard rails for pathological sessions, not tuners.
+  Two F7 sub-items were **not** done, deliberately: the "periodic sweep" was
+  already effectively present (`_clean_expired` runs on every new-key store;
+  expired entries linger only in fully idle sessions, where they cost nothing
+  until process exit), and **single-flight** requires restructuring the
+  per-request compression call sites around shared futures — cross-request
+  identical-content races are rare within a per-session cache, so the
+  complexity is not currently justified. Revisit if profiling shows duplicate
+  concurrent compression.
+
+### Verified still-deferred (unchanged from rounds 1–2, re-confirmed)
+
+- **B2/B3/B7 marker-grammar convergence** — the lockstep surface (five
+  emitters across Python and Rust, the count-parsing regexes in
+  `tool_injection`, parity fixtures, and live-session backward compatibility)
+  still outweighs the per-marker delta; the B6-lite trim above captured the
+  cheap share of the win without moving any matcher.
+- **C8** (needs a quote-aware lexer), **C10** (unrecoverable without storing
+  pre-extraction HTML), **F9** (wrong-file premise; skipped) — as documented.
+
+### Haiku sub-agent review outcome
+
+Three Haiku reviewers swept the codebase against this document. Net-new
+findings: the five `indent=2` stragglers above (confirmed and fixed). The
+compressor-emissions reviewer independently re-derived B6 (already queued);
+everything else it checked matched this document's implemented/deferred
+status. No false positives survived revalidation — the one telemetry-echo
+claim was scoped down after checking that `/v1/retrieve`'s caller-facing
+JSON contract must keep its fields.
+
+### Round-3 test status
+
+`diff`/`cache`/`CCR`/`read-lifecycle`/`response-handler`/`token-headroom`
+suites: 398 passed, 3 skipped. Rust: `headroom-core` diff tests 23/23,
+parity harness diff_compressor 27/27 matched (kompress/ccr/cache_aligner
+fixtures skip in this environment — no HF model cache — same as merge-base).
 
 ## Verified clean (no action)
 

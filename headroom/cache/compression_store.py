@@ -210,6 +210,7 @@ class CompressionStore:
         default_ttl: int = DEFAULT_CCR_TTL_SECONDS,
         enable_feedback: bool = True,
         backend: CompressionStoreBackend | None = None,
+        max_bytes: int = 256 * 1024 * 1024,
     ):
         """Initialize the compression store.
 
@@ -222,6 +223,11 @@ class CompressionStore:
                      defaults to SQLiteBackend for restart/multi-worker
                      safety. Custom backends can be passed for
                      persistence (MongoDB, Redis).
+            max_bytes: Byte-weighted bound on stored content (originals +
+                     compressed, F7). A guard rail against pathological
+                     sessions pinning memory the entry-count bound never
+                     sees; evicting a live entry makes its marker
+                     unredeemable, so this is set far above typical usage.
         """
         # Import here to avoid circular imports
         from .backends import InMemoryBackend
@@ -229,6 +235,7 @@ class CompressionStore:
         self._backend: CompressionStoreBackend = backend or InMemoryBackend()
         self._lock = threading.Lock()
         self._max_entries = max_entries
+        self._max_bytes = max_bytes
         self._default_ttl = default_ttl
         self._enable_feedback = enable_feedback
 
@@ -688,6 +695,26 @@ class CompressionStore:
             stale_ratio = self._stale_heap_entries / heap_size
             if stale_ratio >= self._heap_rebuild_threshold:
                 self._rebuild_heap()
+
+        # F7 (docs/token-efficiency-review.md): byte-weighted bound on top of
+        # the entry-count bound — 1,000 entries of large originals can pin
+        # hundreds of MB that the count bound never sees. Recomputed lazily
+        # here (new-key stores only) rather than tracked incrementally:
+        # `len(str)` is O(1), the store is capped at `max_entries`, and
+        # `_clean_expired` above already paid for a full `items()` pass.
+        approx_bytes = sum(
+            len(e.original_content) + len(e.compressed_content) for _, e in self._backend.items()
+        )
+        while approx_bytes > self._max_bytes and self._backend.count() > 1 and self._eviction_heap:
+            created_at, hash_key = heapq.heappop(self._eviction_heap)
+            entry = self._backend.get(hash_key)
+            if entry is not None and entry.created_at == created_at:
+                if self._enable_feedback and entry.retrieval_count == 0:
+                    self._record_eviction_success(entry)
+                approx_bytes -= len(entry.original_content) + len(entry.compressed_content)
+                self._backend.delete(hash_key)
+            elif self._stale_heap_entries > 0:
+                self._stale_heap_entries -= 1
 
         # If still at capacity, remove oldest entries using heap
         while self._backend.count() >= self._max_entries and self._eviction_heap:

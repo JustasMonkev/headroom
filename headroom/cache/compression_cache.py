@@ -109,8 +109,14 @@ class CompressionCache:
     when the cache exceeds max_entries.
     """
 
-    def __init__(self, max_entries: int = 10000) -> None:
+    def __init__(self, max_entries: int = 10000, max_bytes: int = 64 * 1024 * 1024) -> None:
         self.max_entries = max_entries
+        # F7 (docs/token-efficiency-review.md): the entry-count bound alone
+        # lets 10k large compressed payloads pin ~hundreds of MB. The byte
+        # bound is a guard rail for pathological sessions, not a working-set
+        # tuner — typical sessions measure ~28 MB peak, far below it.
+        self.max_bytes = max_bytes
+        self._total_bytes = 0
         # Reentrant lock guarding all mutable state below. Required because
         # the proxy is async and dispatches multiple concurrent requests per
         # session (Claude Code background tools, parallel agents, etc.) into
@@ -163,14 +169,22 @@ class CompressionCache:
             if hash in self._cache:
                 old_entry = self._cache[hash]
                 self._total_tokens_saved -= old_entry.tokens_saved
+                self._total_bytes -= len(old_entry.compressed)
                 del self._cache[hash]
 
             self._cache[hash] = _CacheEntry(compressed=compressed, tokens_saved=tokens_saved)
             self._total_tokens_saved += tokens_saved
+            self._total_bytes += len(compressed)
 
-            while len(self._cache) > self.max_entries:
+            # Entry-count LRU bound, then byte-weighted bound (F7). `len(str)`
+            # undercounts UTF-8 multibyte payloads slightly; fine for a guard
+            # rail, and it keeps accounting O(1) per store.
+            while len(self._cache) > self.max_entries or (
+                self._total_bytes > self.max_bytes and len(self._cache) > 1
+            ):
                 _, evicted = self._cache.popitem(last=False)
                 self._total_tokens_saved -= evicted.tokens_saved
+                self._total_bytes -= len(evicted.compressed)
 
     def mark_stable(self, content_hash: str) -> None:
         """Mark a content hash as stable (unchanged, not compressed).
@@ -216,6 +230,13 @@ class CompressionCache:
         """
         with self._lock:
             now = time.time()
+            # F7: `_first_seen` previously grew one entry per unique
+            # tool_result forever. Entries older than the TTL can never
+            # produce a `True` ("defer") answer again, so they are dead
+            # weight — prune them opportunistically once the map is large.
+            if len(self._first_seen) > 4096:
+                cutoff = now - ttl_seconds
+                self._first_seen = {h: t for h, t in self._first_seen.items() if t >= cutoff}
             first_seen = self._first_seen.get(content_hash)
             if first_seen is None:
                 self._first_seen[content_hash] = now

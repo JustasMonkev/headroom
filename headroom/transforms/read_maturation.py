@@ -309,8 +309,8 @@ class ReadMaturationManager:
         # NOTE: "Retrieve original: hash=" is load-bearing (marker-
         # preserving regex + ContentRouter compression pinning).
         marker = (
-            f"[Read of {file_display} compressed after use — re-read the file "
-            f"if needed. Retrieve original: hash={ccr_hash}]"
+            # B6: terse on purpose — this replays on every later turn.
+            f"[read compressed after use: {file_display}. Retrieve original: hash={ccr_hash}]"
         )
         self._matured[tc_id] = MaturedRead(marker=marker, ccr_hash=ccr_hash)
         result.newly_matured += 1
