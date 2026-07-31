@@ -364,7 +364,7 @@ class CompressionStore:
             # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
             if existing is None:
-                self._evict_if_needed()
+                self._evict_if_needed(incoming_bytes=len(original) + len(compressed))
             else:
                 # Hash already present. Different content means a true (extremely
                 # rare with SHA256[:24]) collision; same content is a duplicate
@@ -679,14 +679,33 @@ class CompressionStore:
             self._eviction_heap.clear()  # MEDIUM FIX #16: Clear heap too
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
 
-    def _evict_if_needed(self) -> None:
+    def _evict_if_needed(self, incoming_bytes: int = 0) -> None:
         """Evict old entries if at capacity. Must be called with lock held.
 
         MEDIUM FIX #16: Use heap for O(log n) eviction instead of O(n) scan.
         CRITICAL FIX: Track and clean stale heap entries to prevent memory leak.
+
+        Args:
+            incoming_bytes: Size of the entry the caller is about to insert
+                (originals + compressed). Counted toward the byte bound so an
+                insert can't land the store above ``max_bytes`` — the check
+                runs before ``_backend.set``, which otherwise sees only the
+                entries already stored.
         """
-        # First, remove expired entries
-        self._clean_expired()
+        # First, remove expired entries. The same items() pass returns the
+        # live byte total so the byte bound below doesn't re-scan the backend
+        # (on the SQLite backend a second scan re-reads and deserializes
+        # every payload while holding the store lock).
+        approx_bytes = self._clean_expired() + incoming_bytes
+
+        # The heap only records keys THIS process stored. After a restart on
+        # a persistent backend (or with other workers writing rows), the
+        # backend can hold live entries the heap has never seen — eviction
+        # would then skip them forever. A heap that under-covers the backend
+        # is always incomplete (stale entries only ever make it larger), so
+        # rebuild it from the backend before enforcing either bound.
+        if len(self._eviction_heap) < self._backend.count():
+            self._rebuild_heap()
 
         # CRITICAL FIX: Rebuild heap if too many stale entries
         # This prevents unbounded heap growth when entries are deleted/replaced
@@ -698,14 +717,18 @@ class CompressionStore:
 
         # F7 (docs/token-efficiency-review.md): byte-weighted bound on top of
         # the entry-count bound — 1,000 entries of large originals can pin
-        # hundreds of MB that the count bound never sees. Recomputed lazily
-        # here (new-key stores only) rather than tracked incrementally:
-        # `len(str)` is O(1), the store is capped at `max_entries`, and
-        # `_clean_expired` above already paid for a full `items()` pass.
-        approx_bytes = sum(
-            len(e.original_content) + len(e.compressed_content) for _, e in self._backend.items()
-        )
-        while approx_bytes > self._max_bytes and self._backend.count() > 1 and self._eviction_heap:
+        # hundreds of MB that the count bound never sees. `approx_bytes` came
+        # from the expiry pass above plus the caller's pending entry; `len(str)`
+        # is O(1) and the store is capped at `max_entries`. With a pending
+        # insert, evicting down to an empty backend is legitimate (the incoming
+        # entry lands right after); without one, keep at least one entry — the
+        # bound is a guard rail, not a wipe.
+        min_count = 0 if incoming_bytes > 0 else 1
+        while (
+            approx_bytes > self._max_bytes
+            and self._backend.count() > min_count
+            and self._eviction_heap
+        ):
             created_at, hash_key = heapq.heappop(self._eviction_heap)
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
@@ -738,17 +761,29 @@ class CompressionStore:
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
 
-    def _clean_expired(self) -> None:
+    def _clean_expired(self) -> int:
         """Remove expired entries. Must be called with lock held.
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
+
+        Returns:
+            Total bytes (original + compressed content) of the surviving
+            entries, measured on the same ``items()`` pass — callers enforcing
+            the byte bound must not pay for a second full-backend scan.
         """
-        expired_keys = [key for key, entry in self._backend.items() if entry.is_expired()]
+        live_bytes = 0
+        expired_keys = []
+        for key, entry in self._backend.items():
+            if entry.is_expired():
+                expired_keys.append(key)
+            else:
+                live_bytes += len(entry.original_content) + len(entry.compressed_content)
         for key in expired_keys:
             self._backend.delete(key)
             # CRITICAL FIX: Increment stale counter - the heap still has an entry
             # for this key that will be stale when we try to evict
             self._stale_heap_entries += 1
+        return live_bytes
 
     def _rebuild_heap(self) -> None:
         """Rebuild heap from current store entries. Must be called with lock held.

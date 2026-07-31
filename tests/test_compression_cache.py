@@ -687,3 +687,33 @@ def test_get_compression_cache_returns_same_instance_under_contention() -> None:
     first = results[0]
     for c in results[1:]:
         assert c is first, "Concurrent _get_compression_cache returned different instances"
+
+
+class TestByteBound:
+    """Byte-weighted bound — UTF-8 sizing fix from the PR #21 review."""
+
+    def test_byte_bound_measures_utf8_bytes_not_code_points(self) -> None:
+        # 40 emoji = 40 code points but 160 UTF-8 bytes. Counting code
+        # points would see 44 < 100 after the second store and never evict,
+        # retaining ~4x the advertised bound for multibyte payloads.
+        cache = CompressionCache(max_entries=100, max_bytes=100)
+        cache.store_compressed("h1", "\U0001f389" * 40, tokens_saved=1)
+        cache.store_compressed("h2", "tiny", tokens_saved=1)
+
+        assert cache.get_compressed("h1") is None
+        assert cache.get_compressed("h2") == "tiny"
+
+    def test_byte_bound_evicts_oldest_first(self) -> None:
+        cache = CompressionCache(max_entries=100, max_bytes=100)
+        cache.store_compressed("h1", "a" * 80, tokens_saved=1)
+        cache.store_compressed("h2", "b" * 80, tokens_saved=1)
+
+        assert cache.get_compressed("h1") is None
+        assert cache.get_compressed("h2") == "b" * 80
+
+    def test_byte_bound_keeps_last_entry(self) -> None:
+        cache = CompressionCache(max_entries=100, max_bytes=10)
+        cache.store_compressed("h1", "x" * 100, tokens_saved=1)
+
+        # A lone over-bound entry survives — guard rail, not a wipe.
+        assert cache.get_compressed("h1") == "x" * 100

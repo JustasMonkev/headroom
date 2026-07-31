@@ -1121,32 +1121,18 @@ fn format_output(
             continue;
         }
 
-        // C3 (docs/token-efficiency-review.md): for a plain in-place
-        // modification, `--- a/p` / `+++ b/p` restate the path the
-        // `diff --git a/p b/p` header two lines up already carries — up to
-        // `max_files` × 2 redundant path copies per compressed diff. Skip
-        // them only when provably redundant: not a create/delete/rename/
-        // binary, and both lines carry exactly the header's unchanged path.
-        // Anything else (`/dev/null`, quoted paths, prefix mismatches)
-        // keeps the full git triple.
-        let file_lines_redundant = !f.is_new_file
-            && !f.is_deleted_file
-            && !f.is_renamed
-            && diff_git_regex()
-                .captures(&f.header)
-                .map(|c| {
-                    c[1] == c[2]
-                        && f.old_file == format!("--- a/{}", &c[1])
-                        && f.new_file == format!("+++ b/{}", &c[2])
-                })
-                .unwrap_or(false);
-        if !file_lines_redundant {
-            if !f.old_file.is_empty() {
-                out_lines.push(f.old_file.clone());
-            }
-            if !f.new_file.is_empty() {
-                out_lines.push(f.new_file.clone());
-            }
+        // C3 (docs/token-efficiency-review.md) proposed dropping `--- a/p` /
+        // `+++ b/p` when they restate the `diff --git` header's path, but
+        // `parse_diff` already discards the `index` line — suppressing the
+        // file markers too leaves `diff --git` followed directly by `@@`,
+        // which is not a valid unified patch (`git apply` rejects it as a
+        // headerless fragment). Keep the markers unconditionally so the
+        // compressed diff stays applicable.
+        if !f.old_file.is_empty() {
+            out_lines.push(f.old_file.clone());
+        }
+        if !f.new_file.is_empty() {
+            out_lines.push(f.new_file.clone());
         }
 
         for h in &f.hunks {
@@ -1328,10 +1314,8 @@ mod tests {
         assert_eq!(r.deletions, 24);
         assert_eq!(r.hunks_kept, 8);
         assert_eq!(r.hunks_removed, 0);
-        // Compressed line count should be 113 (matches the parity fixture):
-        // 8 plain modifications × 2 redundant `---`/`+++` lines dropped (C3)
-        // from the pre-C3 count of 129.
-        assert_eq!(r.compressed_line_count, 113);
+        // Compressed line count should be 129 (matches the parity fixture).
+        assert_eq!(r.compressed_line_count, 129);
         assert!(r.cache_key.is_some());
     }
 

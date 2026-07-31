@@ -374,14 +374,14 @@ rounds missed. Status of everything that was left:
   `tool_injection` scanner, `parser.CCR_RETRIEVAL_MARKER_RE`, and the
   `compression_units` marker-preserving regex all match the new forms.
 
-- **C3 — diff compressor drops `--- a/p` / `+++ b/p` for plain
-  modifications.** `diff_compressor.rs` `format_output`. Emitted only when
-  *not* provably redundant: creates/deletes/renames/binary files, `/dev/null`,
-  quoted paths, and prefix mismatches all keep the full git triple. Measured:
-  −22 tok per plain-modified file, −440 tok on a 20-file diff. Rust unit
-  tests updated (`compressed_line_count` 129 → 113 on the 8-file synthetic),
-  the Python extension rebuilt, the 27 `diff_compressor` parity fixtures
-  re-recorded, and the Rust parity harness re-run: 27/27 matched.
+- **C3 — REVERTED after review.** Dropping `--- a/p` / `+++ b/p` for plain
+  modifications made the compressed output an invalid unified patch:
+  `parse_diff` already discards the `index` line, so `diff --git` followed
+  directly by `@@` is a headerless fragment that `git apply` rejects. The
+  file markers are kept unconditionally; the projected −22 tok per
+  plain-modified file is forgone to keep compressed diffs applicable. The
+  Rust unit test and the 27 `diff_compressor` parity fixtures stay at the
+  pre-C3 output (`compressed_line_count` 129 on the 8-file synthetic).
 
 - **D1/D2 stragglers (found by the Haiku hygiene reviewer).** Five
   model-facing CCR response paths still pretty-printed with `indent=2`:

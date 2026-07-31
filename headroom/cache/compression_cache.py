@@ -24,6 +24,10 @@ class _CacheEntry:
 
     compressed: str
     tokens_saved: int
+    # UTF-8 encoded length of `compressed`, computed once at store time.
+    # `len(str)` counts code points and undercounts multibyte payloads by up
+    # to 4x (emoji), which would let a nominal 64 MB byte bound retain ~256 MB.
+    size_bytes: int
 
 
 def _is_tool_result_message(msg: dict) -> bool:
@@ -169,22 +173,28 @@ class CompressionCache:
             if hash in self._cache:
                 old_entry = self._cache[hash]
                 self._total_tokens_saved -= old_entry.tokens_saved
-                self._total_bytes -= len(old_entry.compressed)
+                self._total_bytes -= old_entry.size_bytes
                 del self._cache[hash]
 
-            self._cache[hash] = _CacheEntry(compressed=compressed, tokens_saved=tokens_saved)
+            entry = _CacheEntry(
+                compressed=compressed,
+                tokens_saved=tokens_saved,
+                size_bytes=len(compressed.encode("utf-8")),
+            )
+            self._cache[hash] = entry
             self._total_tokens_saved += tokens_saved
-            self._total_bytes += len(compressed)
+            self._total_bytes += entry.size_bytes
 
-            # Entry-count LRU bound, then byte-weighted bound (F7). `len(str)`
-            # undercounts UTF-8 multibyte payloads slightly; fine for a guard
-            # rail, and it keeps accounting O(1) per store.
+            # Entry-count LRU bound, then byte-weighted bound (F7). Sizes are
+            # UTF-8 byte lengths cached on the entry, so replace/evict stay
+            # O(1) — the one encode per store is the price of not undercounting
+            # CJK/emoji payloads by 3-4x against the byte bound.
             while len(self._cache) > self.max_entries or (
                 self._total_bytes > self.max_bytes and len(self._cache) > 1
             ):
                 _, evicted = self._cache.popitem(last=False)
                 self._total_tokens_saved -= evicted.tokens_saved
-                self._total_bytes -= len(evicted.compressed)
+                self._total_bytes -= evicted.size_bytes
 
     def mark_stable(self, content_hash: str) -> None:
         """Mark a content hash as stable (unchanged, not compressed).

@@ -1325,3 +1325,57 @@ class TestHashCollisionDetection:
             "in-memory so upgrade-time mismatch is fine, but external "
             "systems that hash-and-lookup independently need to match."
         )
+
+
+class TestByteBoundEviction:
+    """Byte-weighted bound (F7) — review fixes from PR #21.
+
+    Three properties are pinned here:
+    * the incoming entry's size counts toward the bound (the check runs
+      before ``_backend.set``, which otherwise sees only prior entries),
+    * a store whose eviction heap has never seen the backend's persisted
+      rows (restart, other workers) rebuilds it before enforcing bounds,
+    * without a pending insert the bound never wipes the last entry.
+    """
+
+    def test_incoming_entry_counted_against_byte_bound(self):
+        store = CompressionStore(max_entries=100, max_bytes=250, enable_feedback=False)
+        h1 = store.store(original="a" * 100, compressed="b" * 100)  # 200 bytes
+        h2 = store.store(original="c" * 50, compressed="d" * 50)  # 200 + 100 > 250
+
+        assert store.retrieve(h1) is None, (
+            "insert that lands the store above max_bytes must evict first — "
+            "counting only already-stored entries lets repeated inserts keep "
+            "the store above the advertised bound indefinitely"
+        )
+        assert store.retrieve(h2) is not None
+
+    def test_restart_seeds_eviction_heap_from_backend(self):
+        from headroom.cache.backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        first = CompressionStore(
+            max_entries=100, max_bytes=250, enable_feedback=False, backend=backend
+        )
+        h1 = first.store(original="a" * 100, compressed="b" * 100)
+
+        # Simulated restart: fresh store instance, same persisted rows,
+        # empty in-process eviction heap.
+        second = CompressionStore(
+            max_entries=100, max_bytes=250, enable_feedback=False, backend=backend
+        )
+        h2 = second.store(original="c" * 50, compressed="d" * 50)
+
+        assert second.retrieve(h1) is None, (
+            "persisted entries the heap has never seen must still be evictable"
+        )
+        assert second.retrieve(h2) is not None
+
+    def test_byte_bound_alone_keeps_last_entry(self):
+        store = CompressionStore(max_entries=100, max_bytes=50, enable_feedback=False)
+        h1 = store.store(original="a" * 100, compressed="b" * 100)
+
+        # A lone over-bound entry survives: the guard rail must not make the
+        # marker sitting in the conversation unredeemable when there is
+        # nothing else to reclaim.
+        assert store.retrieve(h1) is not None
