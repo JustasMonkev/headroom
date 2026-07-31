@@ -27,6 +27,7 @@ from headroom import paths as _paths
 from headroom._subprocess import run
 from headroom.config import (
     MIN_CLAUDE_FEATURE_VERSION,
+    model_is_gpt_feature_exception,
     model_supports_gated_features,
     parse_model_family_version,
 )
@@ -3154,7 +3155,9 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     """True when an OpenAI model supports the Responses ``tool_search`` feature.
 
     Default gate: ``gpt-<major>.<minor>`` >= 5.4, so earlier GPT-5 models are
-    below it. A regex in
+    below it — except the allowlisted post-cutoff releases whose slugs keep an
+    older number (``gpt-5.3-codex-spark``,
+    :func:`headroom.config.model_is_gpt_feature_exception`). A regex in
     ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (matched against the model name) wins
     when set; a malformed pattern falls back to the version gate rather than
     crashing. Fail-closed on an unparseable model id.
@@ -3164,6 +3167,8 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     override = _openai_model_override_verdict(model)
     if override is not None:
         return override
+    if model_is_gpt_feature_exception(model):
+        return True
     parsed = parse_model_family_version(model)
     return bool(parsed and parsed[0] == "gpt" and parsed[1] >= _OPENAI_TOOL_SEARCH_MIN_VERSION)
 

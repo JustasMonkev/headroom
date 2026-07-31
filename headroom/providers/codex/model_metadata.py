@@ -59,11 +59,27 @@ class CodexModelRegistryHttpClient(Protocol):
 CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
     "gpt-5.5",
     "gpt-5.4",
+    "gpt-5.3-codex-spark",
     "gpt-5.3",
     "gpt-5.2",
     "gpt-5.1",
     "gpt-5",
 )
+
+
+# Fallback metadata for models whose limits differ from the generic Codex
+# defaults in ``codex_model_registry_entry``. gpt-5.3-codex-spark's context
+# window is 128k (crates/headroom-proxy/data/model_prices_and_context_window
+# .json, "chatgpt/gpt-5.3-codex-spark") — advertising the generic 272k when
+# the upstream registry is unavailable would let Codex retain an oversized
+# conversation instead of compacting it, and the request would then fail
+# upstream. Applied with setdefault, so real upstream registry values win.
+_MODEL_FALLBACK_OVERRIDES: dict[str, dict[str, Any]] = {
+    "gpt-5.3-codex-spark": {
+        "context_window": 128000,
+        "max_context_window": 128000,
+    },
+}
 
 
 CODEX_REASONING_LEVELS: tuple[dict[str, str], ...] = (
@@ -118,6 +134,8 @@ def codex_model_registry_entry(
     """Return Codex app-server model metadata with required registry fields."""
     entry = dict(upstream_entry or {})
     entry["slug"] = model_id
+    for key, value in _MODEL_FALLBACK_OVERRIDES.get(model_id, {}).items():
+        entry.setdefault(key, value)
     entry.setdefault("display_name", display_name_from_model_id(model_id))
     entry.setdefault("description", "Codex model available through ChatGPT subscription auth.")
     entry.setdefault("default_reasoning_level", "medium")

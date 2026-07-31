@@ -187,7 +187,9 @@ Headroom can trim that too, from the proxy, without you changing any code:
 > `headroom/config.py` — gates server-side tool-search deferral and native
 > `text.verbosity`. Features with verified earlier or different support keep
 > their own gate: tool-search deferral on the OpenAI Responses API engages from
-> GPT 5.4, thinking compaction on Anthropic engages from Claude 4.6 (the
+> GPT 5.4 (plus `gpt-5.3-codex-spark`, a post-cutoff release whose slug keeps
+> the 5.3-codex branding — it clears every GPT gate by explicit allowlist),
+> thinking compaction on Anthropic engages from Claude 4.6 (the
 > generation that starts re-billing prior thinking), and the OpenAI-compatible
 > reasoning compactor is shape-driven rather than version-gated (it only
 > touches plain-text reasoning fields). Older models still proxy and still get

@@ -47,6 +47,16 @@ _MODEL_FEATURE_MIN_VERSIONS: dict[str, tuple[int, int]] = {
     "gpt": MIN_GPT_FEATURE_VERSION,
 }
 
+# A slug's version number is branding, not chronology. ``gpt-5.3-codex-spark``
+# is the fast low-latency Codex tier: it shipped after the cutoff-era models
+# and supports the gated token-efficiency features (tool-search deferral,
+# native output controls), but its slug keeps the 5.3-codex family name — so a
+# plain version comparison strips exactly the optimizations that keep its
+# token usage lean. Ids whose token stream contains one of these contiguous
+# runs clear every GPT feature cutoff. The full run is required: plain
+# ``gpt-5.3-codex`` (no spark) stays below the cutoffs.
+_GPT_FEATURE_EXCEPTION_RUNS: tuple[tuple[str, ...], ...] = (("gpt", "5", "3", "codex", "spark"),)
+
 # Everything that is not [0-9a-z] is a separator in a model id. This collapses
 # every real-world shape onto the same token stream:
 #   claude-opus-4-6 / anthropic/claude-opus-4-6 / us.anthropic.claude-opus-4-6-v1:0
@@ -107,6 +117,31 @@ def _is_split_release_date(tokens: list[str], index: int) -> bool:
     )
 
 
+def _model_id_tokens(model: object) -> list[str]:
+    """Normalize a model id into its lowercase token stream; ``[]`` if not a string."""
+    if not isinstance(model, str):
+        return []
+    return [t for t in _MODEL_ID_SEPARATORS.split(model.strip().lower()) if t]
+
+
+def model_is_gpt_feature_exception(model: object) -> bool:
+    """True when ``model`` is allowlisted past the GPT feature-version cutoffs.
+
+    See :data:`_GPT_FEATURE_EXCEPTION_RUNS`: currently ``gpt-5.3-codex-spark``
+    in every real-world spelling (vendor prefixes, case, date suffixes). The
+    match requires the full contiguous run, so neither ``gpt-5.3`` nor
+    ``gpt-5.3-codex`` rides along.
+    """
+    tokens = _model_id_tokens(model)
+    if not tokens:
+        return False
+    for run in _GPT_FEATURE_EXCEPTION_RUNS:
+        span = len(run)
+        if any(tuple(tokens[i : i + span]) == run for i in range(len(tokens) - span + 1)):
+            return True
+    return False
+
+
 def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | None:
     """Parse a model id into ``(family, (major, minor))``; ``None`` if unknown.
 
@@ -129,12 +164,9 @@ def parse_model_family_version(model: object) -> tuple[str, tuple[int, int]] | N
     fail closed. Non-versioned families (``o1``, ``o3``, ``gpt-4o``, embedding
     models, …) also return ``None``.
     """
-    if not isinstance(model, str):
+    tokens = _model_id_tokens(model)
+    if not tokens:
         return None
-    normalized = model.strip().lower()
-    if not normalized:
-        return None
-    tokens = [t for t in _MODEL_ID_SEPARATORS.split(normalized) if t]
     family: str | None = None
     start = 0
     for name in _MODEL_FEATURE_MIN_VERSIONS:
@@ -170,6 +202,8 @@ def model_supports_gated_features(model: object, *, family: str | None = None) -
     ``claude-sonnet-4-6`` and ``gpt-5.4`` remain below these conservative
     defaults. Features with verified earlier support use
     :func:`parse_model_family_version` with their own cutoff.
+    :func:`model_is_gpt_feature_exception` allowlists the post-cutoff releases
+    whose slugs keep an older version number (``gpt-5.3-codex-spark``).
 
     ``family`` optionally restricts the answer to one family (``"claude"`` or
     ``"gpt"``) so a provider-specific gate can't be opened by a model id from
@@ -186,6 +220,8 @@ def model_supports_gated_features(model: object, *, family: str | None = None) -
     parsed_family, version = parsed
     if family is not None and parsed_family != family:
         return False
+    if parsed_family == "gpt" and model_is_gpt_feature_exception(model):
+        return True
     return version >= _MODEL_FEATURE_MIN_VERSIONS[parsed_family]
 
 

@@ -138,7 +138,19 @@ def test_codex_synthetic_model_metadata_responses() -> None:
     unknown = synthetic_model_get_response("gpt-99-future")
 
     assert list_payload["object"] == "list"
-    assert "gpt-5.5" in {entry["id"] for entry in list_payload["data"]}
+    listed_ids = {entry["id"] for entry in list_payload["data"]}
+    assert "gpt-5.5" in listed_ids
+    # The token-efficient fast Codex tier must stay selectable when the
+    # upstream registry is unavailable.
+    assert "gpt-5.3-codex-spark" in listed_ids
+    assert synthetic_model_get_response("gpt-5.3-codex-spark").status_code == 200
+    # ...but with its real 128k context window, not the generic 272k default —
+    # over-advertising lets Codex retain an oversized conversation that the
+    # upstream then rejects instead of compacting it.
+    fallback_entries = {entry["slug"]: entry for entry in list_payload["models"]}
+    assert fallback_entries["gpt-5.3-codex-spark"]["context_window"] == 128000
+    assert fallback_entries["gpt-5.3-codex-spark"]["max_context_window"] == 128000
+    assert fallback_entries["gpt-5.5"]["context_window"] == 272000
     assert known_payload == {
         "id": "gpt-5.5",
         "object": "model",
@@ -156,7 +168,8 @@ def test_codex_model_registry_entry_preserves_upstream_fields_and_defaults() -> 
 
     assert entry["slug"] == "gpt-5.3-codex-spark"
     assert entry["display_name"] == "Spark"
-    assert entry["context_window"] == 12345
+    assert entry["context_window"] == 12345  # upstream beats the model-specific fallback
+    assert entry["max_context_window"] == 128000  # model-specific fallback beats the generic
     assert entry["default_reasoning_level"] == "medium"
     assert entry["supports_parallel_tool_calls"] is True
     assert entry["supported_in_api"] is True

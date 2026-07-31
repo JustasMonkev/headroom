@@ -900,8 +900,11 @@ def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> Non
     ]
     for entry in payload["models"]:
         assert entry["default_reasoning_level"] == "medium"
-        assert entry["context_window"] == 272000
         assert entry["supports_parallel_tool_calls"] is True
+    # When the upstream entry carries no window, model-specific fallback
+    # metadata fills it: Spark is a 128k model, the generic profile is 272k.
+    windows = {entry["slug"]: entry["context_window"] for entry in payload["models"]}
+    assert windows == {"gpt-5.5": 272000, "gpt-5.3-codex-spark": 128000}
     assert len(fake_http_client.calls) == 1
     method, url, headers = fake_http_client.calls[0]
     assert method == "GET"
