@@ -720,6 +720,15 @@ class CompressionStore:
         # and deserialize every payload twice on the SQLite backend.
         live_bytes = self._clean_expired()
 
+        # The heap only records keys THIS process stored. After a restart on
+        # a persistent backend (or with other workers writing rows), the
+        # backend can hold live entries the heap has never seen — eviction
+        # would then skip them forever. A heap that under-covers the backend
+        # is always incomplete (stale entries only ever make it larger), so
+        # rebuild it from the backend before enforcing either bound.
+        if len(self._eviction_heap) < self._backend.count():
+            self._rebuild_heap()
+
         # CRITICAL FIX: Rebuild heap if too many stale entries
         # This prevents unbounded heap growth when entries are deleted/replaced
         heap_size = len(self._eviction_heap)
@@ -727,24 +736,23 @@ class CompressionStore:
             stale_ratio = self._stale_heap_entries / heap_size
             if stale_ratio >= self._heap_rebuild_threshold:
                 self._rebuild_heap()
-        elif self._backend.count() > 0:
-            # Persistent backends (SQLite, multi-worker) can hold live entries
-            # this process never stored — after a restart the heap is empty
-            # and both eviction loops below would silently no-op, leaving the
-            # store above its bounds forever. Seed the heap from the backend.
-            self._rebuild_heap()
 
         # F7 (docs/token-efficiency-review.md): byte-weighted bound on top of
         # the entry-count bound — 1,000 entries of large originals can pin
         # hundreds of MB that the count bound never sees. Recomputed lazily
         # on new-key stores rather than tracked incrementally; the sum rides
-        # the `_clean_expired` pass above.
-        # `count() > 0`, not `> 1`: the pending entry is not in the backend
-        # yet, so draining every stored entry can be exactly what the bound
-        # requires. A pending entry larger than `max_bytes` by itself still
-        # lands (guard-rail semantics — new content is never rejected).
+        # the `_clean_expired` pass above. With a pending insert, evicting
+        # down to an empty backend is legitimate (the incoming entry lands
+        # right after); without one, keep at least one entry — the bound is
+        # a guard rail, not a wipe, and evicting a live entry makes its
+        # marker in the conversation unredeemable.
+        min_count = 0 if pending_bytes > 0 else 1
         approx_bytes = live_bytes + pending_bytes
-        while approx_bytes > self._max_bytes and self._backend.count() > 0 and self._eviction_heap:
+        while (
+            approx_bytes > self._max_bytes
+            and self._backend.count() > min_count
+            and self._eviction_heap
+        ):
             created_at, hash_key = heapq.heappop(self._eviction_heap)
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
@@ -780,11 +788,12 @@ class CompressionStore:
     def _clean_expired(self) -> int:
         """Remove expired entries. Must be called with lock held.
 
-        Returns the UTF-8 byte total of the surviving (live) entries so the
-        byte-bound eviction in `_evict_if_needed` does not need a second
-        full-backend `items()` scan.
-
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
+
+        Returns:
+            UTF-8 byte total of the surviving (live) entries, measured on the
+            same ``items()`` pass — callers enforcing the byte bound must not
+            pay for a second full-backend scan.
         """
         expired_keys: list[str] = []
         live_bytes = 0
