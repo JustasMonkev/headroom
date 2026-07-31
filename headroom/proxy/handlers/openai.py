@@ -2875,7 +2875,6 @@ class OpenAIHandlerMixin:
             )
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        original_client_messages = copy.deepcopy(messages)
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = self._resolve_openai_upstream(request)
         handler_path_suffix = _resolve_openai_chat_handler_path(
@@ -2899,9 +2898,13 @@ class OpenAIHandlerMixin:
         )
         if input_event.messages is not None:
             messages = input_event.messages
-            original_client_messages = copy.deepcopy(messages)
         if input_event.tools is not None:
             body["tools"] = input_event.tools
+        # Snapshot ONCE, after the input extensions: emit() echoes the passed
+        # list back through event.messages, so a pre-emit copy would always be
+        # discarded and re-taken; in-place extension mutations land in
+        # `messages` before this copy either way.
+        original_client_messages = copy.deepcopy(messages)
 
         # Validate message array size
         if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
@@ -2930,6 +2933,7 @@ class OpenAIHandlerMixin:
         if _bypass:
             logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
+        _messages_rewritten_pre_count = False
         # Image compression: tile alignment + ML-based technique routing.
         # Gated on ImageCompressionDecision — same value-type pattern
         # as CompressionDecision + MemoryDecision; locks bypass-respect
@@ -2954,6 +2958,10 @@ class OpenAIHandlerMixin:
                         provider="openai",
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
+                    # `messages` no longer matches original_client_messages, so
+                    # the token count below can't stand in for the consistency
+                    # recount of the original snapshot.
+                    _messages_rewritten_pre_count = True
                     if image_result is not None:
                         logger.info(
                             f"[{request_id}] Image: {image_result['technique']} "
@@ -3162,6 +3170,11 @@ class OpenAIHandlerMixin:
 
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+        # Unless image compression rebound `messages` above, its content here is
+        # identical to original_client_messages — stash the provider-scale count
+        # so the consistency recount before PRE_SEND forwarding can skip a full
+        # re-walk of the original conversation in the common (no-image) case.
+        _handler_original_tokens = None if _messages_rewritten_pre_count else original_tokens
 
         # Hook: pre_compress
         _hook_biases = None
@@ -3785,8 +3798,14 @@ class OpenAIHandlerMixin:
         # branch may have left original_tokens in the pipeline's char-estimator scale
         # (result.tokens_before), which mismatches optimized_tokens (provider tokenizer)
         # and yields impossible tok_after>tok_before. Recount original from the
-        # pre-compression snapshot so the message delta is on one scale.
-        original_tokens = tokenizer.count_messages(original_client_messages)
+        # pre-compression snapshot so the message delta is on one scale. The count
+        # stashed at request start already IS that value unless image compression
+        # rewrote `messages` before it was taken — only then re-walk the snapshot.
+        original_tokens = (
+            _handler_original_tokens
+            if _handler_original_tokens is not None
+            else tokenizer.count_messages(original_client_messages)
+        )
         optimized_tokens = tokenizer.count_messages(body["messages"])
         if tool_tokens_before_compaction > 0:
             try:
