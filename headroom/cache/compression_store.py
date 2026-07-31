@@ -398,8 +398,11 @@ class CompressionStore:
                 # Same-size/shrinking re-stores (the common mirror-bridge
                 # duplicate) skip the eviction scan.
                 if self._entry_nbytes(entry) > self._entry_nbytes(existing):
-                    delta = self._entry_nbytes(entry) - self._entry_nbytes(existing)
-                    self._evict_if_needed(pending_bytes=delta, replacing_key=hash_key)
+                    self._evict_if_needed(
+                        pending_bytes=self._entry_nbytes(entry),
+                        replacing_key=hash_key,
+                        replaced_bytes=self._entry_nbytes(existing),
+                    )
 
             self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
@@ -718,19 +721,23 @@ class CompressionStore:
             pass
         return nbytes
 
-    def _evict_if_needed(self, pending_bytes: int = 0, replacing_key: str | None = None) -> None:
+    def _evict_if_needed(
+        self,
+        pending_bytes: int = 0,
+        replacing_key: str | None = None,
+        replaced_bytes: int = 0,
+    ) -> None:
         """Evict old entries if at capacity. Must be called with lock held.
 
         MEDIUM FIX #16: Use heap for O(log n) eviction instead of O(n) scan.
         CRITICAL FIX: Track and clean stale heap entries to prevent memory leak.
 
         Args:
-            pending_bytes: UTF-8 size the caller is about to add — the full
-                entry for a new key, or the growth delta for a replacement.
-                The byte bound is enforced on `stored + pending`, so the
-                store is back under `max_bytes` *after* the insertion —
-                enforcing on stored bytes alone would let every insert land
-                one entry over the advertised bound.
+            pending_bytes: FULL UTF-8 size of the entry the caller is about
+                to write. The byte bound is enforced on `stored + pending`,
+                so the store is back under `max_bytes` *after* the insertion
+                — enforcing on stored bytes alone would let every insert
+                land one entry over the advertised bound.
             replacing_key: Set when the caller is about to OVERWRITE this
                 existing key (growing re-store). The byte loop never evicts
                 it (the overwrite supersedes it atomically; evicting it here
@@ -738,12 +745,24 @@ class CompressionStore:
                 fails), and the count loop is skipped entirely — a
                 replacement does not change the entry count, so count
                 eviction would destroy an unrelated live entry.
+            replaced_bytes: UTF-8 size of the row `replacing_key` currently
+                holds. Credited against `pending_bytes` ONLY if that row
+                survives the expiry sweep — if it expired between the
+                caller's `get()` and this pass, the sweep already deleted
+                it, the overwrite is effectively a full insertion, and
+                crediting the stale size would under-enforce the bound
+                (PR #21 review).
         """
         # Remove expired entries and collect the live byte total and live
         # (created_at, key) pairs in the same `items()` pass — a second
         # full-backend scan per insert would read and deserialize every
         # payload twice on the SQLite backend.
         live_bytes, live_pairs = self._clean_expired()
+
+        if replacing_key is not None and any(key == replacing_key for _, key in live_pairs):
+            # The old row survived the sweep and will be reclaimed by the
+            # overwrite — only the growth delta is genuinely new bytes.
+            pending_bytes -= replaced_bytes
 
         # The heap only records what THIS process stored. After a restart on
         # a persistent backend (or with other workers writing rows), the
@@ -754,12 +773,17 @@ class CompressionStore:
         # count, and a same-KEY re-store with a new timestamp preserves key
         # coverage while invalidating the local tuple — the eviction loop
         # would pop it, fail the timestamp comparison, and exhaust the heap
-        # without freeing anything. `live_pairs` came from the expiry pass
-        # above; the heap set is O(heap) over small tuples.
+        # without freeing anything. On a coverage miss the heap is rebuilt
+        # FROM THE SNAPSHOT the expiry pass just collected (PR #21 review) —
+        # calling `_rebuild_heap()` here would re-run `backend.items()`,
+        # restoring the double full-store scan on every insertion whenever a
+        # sibling worker writes between our inserts.
         if live_pairs:
             heap_pairs = set(self._eviction_heap)
             if any(pair not in heap_pairs for pair in live_pairs):
-                self._rebuild_heap()
+                self._eviction_heap = list(live_pairs)
+                heapq.heapify(self._eviction_heap)
+                self._stale_heap_entries = 0
 
         # CRITICAL FIX: Rebuild heap if too many stale entries
         # This prevents unbounded heap growth when entries are deleted/replaced
@@ -794,10 +818,18 @@ class CompressionStore:
                 continue
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
+                # Only credit the bytes once the row is confirmed gone —
+                # SQLiteBackend.delete() returns False on transient database
+                # errors (PR #21 review). On failure, restore the heap tuple
+                # and stop: retrying in a tight loop against a failing
+                # backend would spin, and the bound is a guard rail, not a
+                # gate on the insertion.
+                if self._backend.delete(hash_key) is False:
+                    protected.append((created_at, hash_key))
+                    break
                 if self._enable_feedback and entry.retrieval_count == 0:
                     self._record_eviction_success(entry)
                 approx_bytes -= self._entry_nbytes(entry)
-                self._backend.delete(hash_key)
             elif self._stale_heap_entries > 0:
                 self._stale_heap_entries -= 1
         for item in protected:
@@ -817,13 +849,17 @@ class CompressionStore:
             # (entry might have been deleted or replaced)
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
+                # Same delete-confirmation rule as the byte loop above: a
+                # failed delete restores the tuple and stops the pass.
+                if self._backend.delete(hash_key) is False:
+                    heapq.heappush(self._eviction_heap, (created_at, hash_key))
+                    break
                 # HIGH FIX: Track eviction as "successful compression" if never retrieved
                 # This prevents state divergence between store and feedback loop
                 if self._enable_feedback and entry.retrieval_count == 0:
                     # Entry was never retrieved = compression was successful
                     # Notify feedback system so it knows this strategy worked
                     self._record_eviction_success(entry)
-                self._backend.delete(hash_key)
             else:
                 # CRITICAL FIX: This was a stale entry, decrement counter
                 # (we already popped it, so the stale entry is now gone)

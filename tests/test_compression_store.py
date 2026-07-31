@@ -1564,3 +1564,56 @@ class TestRound3ReviewFixes:
             "coverage must compare (created_at, key) pairs: a same-key "
             "re-store by another worker left the row unevictable"
         )
+
+
+class TestRound4ReviewFixes:
+    """Fourth-round PR #21 review fixes: expired replacements count as full
+    insertions, and eviction only credits bytes for confirmed deletes."""
+
+    def test_expired_replacement_counts_full_size(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        victim = store.store(original="v" * 300, compressed="[]")
+        store.store(original="k" * 300, compressed="[]", explicit_hash="ab" * 12, ttl=1)
+        time.sleep(1.05)  # the replaced row expires before the re-store
+
+        # 800-byte growing re-store of the now-expired key: the sweep removes
+        # the old row, so the "delta" credit would see 302 live + 498 delta
+        # and fit — but the write actually lands 302 + 800 = 1102 > 1000.
+        store.store(original="k" * 300, compressed="c" * 500, explicit_hash="ab" * 12)
+        assert store.retrieve("ab" * 12) is not None
+        assert store.retrieve(victim) is None, (
+            "a replacement whose old row expired mid-flight is a full "
+            "insertion; crediting the stale size under-enforces max_bytes"
+        )
+
+    def test_failed_delete_not_credited_and_entry_stays_evictable(self):
+        from headroom.cache.backends import InMemoryBackend
+
+        class FlakyDeleteBackend(InMemoryBackend):
+            fail_next_delete = False
+
+            def delete(self, key):
+                if self.fail_next_delete:
+                    self.fail_next_delete = False
+                    return False  # SQLiteBackend's transient-error contract
+                return super().delete(key)
+
+        backend = FlakyDeleteBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=1000, backend=backend)
+        h1 = store.store(original="a" * 600, compressed="[]")
+
+        backend.fail_next_delete = True
+        h2 = store.store(original="b" * 600, compressed="[]")
+        # Insertion is never blocked (guard rail), and the failed delete did
+        # not remove the old row.
+        assert store.retrieve(h1) is not None
+        assert store.retrieve(h2) is not None
+
+        # The heap tuple survived the failed delete: the next insert can
+        # still evict h1 once the backend recovers.
+        h3 = store.store(original="c" * 600, compressed="[]")
+        assert store.retrieve(h3) is not None
+        assert store.retrieve(h1) is None, (
+            "a failed delete must keep the heap tuple so the row stays "
+            "evictable after the backend recovers"
+        )
