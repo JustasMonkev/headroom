@@ -138,7 +138,12 @@ def test_codex_synthetic_model_metadata_responses() -> None:
     unknown = synthetic_model_get_response("gpt-99-future")
 
     assert list_payload["object"] == "list"
-    assert "gpt-5.5" in {entry["id"] for entry in list_payload["data"]}
+    listed_ids = {entry["id"] for entry in list_payload["data"]}
+    assert "gpt-5.5" in listed_ids
+    # The token-efficient fast Codex tier must stay selectable when the
+    # upstream registry is unavailable.
+    assert "gpt-5.3-codex-spark" in listed_ids
+    assert synthetic_model_get_response("gpt-5.3-codex-spark").status_code == 200
     assert known_payload == {
         "id": "gpt-5.5",
         "object": "model",

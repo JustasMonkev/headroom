@@ -57,6 +57,10 @@ def _tools() -> list[dict]:
         "gpt-6",
         "gpt-6.2",
         "openai/gpt-5.4",
+        # Allowlisted past the 5.4 cutoff: a post-cutoff release whose slug
+        # keeps the 5.3-codex branding.
+        "gpt-5.3-codex-spark",
+        "openai/gpt-5.3-codex-spark",
     ],
 )
 def test_model_supported(model):
@@ -70,6 +74,7 @@ def test_model_supported(model):
         "gpt-4.1",
         "gpt-5",
         "gpt-5.3",
+        "gpt-5.3-codex",  # the spark carve-out does not cover plain 5.3-codex
         "o3",
         "",
         None,
@@ -84,11 +89,14 @@ def test_env_override_wins_then_falls_back(monkeypatch):
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", r"^my-model")
     assert _model_supports_openai_tool_search("my-model-v1") is True
     assert _model_supports_openai_tool_search("gpt-5.5") is False  # override replaces the gate
+    # ...including the codex-spark allowlist — the operator regex is the policy.
+    assert _model_supports_openai_tool_search("gpt-5.3-codex-spark") is False
     # a malformed regex must not crash — fall back to the version gate.
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
     assert _model_supports_openai_tool_search("gpt-5.5") is True
     assert _model_supports_openai_tool_search("gpt-5.4") is True
     assert _model_supports_openai_tool_search("gpt-5.3") is False
+    assert _model_supports_openai_tool_search("gpt-5.3-codex-spark") is True
 
 
 def test_tool_search_cutoff_does_not_weaken_the_shared_gpt_gate():

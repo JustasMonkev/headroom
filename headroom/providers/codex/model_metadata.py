@@ -59,6 +59,7 @@ class CodexModelRegistryHttpClient(Protocol):
 CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
     "gpt-5.5",
     "gpt-5.4",
+    "gpt-5.3-codex-spark",
     "gpt-5.3",
     "gpt-5.2",
     "gpt-5.1",

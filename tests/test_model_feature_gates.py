@@ -11,7 +11,9 @@ Two properties are load-bearing and pinned here:
 
 * **Feature-specific definitions.** Anthropic tool search and OpenAI native
   output controls use the shared cutoffs. Thinking compaction starts at Claude
-  4.6, and OpenAI tool search starts at GPT 5.4.
+  4.6, and OpenAI tool search starts at GPT 5.4. ``gpt-5.3-codex-spark`` is a
+  post-cutoff release whose slug keeps the 5.3-codex branding, so it is
+  allowlisted past every GPT cutoff.
 * **Fail closed.** An unrecognized or unparseable model id must NOT get the
   gated features. Firing one where the provider doesn't support it costs real
   tokens (compacting thinking a pre-cutoff model would have stripped for free)
@@ -26,6 +28,7 @@ import pytest
 from headroom.config import (
     MIN_CLAUDE_FEATURE_VERSION,
     MIN_GPT_FEATURE_VERSION,
+    model_is_gpt_feature_exception,
     model_supports_gated_features,
     parse_model_family_version,
 )
@@ -34,6 +37,28 @@ from headroom.config import (
 def test_cutoffs_are_the_agreed_versions() -> None:
     assert MIN_CLAUDE_FEATURE_VERSION == (4, 8)
     assert MIN_GPT_FEATURE_VERSION == (5, 5)
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gpt-5.3-codex-spark", True),
+        ("openai/gpt-5.3-codex-spark", True),
+        ("chatgpt/gpt-5.3-codex-spark", True),
+        ("GPT-5.3-Codex-Spark", True),
+        ("gpt-5.3-codex-spark-2026-06-01", True),
+        # The full contiguous codex-spark run is required.
+        ("gpt-5.3-codex", False),
+        ("gpt-5.3-spark", False),
+        ("gpt-5.3", False),
+        ("gpt-5.4-codex-spark", False),
+        ("claude-codex-spark", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_model_is_gpt_feature_exception(model: object, expected: bool) -> None:
+    assert model_is_gpt_feature_exception(model) is expected
 
 
 # (model id, gated features engage?)
@@ -101,6 +126,15 @@ GATE_TABLE: list[tuple[object, bool]] = [
     ("gpt-6.2", True),
     ("openai/gpt-5.5", True),
     ("openai/gpt-5", False),
+    # --- gpt-5.3-codex-spark: allowlisted past the version cutoffs. The slug
+    # keeps 5.3-codex branding, but the model is a post-cutoff release with
+    # verified support for the gated token-efficiency features.
+    ("gpt-5.3-codex-spark", True),
+    ("openai/gpt-5.3-codex-spark", True),
+    ("GPT-5.3-Codex-Spark", True),
+    ("gpt-5.3-codex-spark-2026-06-01", True),
+    ("gpt-5.3-codex", False),  # the carve-out needs the full codex-spark run
+    ("gpt-5.3-spark", False),
     # --- Families with no version-gated features at all.
     ("o1", False),
     ("o3", False),
@@ -191,7 +225,11 @@ def test_each_gate_uses_its_feature_cutoff() -> None:
         claude_shared = expected and model_supports_gated_features(model, family="claude")
         gpt_shared = expected and model_supports_gated_features(model, family="gpt")
         thinking = bool(parsed and parsed[0] == "claude" and parsed[1] >= (4, 6))
-        openai_tool_search = bool(parsed and parsed[0] == "gpt" and parsed[1] >= (5, 4))
+        openai_tool_search = bool(
+            parsed
+            and parsed[0] == "gpt"
+            and (parsed[1] >= (5, 4) or model_is_gpt_feature_exception(model))
+        )
         assert bills_prior_thinking(model) is thinking, model
         assert _model_supports_anthropic_tool_search(model) is bool(claude_shared), model
         assert _model_supports_openai_tool_search(model) is openai_tool_search, model
