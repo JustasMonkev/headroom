@@ -746,3 +746,23 @@ class TestExtractAssistantMessageEdgeCases:
         resp = {"choices": [{"message": {"content": "hi", "tool_calls": [{"id": "1"}]}}]}
         msg = handler._extract_assistant_message(resp, "openai")
         assert msg == {"role": "assistant", "content": "hi", "tool_calls": [{"id": "1"}]}
+
+
+class TestModelFacingJsonSurrogates:
+    """PR #21 review: lone surrogates from JSON input must not crash the
+    continuation request's UTF-8 serialization."""
+
+    def test_lone_surrogate_falls_back_to_ascii_escaping(self):
+        from headroom.ccr.response_handler import model_facing_json
+
+        lone_surrogate = json.loads('"payload \\ud800 tail"')
+        text = model_facing_json({"hash": "ab" * 12, "original_content": lone_surrogate})
+        text.encode("utf-8")  # must not raise
+        assert json.loads(text)["original_content"] == lone_surrogate
+
+    def test_normal_unicode_stays_unescaped(self):
+        from headroom.ccr.response_handler import model_facing_json
+
+        text = model_facing_json({"original_content": "汉字 🎉"})
+        assert "汉字 🎉" in text  # compact, unescaped — the cheap-token path
+        assert ": " not in text and ", " not in text

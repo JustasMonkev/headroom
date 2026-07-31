@@ -452,6 +452,34 @@ status. No false positives survived revalidation — the one telemetry-echo
 claim was scoped down after checking that `/v1/retrieve`'s caller-facing
 JSON contract must keep its fields.
 
+### Round-2 review follow-ups (same PR)
+
+A second reviewer pass on the fixes surfaced four more defects, all fixed
+with regression tests:
+
+- **Byte bound on growing re-stores.** The duplicate-store fast path
+  skipped `_evict_if_needed`, so re-storing an existing hash with a larger
+  compressed payload could keep the store above `max_bytes` with no new key
+  ever arriving to trigger eviction. Growing replacements now
+  delete-then-evict-then-set (the bound sees the store without the old
+  entry and cannot evict the key being replaced); byte-identical duplicate
+  re-stores — the common mirror-bridge pattern — still skip the scan.
+- **Heap coverage by key, not cardinality.** Another worker deleting one
+  row and inserting another leaves the backend count unchanged while the
+  local heap lacks the new live key. Coverage is now verified against the
+  live-key list the expiry pass already produces.
+- **Maturation replay no longer clobbers stale markers.** The
+  lifecycle-marker guard now runs before the matured-replay branch: a
+  matured file that is edited later keeps read_lifecycle's stale marker
+  ("re-read for current content") instead of being overwritten by the
+  recorded maturation marker, which only advertises the pre-edit original.
+- **Lone-surrogate-safe model-facing JSON.** `ensure_ascii=False` would
+  emit a lone surrogate accepted from JSON input literally, crashing the
+  continuation request's UTF-8 serialization. All five compact-JSON
+  retrieval sites now go through `model_facing_json()`, which probes with
+  an encode and falls back to ASCII escaping for exactly that case —
+  normal CJK/emoji stays on the cheap unescaped path.
+
 ### Round-3 test status
 
 `diff`/`cache`/`CCR`/`read-lifecycle`/`response-handler`/`token-headroom`

@@ -1428,3 +1428,69 @@ class TestByteBoundEviction:
         # marker sitting in the conversation unredeemable when there is
         # nothing else to reclaim.
         assert store.retrieve(h1) is not None
+
+
+class TestRound2ReviewFixes:
+    """Second-round PR #21 review fixes."""
+
+    def test_growing_replacement_enforces_byte_bound(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        victim = store.store(original="v" * 300, compressed="[]")
+        grown_key = store.store(original="g" * 300, compressed="[]", explicit_hash="ab" * 12)
+        assert store.retrieve(victim) is not None
+
+        # Re-store the same key with a much larger compressed payload:
+        # 300 (victim) + 300 + 500 (grown) > 1000 → the victim must go.
+        store.store(original="g" * 300, compressed="c" * 500, explicit_hash="ab" * 12)
+        assert store.retrieve(grown_key) is not None
+        assert store.retrieve(victim) is None, (
+            "a growing re-store adds bytes; skipping the bound check lets "
+            "repeated growing re-stores keep the store above max_bytes"
+        )
+
+    def test_same_size_duplicate_restore_does_not_evict(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        victim = store.store(original="v" * 300, compressed="[]")
+        dup_key = store.store(original="g" * 300, compressed="[]", explicit_hash="ab" * 12)
+
+        # Byte-identical duplicate re-store (mirror-bridge pattern): no
+        # growth, no eviction scan, victim untouched.
+        store.store(original="g" * 300, compressed="[]", explicit_hash="ab" * 12)
+        assert store.retrieve(victim) is not None
+        assert store.retrieve(dup_key) is not None
+
+    def test_heap_coverage_checked_by_key_not_count(self):
+        import time as _time
+
+        from headroom.cache.backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=1000, backend=backend)
+        h1 = store.store(original="a" * 600, compressed="[]")
+
+        # Simulate another worker: h1 replaced by h2 directly in the shared
+        # backend. Row count is unchanged (1), but the local heap only knows
+        # h1 — a cardinality check would pass and byte eviction would find
+        # nothing live to evict.
+        backend.delete(h1)
+        other = CompressionEntry(
+            hash="cd" * 12,
+            original_content="b" * 600,
+            compressed_content="[]",
+            original_tokens=0,
+            compressed_tokens=0,
+            original_item_count=1,
+            compressed_item_count=1,
+            tool_name=None,
+            tool_call_id=None,
+            query_context=None,
+            created_at=_time.time(),
+        )
+        backend.set(other.hash, other)
+
+        h3 = store.store(original="c" * 600, compressed="[]")
+        assert store.retrieve(h3) is not None
+        assert store.retrieve(other.hash) is None, (
+            "heap coverage must be verified by key: same-count key swaps by "
+            "another worker leave the live row unevictable"
+        )

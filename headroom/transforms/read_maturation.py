@@ -266,20 +266,26 @@ class ReadMaturationManager:
         """Returns (replacement_content | None, still_holding)."""
         matured = self._matured.get(tc_id)
 
+        # Lifecycle/CCR markers are already compact — and read_lifecycle runs
+        # FIRST, so respect its replacement. This guard must run before the
+        # matured-replay branch: a file that matured and was edited later gets
+        # a STALE marker from read_lifecycle ("re-read for current content"),
+        # and replaying the recorded maturation marker over it would replace
+        # accurate guidance with a marker that only advertises the pre-edit
+        # original. (The matured marker itself carries the same phrase, so
+        # replaying over our own already-applied marker also lands here — the
+        # correct no-op.)
+        if "Retrieve original: hash=" in content or "Retrieve more: hash=" in content:
+            return None, False
+
         # Matured earlier: replay the recorded marker deterministically.
         if matured is not None:
-            if content == matured.marker:
-                return None, False
             result.replacements_applied += 1
             result.bytes_saved += max(0, len(content) - len(matured.marker))
             return matured.marker, False
 
         size = len(content.encode("utf-8", errors="replace"))
         if size < self.config.min_size_bytes:
-            return None, False
-        # Lifecycle markers (stale/superseded) are already compact — and
-        # read_lifecycle runs first, so respect its replacement.
-        if "Retrieve original: hash=" in content or "Retrieve more: hash=" in content:
             return None, False
 
         file_path, read_turn = activity.read_calls[tc_id]

@@ -351,3 +351,43 @@ class TestBreakpointRelocation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestLifecycleMarkerSurvivesReplay:
+    """PR #21 review: a matured file that is edited later gets a STALE
+    marker from read_lifecycle (which runs first); replaying the recorded
+    maturation marker over it would replace 're-read for current content'
+    guidance with a marker that only advertises the pre-edit original."""
+
+    def test_stale_marker_not_clobbered_by_matured_replay(self):
+        m = manager(quiesce_turns=5)
+        msgs = [*base_conv(), *quiet(5)]
+        res = m.apply(msgs)
+        assert res.newly_matured == 1
+
+        # Later request: read_lifecycle has already replaced this read's
+        # content with a stale marker (the file was edited after maturation).
+        stale_marker = (
+            "[stale read: /x/foo.py — re-read for current content. "
+            "Retrieve original: hash=" + "ab" * 12 + "]"
+        )
+        lifecycle_msgs = [
+            {"role": "user", "content": "look"},
+            *anthropic_read("r1", "/x/foo.py", stale_marker),
+            *quiet(5),
+        ]
+        res2 = m.apply(lifecycle_msgs)
+        assert read_content(res2) == stale_marker, (
+            "matured replay must not clobber read_lifecycle's stale marker"
+        )
+
+    def test_raw_content_still_replayed_after_maturation(self):
+        m = manager(quiesce_turns=5)
+        msgs = [*base_conv(), *quiet(5)]
+        res = m.apply(msgs)
+        assert res.newly_matured == 1
+        marker = read_content(res)
+
+        # Client echoes the original verbatim content back — replay applies.
+        res2 = m.apply(msgs)
+        assert read_content(res2) == marker

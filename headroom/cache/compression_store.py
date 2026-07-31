@@ -384,6 +384,17 @@ class CompressionStore:
                     )
                 # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
+                # Byte bound on replacements (PR #21 review): a re-store that
+                # GROWS the entry adds bytes the duplicate fast path never
+                # counted — without this, repeated growing re-stores keep the
+                # store above `max_bytes` with no new key ever arriving to
+                # trigger eviction. Delete-then-evict-then-set so the bound
+                # sees the store without the old entry and cannot evict the
+                # very key being replaced. Same-size/shrinking re-stores (the
+                # common mirror-bridge duplicate) skip the eviction scan.
+                if self._entry_nbytes(entry) > self._entry_nbytes(existing):
+                    self._backend.delete(hash_key)
+                    self._evict_if_needed(pending_bytes=self._entry_nbytes(entry))
 
             self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
@@ -715,19 +726,24 @@ class CompressionStore:
                 enforcing on stored bytes alone would let every insert land
                 one entry over the advertised bound.
         """
-        # Remove expired entries and collect the live byte total in the same
-        # `items()` pass — a second full-backend scan per insert would read
-        # and deserialize every payload twice on the SQLite backend.
-        live_bytes = self._clean_expired()
+        # Remove expired entries and collect the live byte total and live
+        # keys in the same `items()` pass — a second full-backend scan per
+        # insert would read and deserialize every payload twice on the
+        # SQLite backend.
+        live_bytes, live_keys = self._clean_expired()
 
         # The heap only records keys THIS process stored. After a restart on
         # a persistent backend (or with other workers writing rows), the
         # backend can hold live entries the heap has never seen — eviction
-        # would then skip them forever. A heap that under-covers the backend
-        # is always incomplete (stale entries only ever make it larger), so
-        # rebuild it from the backend before enforcing either bound.
-        if len(self._eviction_heap) < self._backend.count():
-            self._rebuild_heap()
+        # would then skip them forever. Coverage is checked by KEY, not by
+        # cardinality (PR #21 review): another worker deleting one row and
+        # inserting another leaves the count unchanged while the local heap
+        # still lacks the new live key. `live_keys` came from the expiry pass
+        # above; the heap-key set is O(heap) over 24-char strings.
+        if live_keys:
+            heap_keys = {key for _, key in self._eviction_heap}
+            if any(key not in heap_keys for key in live_keys):
+                self._rebuild_heap()
 
         # CRITICAL FIX: Rebuild heap if too many stale entries
         # This prevents unbounded heap growth when entries are deleted/replaced
@@ -785,29 +801,32 @@ class CompressionStore:
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
 
-    def _clean_expired(self) -> int:
+    def _clean_expired(self) -> tuple[int, list[str]]:
         """Remove expired entries. Must be called with lock held.
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
 
         Returns:
-            UTF-8 byte total of the surviving (live) entries, measured on the
-            same ``items()`` pass — callers enforcing the byte bound must not
-            pay for a second full-backend scan.
+            ``(live_bytes, live_keys)`` — the UTF-8 byte total and the keys of
+            the surviving (live) entries, measured on the same ``items()``
+            pass. Callers enforcing the byte bound and verifying heap key
+            coverage must not pay for a second full-backend scan.
         """
         expired_keys: list[str] = []
+        live_keys: list[str] = []
         live_bytes = 0
         for key, entry in self._backend.items():
             if entry.is_expired():
                 expired_keys.append(key)
             else:
+                live_keys.append(key)
                 live_bytes += self._entry_nbytes(entry)
         for key in expired_keys:
             self._backend.delete(key)
             # CRITICAL FIX: Increment stale counter - the heap still has an entry
             # for this key that will be stale when we try to evict
             self._stale_heap_entries += 1
-        return live_bytes
+        return live_bytes, live_keys
 
     def _rebuild_heap(self) -> None:
         """Rebuild heap from current store entries. Must be called with lock held.
