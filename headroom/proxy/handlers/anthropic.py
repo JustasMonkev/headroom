@@ -31,7 +31,7 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -713,12 +713,14 @@ class AnthropicHandlerMixin:
             # aborting multi-turn sessions. Canonicalizing here (in place, so body,
             # original, forwarded, and the recorded/replayed prefix are all identical)
             # keeps it cache-safe: overlay_cached_prefix replays the same stripped bytes.
-            _strip_streaming_only_content_fields(messages)
+            # JSON serializers never escape ASCII key characters, so a body
+            # without the literal bytes `"index"` cannot contain the key —
+            # skip the full-conversation walk for the common case.
+            if b'"index"' in original_body_bytes:
+                _strip_streaming_only_content_fields(messages)
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
             pipeline_stream = bool(body.get("stream", False) or force_stream)
-            with stage_timer.measure("deep_copy"):
-                original_client_messages = copy.deepcopy(messages)
             input_event = self.pipeline_extensions.emit(
                 PipelineStage.INPUT_RECEIVED,
                 operation="proxy.request",
@@ -731,10 +733,14 @@ class AnthropicHandlerMixin:
             )
             if input_event.messages is not None:
                 messages = input_event.messages
-                with stage_timer.measure("deep_copy"):
-                    original_client_messages = copy.deepcopy(messages)
             if input_event.tools is not None:
                 body["tools"] = input_event.tools
+            # Snapshot ONCE, after the input extensions: emit() echoes the passed
+            # list back through event.messages, so a pre-emit copy would always be
+            # discarded and re-taken; in-place extension mutations land in
+            # `messages` before this copy either way.
+            with stage_timer.measure("deep_copy"):
+                original_client_messages = copy.deepcopy(messages)
 
             # Validate message array size
             if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
@@ -1010,6 +1016,11 @@ class AnthropicHandlerMixin:
             # resolution may hit the network (HF download) and counting a full
             # conversation is CPU-bound — on-loop it froze the server (#1701).
             tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+            # `messages` content here is identical to original_client_messages
+            # (the snapshot is frozen and nothing mutates messages in between),
+            # so the consistency recount before send reuses this handler-scale
+            # count instead of re-walking the whole conversation on-loop.
+            _handler_original_tokens = original_tokens
 
             # Enterprise Security: scan request before compression
             _security_ctx = None
@@ -1217,8 +1228,6 @@ class AnthropicHandlerMixin:
             )
             _image_decision.apply_to_tags(tags)
             if _image_decision.should_compress and not is_cache_mode(self.config.mode):
-                from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                 compressor = None
                 try:
                     compressor = _get_image_compressor()
@@ -1268,8 +1277,6 @@ class AnthropicHandlerMixin:
                 )
             if _decision.should_compress and not _skip_compression_for_backpressure:
                 try:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                     context_limit = self.anthropic_provider.get_context_limit(model)
                     result = None
                     biases = (
@@ -2445,7 +2452,6 @@ class AnthropicHandlerMixin:
                 "on",
             ):
                 try:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
                     from headroom.transforms.compression_units import find_content_router
                     from headroom.transforms.thinking_compactor import (
                         bills_prior_thinking,
@@ -2524,10 +2530,19 @@ class AnthropicHandlerMixin:
                 metadata={"path": pipeline_path, "stream": stream},
             )
             previous_presend_messages = optimized_messages
+            previous_presend_tools = tools
             if presend_event.messages is not None:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
-            if presend_event.tools is not None:
+            # Re-sorting costs a canonical json.dumps per tool, and emit() echoes
+            # the tools list back through the event — so with no extensions
+            # installed nothing can have changed and the already-deterministic
+            # order stands. With extensions, always re-sort: the contract allows
+            # in-place mutation, which an identity check cannot see.
+            if presend_event.tools is not None and (
+                self.pipeline_extensions.enabled
+                or presend_event.tools is not previous_presend_tools
+            ):
                 tools = self._tools_for_forwarding(
                     presend_event.tools,
                     preserve_order=preserve_tool_order,
@@ -2704,13 +2719,15 @@ class AnthropicHandlerMixin:
             # and the handler use different token estimators, and cache-mode branches
             # can leave original_tokens (handler, line ~1049) and optimized_tokens
             # (pipeline, result.tokens_after) on different scales — which produced
-            # impossible tok_after>tok_before deltas and masked real savings. Recount
-            # BOTH endpoints (pre-compression snapshot vs final outbound messages) with
-            # the handler tokenizer so the delta is meaningful. This also captures any
-            # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
+            # impossible tok_after>tok_before deltas and masked real savings. Both
+            # endpoints must come from the handler tokenizer: the original endpoint
+            # reuses the handler-scale count taken at request start (same tokenizer,
+            # identical frozen snapshot — recounting it here walked the entire
+            # conversation on-loop for a value already known), and only the final
+            # outbound messages are counted fresh. This also captures any turn-hook
+            # fold (optimized_messages is post-hook). Runs unconditionally.
             try:
-                _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
-                original_tokens = tokenizer.count_messages(_orig_snapshot)
+                original_tokens = _handler_original_tokens  # noqa: F821 (bound at request start)
                 optimized_tokens = tokenizer.count_messages(optimized_messages)
                 tokens_saved = max(0, original_tokens - optimized_tokens)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
@@ -4166,8 +4183,6 @@ class AnthropicHandlerMixin:
                     _, original_tokens = await self._count_tokens_offloaded(model, messages)
                     optimized_tokens = original_tokens
                 else:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                     # Offload off the event loop (#1701): an inline apply()
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
