@@ -144,6 +144,13 @@ def test_codex_synthetic_model_metadata_responses() -> None:
     # upstream registry is unavailable.
     assert "gpt-5.3-codex-spark" in listed_ids
     assert synthetic_model_get_response("gpt-5.3-codex-spark").status_code == 200
+    # ...but with its real 128k context window, not the generic 272k default —
+    # over-advertising lets Codex retain an oversized conversation that the
+    # upstream then rejects instead of compacting it.
+    fallback_entries = {entry["slug"]: entry for entry in list_payload["models"]}
+    assert fallback_entries["gpt-5.3-codex-spark"]["context_window"] == 128000
+    assert fallback_entries["gpt-5.3-codex-spark"]["max_context_window"] == 128000
+    assert fallback_entries["gpt-5.5"]["context_window"] == 272000
     assert known_payload == {
         "id": "gpt-5.5",
         "object": "model",
