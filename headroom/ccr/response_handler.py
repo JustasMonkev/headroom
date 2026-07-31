@@ -30,6 +30,26 @@ from .tool_injection import CCR_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
+
+def model_facing_json(payload: dict) -> str:
+    """Compact JSON for model-facing tool-result content.
+
+    ``ensure_ascii=False`` keeps CJK/emoji at ~1 token per character instead
+    of 6-char ``\\uXXXX`` escapes — but a lone surrogate accepted from JSON
+    input (e.g. ``"\\ud800"`` in stored tool output) would then be emitted
+    literally and crash the continuation request's UTF-8 serialization with
+    ``UnicodeEncodeError`` (PR #21 review). Probe with an encode and fall
+    back to ASCII escaping for exactly that case; the probe is a single
+    encode of the payload, paid only on retrieval responses.
+    """
+    text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(payload, separators=(",", ":"))
+    return text
+
+
 # Residual-CCR status signals (provider-generic).
 #
 # ``handle_response`` may return a response that still contains
@@ -196,7 +216,7 @@ class CCRResponseHandler:
                 get_status(ccr_call.hash_key, clean_expired=True) if callable(get_status) else None
             )
             if entry_status is not None and entry_status["status"] != "available":
-                content = json.dumps(
+                content = model_facing_json(
                     {
                         "error": format_retrieval_miss_detail(entry_status),
                         "hash": ccr_call.hash_key,
@@ -204,8 +224,7 @@ class CCRResponseHandler:
                         "ttl_seconds": entry_status.get(
                             "ttl_seconds", entry_status["default_ttl_seconds"]
                         ),
-                    },
-                    indent=2,
+                    }
                 )
                 return CCRToolResult(
                     tool_call_id=ccr_call.tool_call_id,
@@ -216,13 +235,14 @@ class CCRResponseHandler:
             # Retrieval is by hash: always return the full original content.
             entry = store.retrieve(ccr_call.hash_key)
             if entry:
-                content = json.dumps(
+                # Model-facing payload: compact separators, no telemetry echo.
+                # `original_item_count` is already carried out-of-band on
+                # CCRToolResult.items_retrieved (D2 parity with mcp_server).
+                content = model_facing_json(
                     {
                         "hash": ccr_call.hash_key,
                         "original_content": entry.original_content,
-                        "original_item_count": entry.original_item_count,
-                    },
-                    indent=2,
+                    }
                 )
                 return CCRToolResult(
                     tool_call_id=ccr_call.tool_call_id,
@@ -236,14 +256,13 @@ class CCRResponseHandler:
                 if callable(get_status)
                 else {"hash": ccr_call.hash_key, "status": "missing"}
             )
-            content = json.dumps(
+            content = model_facing_json(
                 {
                     "error": format_retrieval_miss_detail(miss_status),
                     "hash": ccr_call.hash_key,
                     "status": miss_status["status"],
                     "ttl_seconds": miss_status.get("ttl_seconds"),
-                },
-                indent=2,
+                }
             )
             return CCRToolResult(
                 tool_call_id=ccr_call.tool_call_id,
@@ -253,12 +272,11 @@ class CCRResponseHandler:
 
         except Exception as e:
             logger.error(f"CCR retrieval failed for {ccr_call.hash_key}: {e}")
-            content = json.dumps(
+            content = model_facing_json(
                 {
                     "error": f"Retrieval failed: {str(e)}",
                     "hash": ccr_call.hash_key,
-                },
-                indent=2,
+                }
             )
             return CCRToolResult(
                 tool_call_id=ccr_call.tool_call_id,

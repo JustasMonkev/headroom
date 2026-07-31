@@ -499,17 +499,19 @@ class ReadLifecycleManager:
         # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
         # the compression-pinning checks in ContentRouter and the
         # marker-preserving regex in compression_units.py match on it.
+        #
+        # B6 (docs/token-efficiency-review.md): prose kept terse on purpose.
+        # These markers replay on every later turn, dozens per long session;
+        # the old sentence forms cost ~2× the tokens to restate what "stale"
+        # / "superseded" already say. The one load-bearing piece of advice —
+        # a stale read must be RE-READ, not retrieved, for current content —
+        # is kept inline.
         if classification.state == ReadState.STALE:
             marker = (
-                f"[Read content stale: {file_display} was modified after this read — "
-                f"re-read the file for current content. "
+                f"[stale read: {file_display} — re-read for current content. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
         else:  # SUPERSEDED
-            marker = (
-                f"[Read content superseded: {file_display} was re-read later — "
-                f"re-read the file if needed. "
-                f"Retrieve original: hash={ccr_hash}]"
-            )
+            marker = f"[superseded read: {file_display}. Retrieve original: hash={ccr_hash}]"
 
         return True, marker, ccr_hash

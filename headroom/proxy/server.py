@@ -4891,9 +4891,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     ),
                 }
 
-        # Format tool result for provider
+        # Format tool result for provider. `result_content` is what the model
+        # is billed for on every later turn: compact separators, and no
+        # telemetry echo (`*_item_count` stays in the caller-facing `data`
+        # field below, mirroring the mcp_server D2 fix).
         tool_call_id = tool_call.get("id", "")
-        result_content = json.dumps(retrieval_data, indent=2)
+        model_facing = {
+            k: v
+            for k, v in retrieval_data.items()
+            if k not in ("original_item_count", "compressed_item_count")
+        }
+        # Surrogate-safe (PR #21 review): stored originals can carry lone
+        # surrogates accepted from JSON input; the shared helper falls back
+        # to ASCII escaping for exactly that case so the continuation
+        # request's UTF-8 serialization cannot raise.
+        from ..ccr.response_handler import model_facing_json
+
+        result_content = model_facing_json(model_facing)
 
         if provider == "anthropic":
             tool_result = {

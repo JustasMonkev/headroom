@@ -1325,3 +1325,295 @@ class TestHashCollisionDetection:
             "in-memory so upgrade-time mismatch is fine, but external "
             "systems that hash-and-lookup independently need to match."
         )
+
+
+class TestByteWeightedBound:
+    """F7 byte bound — PR #21 review fixes.
+
+    The bound is enforced on `stored + pending` (the store is back under
+    `max_bytes` *after* the insert), sizes are UTF-8 bytes (not code
+    points), and an empty eviction heap over a populated backend (restart
+    with a persistent backend) is reseeded before eviction.
+    """
+
+    def test_pending_entry_counts_toward_bound(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        first = store.store(original="a" * 600, compressed="[]")
+        assert store.retrieve(first) is not None
+        # 600 stored + 600 pending > 1000 → the first entry must be evicted
+        # BEFORE the second lands; post-insert total stays under the bound.
+        second = store.store(original="b" * 600, compressed="[]")
+        assert store.retrieve(second) is not None
+        assert store.retrieve(first) is None, (
+            "byte bound must count the incoming entry: 600 + 600 > 1000 yet both entries survived"
+        )
+
+    def test_byte_bound_measures_utf8_not_code_points(self):
+        # "汉" is 1 code point / 3 UTF-8 bytes: 300 code points = 900 bytes.
+        # Distinct originals — identical content would hash to the same key
+        # and the second store would be an in-place overwrite, not an insert.
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        first = store.store(original="汉" * 300, compressed="[]")
+        second = store.store(original="码" * 300, compressed="[]")
+        assert store.retrieve(second) is not None
+        assert store.retrieve(first) is None, (
+            "byte bound must measure UTF-8 bytes: two 900-byte entries "
+            "both survived a 1000-byte bound"
+        )
+
+    def test_empty_heap_reseeded_from_backend(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        first = store.store(original="a" * 600, compressed="[]")
+        # Simulate a restart with a persistent backend: entries survive,
+        # process-local eviction state does not.
+        store._eviction_heap.clear()
+        store._stale_heap_entries = 0
+        second = store.store(original="b" * 600, compressed="[]")
+        assert store.retrieve(second) is not None
+        assert store.retrieve(first) is None, (
+            "an empty eviction heap over a populated backend must be "
+            "reseeded, not treated as nothing-to-evict"
+        )
+
+
+class TestByteBoundEviction:
+    """Byte-weighted bound (F7) — review fixes from PR #21.
+
+    Three properties are pinned here:
+    * the incoming entry's size counts toward the bound (the check runs
+      before ``_backend.set``, which otherwise sees only prior entries),
+    * a store whose eviction heap has never seen the backend's persisted
+      rows (restart, other workers) rebuilds it before enforcing bounds,
+    * without a pending insert the bound never wipes the last entry.
+    """
+
+    def test_incoming_entry_counted_against_byte_bound(self):
+        store = CompressionStore(max_entries=100, max_bytes=250, enable_feedback=False)
+        h1 = store.store(original="a" * 100, compressed="b" * 100)  # 200 bytes
+        h2 = store.store(original="c" * 50, compressed="d" * 50)  # 200 + 100 > 250
+
+        assert store.retrieve(h1) is None, (
+            "insert that lands the store above max_bytes must evict first — "
+            "counting only already-stored entries lets repeated inserts keep "
+            "the store above the advertised bound indefinitely"
+        )
+        assert store.retrieve(h2) is not None
+
+    def test_restart_seeds_eviction_heap_from_backend(self):
+        from headroom.cache.backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        first = CompressionStore(
+            max_entries=100, max_bytes=250, enable_feedback=False, backend=backend
+        )
+        h1 = first.store(original="a" * 100, compressed="b" * 100)
+
+        # Simulated restart: fresh store instance, same persisted rows,
+        # empty in-process eviction heap.
+        second = CompressionStore(
+            max_entries=100, max_bytes=250, enable_feedback=False, backend=backend
+        )
+        h2 = second.store(original="c" * 50, compressed="d" * 50)
+
+        assert second.retrieve(h1) is None, (
+            "persisted entries the heap has never seen must still be evictable"
+        )
+        assert second.retrieve(h2) is not None
+
+    def test_byte_bound_alone_keeps_last_entry(self):
+        store = CompressionStore(max_entries=100, max_bytes=50, enable_feedback=False)
+        h1 = store.store(original="a" * 100, compressed="b" * 100)
+
+        # A lone over-bound entry survives: the guard rail must not make the
+        # marker sitting in the conversation unredeemable when there is
+        # nothing else to reclaim.
+        assert store.retrieve(h1) is not None
+
+
+class TestRound2ReviewFixes:
+    """Second-round PR #21 review fixes."""
+
+    def test_growing_replacement_enforces_byte_bound(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        victim = store.store(original="v" * 300, compressed="[]")
+        grown_key = store.store(original="g" * 300, compressed="[]", explicit_hash="ab" * 12)
+        assert store.retrieve(victim) is not None
+
+        # Re-store the same key with a much larger compressed payload:
+        # 300 (victim) + 300 + 500 (grown) > 1000 → the victim must go.
+        store.store(original="g" * 300, compressed="c" * 500, explicit_hash="ab" * 12)
+        assert store.retrieve(grown_key) is not None
+        assert store.retrieve(victim) is None, (
+            "a growing re-store adds bytes; skipping the bound check lets "
+            "repeated growing re-stores keep the store above max_bytes"
+        )
+
+    def test_same_size_duplicate_restore_does_not_evict(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        victim = store.store(original="v" * 300, compressed="[]")
+        dup_key = store.store(original="g" * 300, compressed="[]", explicit_hash="ab" * 12)
+
+        # Byte-identical duplicate re-store (mirror-bridge pattern): no
+        # growth, no eviction scan, victim untouched.
+        store.store(original="g" * 300, compressed="[]", explicit_hash="ab" * 12)
+        assert store.retrieve(victim) is not None
+        assert store.retrieve(dup_key) is not None
+
+    def test_heap_coverage_checked_by_key_not_count(self):
+        import time as _time
+
+        from headroom.cache.backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=1000, backend=backend)
+        h1 = store.store(original="a" * 600, compressed="[]")
+
+        # Simulate another worker: h1 replaced by h2 directly in the shared
+        # backend. Row count is unchanged (1), but the local heap only knows
+        # h1 — a cardinality check would pass and byte eviction would find
+        # nothing live to evict.
+        backend.delete(h1)
+        other = CompressionEntry(
+            hash="cd" * 12,
+            original_content="b" * 600,
+            compressed_content="[]",
+            original_tokens=0,
+            compressed_tokens=0,
+            original_item_count=1,
+            compressed_item_count=1,
+            tool_name=None,
+            tool_call_id=None,
+            query_context=None,
+            created_at=_time.time(),
+        )
+        backend.set(other.hash, other)
+
+        h3 = store.store(original="c" * 600, compressed="[]")
+        assert store.retrieve(h3) is not None
+        assert store.retrieve(other.hash) is None, (
+            "heap coverage must be verified by key: same-count key swaps by "
+            "another worker leave the live row unevictable"
+        )
+
+
+class TestRound3ReviewFixes:
+    """Third-round PR #21 review fixes: replacement atomicity and
+    timestamp-aware heap coverage."""
+
+    def test_failed_replacement_set_keeps_old_row(self):
+        """The old row must survive a growing re-store whose backend write
+        silently fails (SQLiteBackend.set logs-and-returns on transient
+        errors) — deleting it first would strand the marker permanently."""
+        from headroom.cache.backends import InMemoryBackend
+
+        class FlakyBackend(InMemoryBackend):
+            drop_next_set = False
+
+            def set(self, key, entry):
+                if self.drop_next_set:
+                    self.drop_next_set = False
+                    return  # simulate SQLiteBackend's swallowed write error
+                super().set(key, entry)
+
+        backend = FlakyBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=10_000, backend=backend)
+        key = store.store(original="o" * 100, compressed="[]", explicit_hash="ab" * 12)
+        assert store.retrieve(key) is not None
+
+        backend.drop_next_set = True
+        store.store(original="o" * 100, compressed="c" * 500, explicit_hash="ab" * 12)
+
+        entry = store.retrieve(key)
+        assert entry is not None, (
+            "growing re-store with a failed backend write must leave the "
+            "old (valid) row retrievable, not deleted"
+        )
+        assert entry.compressed_content == "[]"
+
+    def test_same_key_restore_by_other_worker_stays_evictable(self):
+        """Key-only coverage misses a same-key re-store with a fresh
+        created_at: the local heap tuple fails the timestamp comparison and
+        the byte loop exhausts the heap without freeing anything."""
+        import time as _time
+
+        from headroom.cache.backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=1000, backend=backend)
+        h1 = store.store(original="a" * 600, compressed="[]")
+
+        # Another worker re-stores the same hash with a new timestamp.
+        replaced = CompressionEntry(
+            hash=h1,
+            original_content="a" * 600,
+            compressed_content="[]",
+            original_tokens=0,
+            compressed_tokens=0,
+            original_item_count=1,
+            compressed_item_count=1,
+            tool_name=None,
+            tool_call_id=None,
+            query_context=None,
+            created_at=_time.time() + 10,
+        )
+        backend.set(h1, replaced)
+
+        h2 = store.store(original="b" * 600, compressed="[]")
+        assert store.retrieve(h2) is not None
+        assert store.retrieve(h1) is None, (
+            "coverage must compare (created_at, key) pairs: a same-key "
+            "re-store by another worker left the row unevictable"
+        )
+
+
+class TestRound4ReviewFixes:
+    """Fourth-round PR #21 review fixes: expired replacements count as full
+    insertions, and eviction only credits bytes for confirmed deletes."""
+
+    def test_expired_replacement_counts_full_size(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        victim = store.store(original="v" * 300, compressed="[]")
+        store.store(original="k" * 300, compressed="[]", explicit_hash="ab" * 12, ttl=1)
+        time.sleep(1.05)  # the replaced row expires before the re-store
+
+        # 800-byte growing re-store of the now-expired key: the sweep removes
+        # the old row, so the "delta" credit would see 302 live + 498 delta
+        # and fit — but the write actually lands 302 + 800 = 1102 > 1000.
+        store.store(original="k" * 300, compressed="c" * 500, explicit_hash="ab" * 12)
+        assert store.retrieve("ab" * 12) is not None
+        assert store.retrieve(victim) is None, (
+            "a replacement whose old row expired mid-flight is a full "
+            "insertion; crediting the stale size under-enforces max_bytes"
+        )
+
+    def test_failed_delete_not_credited_and_entry_stays_evictable(self):
+        from headroom.cache.backends import InMemoryBackend
+
+        class FlakyDeleteBackend(InMemoryBackend):
+            fail_next_delete = False
+
+            def delete(self, key):
+                if self.fail_next_delete:
+                    self.fail_next_delete = False
+                    return False  # SQLiteBackend's transient-error contract
+                return super().delete(key)
+
+        backend = FlakyDeleteBackend()
+        store = CompressionStore(enable_feedback=False, max_bytes=1000, backend=backend)
+        h1 = store.store(original="a" * 600, compressed="[]")
+
+        backend.fail_next_delete = True
+        h2 = store.store(original="b" * 600, compressed="[]")
+        # Insertion is never blocked (guard rail), and the failed delete did
+        # not remove the old row.
+        assert store.retrieve(h1) is not None
+        assert store.retrieve(h2) is not None
+
+        # The heap tuple survived the failed delete: the next insert can
+        # still evict h1 once the backend recovers.
+        h3 = store.store(original="c" * 600, compressed="[]")
+        assert store.retrieve(h3) is not None
+        assert store.retrieve(h1) is None, (
+            "a failed delete must keep the heap tuple so the row stays "
+            "evictable after the backend recovers"
+        )
