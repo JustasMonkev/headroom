@@ -494,6 +494,32 @@ A third pass refined two of these for shared-backend concurrency:
   timestamp comparison, and exhaust the heap without freeing anything.
   Coverage now compares full pairs from the same expiry pass.
 
+### Round-3 benchmark (branch vs merge-base, measured)
+
+Token side (`o200k_base`, bundled tokenizer):
+
+| | pre-change | branch |
+|---|---|---|
+| 20-file plain-modification diff, compressed | 1,731 tok | **1,211 tok (−30%)** |
+| stale / superseded / maturation marker | 57 / 56 / 52 | 50 / 45 / 45 |
+| CCR retrieval payload (~500-char original) | 114 | 98 |
+
+Compute side (best-of-5, same machine, branch vs merge-base `a68a33e`):
+
+| | base | branch |
+|---|---|---|
+| end-to-end `compress()` on a 135k-token 26-message transcript | 0.316 s | **0.308 s (parity)** |
+| CompressionStore new-key store (5 KB) | 0.12 ms | 0.31 ms |
+| CompressionStore duplicate re-store | 4.1 µs | 7.2 µs |
+| CompressionCache store (5 KB ASCII / 7 KB CJK) | 1.1 / 1.1 µs | 1.7 / 6.5 µs |
+
+The store/cache micro-overheads are the byte-bound + heap-coverage
+machinery (UTF-8 sizing, pair-coverage set per insert) — absolute costs in
+the 0.2 ms/6 µs range on operations that fire once per compression event,
+invisible at request level (the end-to-end row). The CJK cache delta is
+the UTF-8 encode that byte-accurate accounting requires; the review
+explicitly chose that accuracy over `len(str)`'s 3-4× undercount.
+
 ### Round-3 test status
 
 `diff`/`cache`/`CCR`/`read-lifecycle`/`response-handler`/`token-headroom`
