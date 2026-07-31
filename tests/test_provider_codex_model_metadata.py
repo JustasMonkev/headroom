@@ -168,7 +168,8 @@ def test_codex_model_registry_entry_preserves_upstream_fields_and_defaults() -> 
 
     assert entry["slug"] == "gpt-5.3-codex-spark"
     assert entry["display_name"] == "Spark"
-    assert entry["context_window"] == 12345
+    assert entry["context_window"] == 12345  # upstream beats the model-specific fallback
+    assert entry["max_context_window"] == 128000  # model-specific fallback beats the generic
     assert entry["default_reasoning_level"] == "medium"
     assert entry["supports_parallel_tool_calls"] is True
     assert entry["supported_in_api"] is True
