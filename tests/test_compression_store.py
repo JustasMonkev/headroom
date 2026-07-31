@@ -1325,3 +1325,52 @@ class TestHashCollisionDetection:
             "in-memory so upgrade-time mismatch is fine, but external "
             "systems that hash-and-lookup independently need to match."
         )
+
+
+class TestByteWeightedBound:
+    """F7 byte bound — PR #21 review fixes.
+
+    The bound is enforced on `stored + pending` (the store is back under
+    `max_bytes` *after* the insert), sizes are UTF-8 bytes (not code
+    points), and an empty eviction heap over a populated backend (restart
+    with a persistent backend) is reseeded before eviction.
+    """
+
+    def test_pending_entry_counts_toward_bound(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        first = store.store(original="a" * 600, compressed="[]")
+        assert store.retrieve(first) is not None
+        # 600 stored + 600 pending > 1000 → the first entry must be evicted
+        # BEFORE the second lands; post-insert total stays under the bound.
+        second = store.store(original="b" * 600, compressed="[]")
+        assert store.retrieve(second) is not None
+        assert store.retrieve(first) is None, (
+            "byte bound must count the incoming entry: 600 + 600 > 1000 yet both entries survived"
+        )
+
+    def test_byte_bound_measures_utf8_not_code_points(self):
+        # "汉" is 1 code point / 3 UTF-8 bytes: 300 code points = 900 bytes.
+        # Distinct originals — identical content would hash to the same key
+        # and the second store would be an in-place overwrite, not an insert.
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        first = store.store(original="汉" * 300, compressed="[]")
+        second = store.store(original="码" * 300, compressed="[]")
+        assert store.retrieve(second) is not None
+        assert store.retrieve(first) is None, (
+            "byte bound must measure UTF-8 bytes: two 900-byte entries "
+            "both survived a 1000-byte bound"
+        )
+
+    def test_empty_heap_reseeded_from_backend(self):
+        store = CompressionStore(enable_feedback=False, max_bytes=1000)
+        first = store.store(original="a" * 600, compressed="[]")
+        # Simulate a restart with a persistent backend: entries survive,
+        # process-local eviction state does not.
+        store._eviction_heap.clear()
+        store._stale_heap_entries = 0
+        second = store.store(original="b" * 600, compressed="[]")
+        assert store.retrieve(second) is not None
+        assert store.retrieve(first) is None, (
+            "an empty eviction heap over a populated backend must be "
+            "reseeded, not treated as nothing-to-evict"
+        )

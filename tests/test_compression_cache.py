@@ -687,3 +687,21 @@ def test_get_compression_cache_returns_same_instance_under_contention() -> None:
     first = results[0]
     for c in results[1:]:
         assert c is first, "Concurrent _get_compression_cache returned different instances"
+
+
+class TestCompressionCacheByteBound:
+    """F7 byte bound measures UTF-8 bytes — PR #21 review fix."""
+
+    def test_multibyte_payloads_counted_as_utf8(self):
+        from headroom.cache.compression_cache import CompressionCache
+
+        cache = CompressionCache(max_entries=100, max_bytes=1000)
+        # 300 CJK code points = 900 UTF-8 bytes each; two entries exceed a
+        # 1000-byte bound even though 600 code points would not.
+        cache.store_compressed("h1", "汉" * 300, tokens_saved=1)
+        cache.store_compressed("h2", "汉" * 300, tokens_saved=1)
+        assert cache.get_compressed("h2") is not None
+        assert cache.get_compressed("h1") is None, (
+            "byte bound must measure UTF-8 bytes, not code points"
+        )
+        assert cache._total_bytes <= 1000

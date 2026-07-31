@@ -1099,7 +1099,36 @@ fn format_output(
     }
 
     for f in files {
-        out_lines.push(f.header.clone());
+        // C3 (docs/token-efficiency-review.md): for a plain in-place
+        // modification the `diff --git a/p b/p` header and the
+        // `--- a/p` / `+++ b/p` pair carry the same path twice each — four
+        // copies per file. Drop the HEADER (not the markers) when it is
+        // provably redundant: not a create/delete/rename/binary, and both
+        // marker lines carry exactly the header's unchanged path. The
+        // `---`/`+++` pair tokenizes the same as the header but keeps the
+        // output a valid unified diff (`git apply` accepts headerless
+        // `---`/`+++` file sections; `diff --git` followed directly by
+        // `@@` is a rejected fragment — parse_diff drops `index` lines, so
+        // the extended-header form cannot be made whole). Anything else
+        // (`/dev/null`, quoted paths, prefix mismatches, mode/rename
+        // metadata that must follow a `diff --git` line) keeps the full
+        // git triple.
+        let header_redundant = !f.is_new_file
+            && !f.is_deleted_file
+            && !f.is_renamed
+            && !f.is_binary
+            && diff_git_regex()
+                .captures(&f.header)
+                .map(|c| {
+                    c[1] == c[2]
+                        && f.old_file == format!("--- a/{}", &c[1])
+                        && f.new_file == format!("+++ b/{}", &c[2])
+                })
+                .unwrap_or(false);
+
+        if !header_redundant {
+            out_lines.push(f.header.clone());
+        }
 
         // Bug-fix: emit rename / similarity / dissimilarity / copy marker
         // lines immediately after `diff --git`, matching git's canonical
@@ -1121,32 +1150,11 @@ fn format_output(
             continue;
         }
 
-        // C3 (docs/token-efficiency-review.md): for a plain in-place
-        // modification, `--- a/p` / `+++ b/p` restate the path the
-        // `diff --git a/p b/p` header two lines up already carries — up to
-        // `max_files` × 2 redundant path copies per compressed diff. Skip
-        // them only when provably redundant: not a create/delete/rename/
-        // binary, and both lines carry exactly the header's unchanged path.
-        // Anything else (`/dev/null`, quoted paths, prefix mismatches)
-        // keeps the full git triple.
-        let file_lines_redundant = !f.is_new_file
-            && !f.is_deleted_file
-            && !f.is_renamed
-            && diff_git_regex()
-                .captures(&f.header)
-                .map(|c| {
-                    c[1] == c[2]
-                        && f.old_file == format!("--- a/{}", &c[1])
-                        && f.new_file == format!("+++ b/{}", &c[2])
-                })
-                .unwrap_or(false);
-        if !file_lines_redundant {
-            if !f.old_file.is_empty() {
-                out_lines.push(f.old_file.clone());
-            }
-            if !f.new_file.is_empty() {
-                out_lines.push(f.new_file.clone());
-            }
+        if !f.old_file.is_empty() {
+            out_lines.push(f.old_file.clone());
+        }
+        if !f.new_file.is_empty() {
+            out_lines.push(f.new_file.clone());
         }
 
         for h in &f.hunks {
@@ -1328,10 +1336,11 @@ mod tests {
         assert_eq!(r.deletions, 24);
         assert_eq!(r.hunks_kept, 8);
         assert_eq!(r.hunks_removed, 0);
-        // Compressed line count should be 113 (matches the parity fixture):
-        // 8 plain modifications × 2 redundant `---`/`+++` lines dropped (C3)
-        // from the pre-C3 count of 129.
-        assert_eq!(r.compressed_line_count, 113);
+        // Compressed line count should be 121 (matches the parity fixture):
+        // 8 plain modifications × 1 redundant `diff --git` header dropped
+        // (C3; the `---`/`+++` pair stays so output remains a valid unified
+        // diff) from the pre-C3 count of 129.
+        assert_eq!(r.compressed_line_count, 121);
         assert!(r.cache_key.is_some());
     }
 
@@ -1790,8 +1799,11 @@ mod tests {
             "pre-diff commit message dropped:\n{}",
             r.compressed
         );
-        // And the diff itself is still there.
-        assert!(r.compressed.contains("diff --git a/x.py b/x.py"));
+        // And the diff itself is still there. C3 drops the redundant
+        // `diff --git` header for a plain modification; the `---`/`+++`
+        // pair carries the path.
+        assert!(r.compressed.contains("--- a/x.py"));
+        assert!(r.compressed.contains("+++ b/x.py"));
         assert!(r.compressed.contains("-a"));
         assert!(r.compressed.contains("+b"));
     }

@@ -374,14 +374,25 @@ rounds missed. Status of everything that was left:
   `tool_injection` scanner, `parser.CCR_RETRIEVAL_MARKER_RE`, and the
   `compression_units` marker-preserving regex all match the new forms.
 
-- **C3 — diff compressor drops `--- a/p` / `+++ b/p` for plain
-  modifications.** `diff_compressor.rs` `format_output`. Emitted only when
-  *not* provably redundant: creates/deletes/renames/binary files, `/dev/null`,
-  quoted paths, and prefix mismatches all keep the full git triple. Measured:
-  −22 tok per plain-modified file, −440 tok on a 20-file diff. Rust unit
-  tests updated (`compressed_line_count` 129 → 113 on the 8-file synthetic),
-  the Python extension rebuilt, the 27 `diff_compressor` parity fixtures
-  re-recorded, and the Rust parity harness re-run: 27/27 matched.
+- **C3 — diff compressor drops the redundant `diff --git a/p b/p` header
+  for plain modifications.** `diff_compressor.rs` `format_output`. The
+  first-cut implementation dropped the `---`/`+++` pair instead; PR review
+  correctly flagged that `diff --git` followed directly by `@@` is a patch
+  fragment `git apply` rejects (`parse_diff` discards `index` lines, so the
+  extended-header form can't be made whole). The header and the marker pair
+  tokenize identically (16 tok each for a typical path — the header carries
+  the path twice), so the fix keeps the `---`/`+++` pair and drops the
+  header: same saving, and the output is now a *valid* unified diff —
+  verified with `git apply --check` on untrimmed output. (When context
+  trimming or hunk dropping fires, hunk headers go stale and strict
+  applicability was already broken pre-C3; that is a pre-existing property
+  of the compressor, not a regression.) Creates/deletes/renames/binary
+  files, `/dev/null`, quoted paths, and prefix mismatches all keep the full
+  git triple. Measured: −22 tok per plain-modified file, −440 tok on a
+  20-file diff. Rust unit tests updated (`compressed_line_count` 129 → 121
+  on the 8-file synthetic), the Python extension rebuilt, the 27
+  `diff_compressor` parity fixtures re-recorded, and the Rust parity
+  harness re-run: 27/27 matched.
 
 - **D1/D2 stragglers (found by the Haiku hygiene reviewer).** Five
   model-facing CCR response paths still pretty-printed with `indent=2`:
@@ -399,11 +410,19 @@ rounds missed. Status of everything that was left:
   64 MB) alongside the 10k-entry bound, and opportunistic pruning of the
   previously unbounded `_first_seen` map (entries older than the defer TTL
   can never answer "defer" again). `compression_store.py`: byte-weighted
-  eviction bound (`max_bytes`, default 256 MB) computed lazily inside
-  `_evict_if_needed` — the `_clean_expired` pass there already pays for the
-  `items()` walk, and `len(str)` is O(1), so accounting stays out of the hot
-  path. Defaults sit far above the measured 28 MB peak of a 200-turn
-  session: these are guard rails for pathological sessions, not tuners.
+  eviction bound (`max_bytes`, default 256 MB) enforced in
+  `_evict_if_needed`. Four PR-review hardenings on top of the first cut,
+  each with a regression test: sizes are UTF-8 bytes, not code points
+  (`len(str)` undercounts CJK/emoji payloads 3-4×; cached per entry so the
+  encode is paid once); the bound is enforced on *stored + pending* so the
+  store is back under `max_bytes` after the insert, not one entry over; an
+  empty eviction heap over a populated backend (restart with the SQLite
+  backend, or another worker's writes) is reseeded via `_rebuild_heap()`
+  instead of silently skipping eviction; and the byte total rides the
+  existing `_clean_expired` `items()` pass instead of a second
+  full-backend scan per insert. Defaults sit far above the measured 28 MB
+  peak of a 200-turn session: these are guard rails for pathological
+  sessions, not tuners.
   Two F7 sub-items were **not** done, deliberately: the "periodic sweep" was
   already effectively present (`_clean_expired` runs on every new-key store;
   expired entries linger only in fully idle sessions, where they cost nothing

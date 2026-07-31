@@ -306,9 +306,11 @@ class TestOutputFormatting:
         assert "files changed" in result.compressed
         assert "hunks omitted" in result.compressed
 
-    def test_plain_modification_drops_redundant_file_lines(self):
-        """C3: for an in-place modification, `--- a/p` / `+++ b/p` restate the
-        path the `diff --git a/p b/p` header already carries and are dropped."""
+    def test_plain_modification_drops_redundant_git_header(self):
+        """C3: for an in-place modification the `diff --git a/p b/p` header
+        restates the path the `--- a/p` / `+++ b/p` pair already carries and
+        is dropped — the marker pair stays so the output remains a valid
+        unified diff (`git apply` accepts headerless file sections)."""
         content = """diff --git a/test.py b/test.py
 --- a/test.py
 +++ b/test.py
@@ -326,11 +328,11 @@ class TestOutputFormatting:
         )
         result = compressor.compress(content)
 
-        assert "diff --git" in result.compressed
+        assert "--- a/test.py" in result.compressed
+        assert "+++ b/test.py" in result.compressed
         assert "@@" in result.compressed
-        # Redundant path restatements removed for plain modifications.
-        assert "--- a/test.py" not in result.compressed
-        assert "+++ b/test.py" not in result.compressed
+        # Redundant extended header removed for plain modifications.
+        assert "diff --git" not in result.compressed
 
     def test_new_file_keeps_full_git_triple(self):
         """C3: creates (and deletes/renames) keep `---`/`+++` — `/dev/null`
@@ -685,7 +687,10 @@ class TestBugfixPreDiffContent:
         assert result.compressed.startswith("commit abc1234567890abcdef")
         assert "Author: Tester" in result.compressed
         assert "Refactor: rename and modify" in result.compressed
-        assert "diff --git a/x.py b/x.py" in result.compressed
+        # C3: plain modification — the `---`/`+++` pair carries the path,
+        # the redundant `diff --git` header is dropped.
+        assert "--- a/x.py" in result.compressed
+        assert "+++ b/x.py" in result.compressed
         assert "-a" in result.compressed
         assert "+b" in result.compressed
 
@@ -696,7 +701,10 @@ class TestBugfixPreDiffContent:
 
         diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
         result = DiffCompressor(_cfg_below_threshold()).compress(diff)
-        assert result.compressed.startswith("diff --git a/x.py b/x.py")
+        # C3 drops the redundant `diff --git` header for a plain
+        # modification; the point of this test is only the missing
+        # leading blank line.
+        assert result.compressed.startswith("--- a/x.py")
 
 
 class TestRoutingGapMergeDiffs:
