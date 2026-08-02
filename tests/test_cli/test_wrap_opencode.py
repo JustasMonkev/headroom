@@ -31,6 +31,7 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("USERPROFILE", home)
     monkeypatch.delenv("OPENCODE_HOME", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("HEADROOM_CODE_MEMORY", raising=False)
 
 
 def _clear_copilot_route_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -388,6 +389,7 @@ def test_wrap_opencode_prepare_only_injects_config(
     assert config_file.exists()
     config = json.loads(config_file.read_text(encoding="utf-8"))
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
+    assert "serena" not in config.get("mcp", {})
 
 
 def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
@@ -401,7 +403,10 @@ def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
 
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-            result = runner.invoke(main, ["wrap", "opencode", "--prepare-only"])
+            result = runner.invoke(
+                main,
+                ["wrap", "opencode", "--prepare-only", "--code-memory", "serena"],
+            )
 
     assert result.exit_code == 0, result.output
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"

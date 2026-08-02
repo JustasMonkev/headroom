@@ -2252,7 +2252,8 @@ def _codex_session_launch_settings(
     """Build process-local routing while preserving the selected provider id."""
     config_file, _ = _codex_config_paths()
     try:
-        config = tomllib.loads(_read_text(config_file)) if config_file.exists() else {}
+        config_content = _read_text(config_file) if config_file.exists() else ""
+        config = tomllib.loads(config_content) if config_content else {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise click.ClickException(
             f"could not read Codex config for session routing: {exc}"
@@ -2296,9 +2297,14 @@ def _codex_session_launch_settings(
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
-        if provider != "headroom":
-            env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
-            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
+        forwarded_upstream = (
+            _detect_custom_codex_upstream_base_url(config_content)
+            if provider == "headroom"
+            else upstream.rstrip("/")
+        )
+        if forwarded_upstream:
+            env[_UPSTREAM_BASE_URL_ENV_VAR] = forwarded_upstream
+            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={forwarded_upstream}")
             overrides.append(
                 f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
                 f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
@@ -7682,6 +7688,7 @@ def openclaw(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_code_memory_option
 @_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
@@ -7753,7 +7760,7 @@ def opencode(
         headroom wrap opencode --no-context-tool       # Skip CLI context-tool setup
         headroom wrap opencode --no-project-rtk        # Keep project AGENTS.md unchanged
         headroom wrap opencode --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap opencode --no-serena             # Skip Serena MCP registration
+        headroom wrap opencode --code-memory serena    # Opt in to Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
@@ -7808,17 +7815,16 @@ def opencode(
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    if not no_serena:
-        from headroom.mcp_registry import OpencodeRegistrar
+    from headroom.mcp_registry import OpencodeRegistrar
 
-        # Serena ships no "opencode" context (only agent/codex/claude-code/ide/…);
-        # passing --context opencode crashes Serena on launch (#1549/#1572). Use
-        # the generic "agent" context, which OpenCode is.
-        _setup_serena_mcp(OpencodeRegistrar(), context="agent", verbose=verbose, force=True)
-    else:
-        from headroom.mcp_registry import OpencodeRegistrar
-
-        _disable_serena_mcp(OpencodeRegistrar(), verbose=verbose)
+    # Serena has no "opencode" context; the generic "agent" context is valid.
+    _setup_coding_compressor(
+        OpencodeRegistrar(),
+        serena_context="agent",
+        no_serena=no_serena,
+        verbose=verbose,
+        force=True,
+    )
 
     # Setup memory MCP server for OpenCode (native tool integration)
     if memory:

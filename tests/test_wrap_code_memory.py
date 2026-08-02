@@ -108,7 +108,7 @@ def test_orchestrator_dispatch() -> None:
 
 def test_code_memory_option_present_only_on_code_memory_agents() -> None:
     runner = CliRunner()
-    for tool in ("claude", "codex", "grok"):
+    for tool in ("claude", "codex", "grok", "opencode"):
         out = runner.invoke(wrap.wrap, [tool, "--help"]).output
         assert "--code-memory" in out, f"--code-memory missing from `wrap {tool} --help`"
     # aider does not register a code-memory MCP → no flag
