@@ -7,6 +7,7 @@ from fastapi import WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
@@ -62,6 +63,23 @@ def test_codex_responses_websocket_aliases_delegate_to_openai_handler(monkeypatc
         "/backend-api/responses",
         "/backend-api/codex/responses",
     ]
+
+
+def test_project_prefixed_codex_websocket_reaches_openai_handler(monkeypatch):
+    seen: list[tuple[str, str | None]] = []
+
+    async def fake_handle_ws(self, websocket: WebSocket):  # type: ignore[no-untyped-def]
+        seen.append((websocket.url.path, get_current_project()))
+        await websocket.accept()
+        await websocket.close()
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_responses_ws", fake_handle_ws)
+
+    with TestClient(create_app(ProxyConfig())) as client:
+        with client.websocket_connect("/p/my%20repo/v1/responses"):
+            pass
+
+    assert seen == [("/v1/responses", "my repo")]
 
 
 def test_codex_responses_subpath_aliases_delegate_to_passthrough():
