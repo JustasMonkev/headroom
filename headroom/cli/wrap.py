@@ -751,8 +751,8 @@ def _serena_instructions_opt_in() -> bool:
     Injecting "prefer Serena symbol tools" guidance rewrites the user's
     ``CLAUDE.md``/``AGENTS.md``, so it is opt-in (off by default): turn it on
     with ``--serena-instructions`` (which sets ``HEADROOM_SERENA_INSTRUCTIONS=1``)
-    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. Serena's ``.serena/``-only
-    setup (language scoping, pre-indexing) stays on by default regardless.
+    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. When Serena is selected,
+    its ``.serena/`` setup (language scoping, pre-indexing) still runs.
     """
     return os.environ.get("HEADROOM_SERENA_INSTRUCTIONS", "").strip().lower() in (
         "1",
@@ -1609,8 +1609,8 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
     Serena opens its web dashboard in a browser tab on launch by default
-    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
-    as the default code-memory MCP, flip that setting off so wrapped sessions
+    (``web_dashboard_open_on_launch: true``). When Headroom registers Serena
+    explicitly, it flips that setting off so wrapped sessions
     don't spawn a browser tab. The dashboard backend still runs and stays
     reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
     own config (authoritative, unlike a startup flag); other keys and comments are
@@ -4881,7 +4881,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+    help="Deprecated and ignored: tokensave was retired; code memory is opt-in.",
 )
 @click.option(
     "--serena",
@@ -4972,7 +4972,8 @@ def claude(
 
     \b
     Examples:
-        headroom wrap claude                    # Start everything (Serena code memory)
+        headroom wrap claude                    # Start proxy + MCP + Claude
+        headroom wrap claude --code-memory serena # Opt in to Serena code memory
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
@@ -6008,7 +6009,7 @@ def _run_codex_wrap(
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+    help="Deprecated and ignored: tokensave was retired; code memory is opt-in.",
 )
 @click.option(
     "--serena",
@@ -6505,7 +6506,7 @@ def kimi(
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+    help="Deprecated and ignored: tokensave was retired; code memory is opt-in.",
 )
 @click.option(
     "--serena",

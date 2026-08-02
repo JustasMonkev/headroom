@@ -109,7 +109,7 @@ headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
 
-To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, installs **Serena** for semantic code navigation, and launches a coding agent session configured to proxy requests through headroom.
+To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy and launches an agent session configured to proxy requests through headroom. Serena semantic code navigation is opt-in with `--code-memory serena`.
 
 The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
 
@@ -612,7 +612,7 @@ Headroom runs **locally**, covers **every** content type, works with every major
 | [Compresr](https://compresr.ai), [Token Co.](https://thetokencompany.ai)    | Text sent to their API                         | Hosted API call                    | No    | No         |
 | OpenAI Compaction                                                            | Conversation history                           | Provider-native                    | No    | No         |
 
-> **Stack & integrations.** Headroom is the **proxy** — that's what we build and offer, and it compresses everything flowing through it no matter what sits upstream. Our recommended companion is **[Serena](https://github.com/oraios/serena)** (installed by default when you wrap an agent) for semantic code navigation — plus **Ponytail** if you want leaner model output. Everything else is your call: Headroom vendors the third-party [RTK](https://github.com/rtk-ai/rtk) and [lean-ctx](https://github.com/yvgude/lean-ctx) binaries for shell-output rewriting, but we don't own or control either project — swap between them with `HEADROOM_CONTEXT_TOOL`, or turn them off. You're free to attach your own tooling too — code-memory MCP, Graphify, Caveman, or any MCP server — and Headroom compresses downstream of all of it.
+> **Stack & integrations.** Headroom is the **proxy** — that's what we build and offer, and it compresses everything flowing through it no matter what sits upstream. Our recommended companion is **[Serena](https://github.com/oraios/serena)** (opt in with `--code-memory serena`) for semantic code navigation — plus **Ponytail** if you want leaner model output. Everything else is your call: Headroom vendors the third-party [RTK](https://github.com/rtk-ai/rtk) and [lean-ctx](https://github.com/yvgude/lean-ctx) binaries for shell-output rewriting, but we don't own or control either project — swap between them with `HEADROOM_CONTEXT_TOOL`, or turn them off. You're free to attach your own tooling too — code-memory MCP, Graphify, Caveman, or any MCP server — and Headroom compresses downstream of all of it.
 
 ## Contributing
 

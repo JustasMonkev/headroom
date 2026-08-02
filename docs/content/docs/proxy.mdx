@@ -75,9 +75,9 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 
 #### Code-memory MCP (Serena)
 
-`headroom wrap` registers **[Serena](https://github.com/oraios/serena)** as the code-memory MCP for semantic, symbol-level code navigation. Serena runs on demand via `uvx` — Headroom downloads and executes no binary of its own — and indexes the current project locally. Pass `--code-memory none` to register no code-memory MCP.
+**[Serena](https://github.com/oraios/serena)** is an opt-in code-memory MCP for semantic, symbol-level code navigation. Pass `--code-memory serena` to run it on demand via `uvx` and index the current project locally. The default is `--code-memory none`, so no Git-sourced Serena code runs implicitly.
 
-> **Upgrading from tokensave?** Earlier releases registered a `tokensave` MCP server (a downloaded Rust binary). tokensave has been retired in favour of Serena. On your next `headroom wrap` / `headroom unwrap`, Headroom removes the `tokensave` MCP entry it installed and switches you to Serena — nothing to migrate, since both are just indexes rebuilt from your source. The leftover `tokensave` binary in `~/.local/bin` and any `.tokensave/` folders are unused and safe to delete.
+> **Upgrading from tokensave?** Earlier releases registered a `tokensave` MCP server (a downloaded Rust binary). tokensave has been retired. On your next `headroom wrap` / `headroom unwrap`, Headroom removes the `tokensave` MCP entry it installed; use `--code-memory serena` if you want Serena instead. The leftover `tokensave` binary in `~/.local/bin` and any `.tokensave/` folders are unused and safe to delete.
 
 By default, the proxy uses the shared **ContentRouter** pipeline. It routes text, logs, JSON, code, images, and tool outputs through the currently enabled compressors and preserves reversible CCR markers where applicable.
 
