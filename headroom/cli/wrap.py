@@ -751,8 +751,8 @@ def _serena_instructions_opt_in() -> bool:
     Injecting "prefer Serena symbol tools" guidance rewrites the user's
     ``CLAUDE.md``/``AGENTS.md``, so it is opt-in (off by default): turn it on
     with ``--serena-instructions`` (which sets ``HEADROOM_SERENA_INSTRUCTIONS=1``)
-    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. Serena's ``.serena/``-only
-    setup (language scoping, pre-indexing) stays on by default regardless.
+    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. When Serena is selected,
+    its ``.serena/`` setup (language scoping, pre-indexing) still runs.
     """
     return os.environ.get("HEADROOM_SERENA_INSTRUCTIONS", "").strip().lower() in (
         "1",
@@ -789,7 +789,7 @@ _serena_instructions_option = click.option(
 
 
 # --- Code-memory MCP selection ------------------------------------------------
-# The code-memory MCP is Serena by default; turn it off with --code-memory none.
+# Code-memory MCPs are opt-in because Serena runs a Git-sourced uvx command.
 # Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
 # callback) so it works the same on every agent without threading a param
 # through each subcommand — the same approach as _rtk_option above.
@@ -804,15 +804,15 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
 
     Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
     wins; otherwise the deprecated ``--serena`` / ``--no-serena`` flags map into
-    it; otherwise the default is ``serena`` — mature, offline, symbol-level code
-    navigation. The retired ``tokensave`` option is accepted gracefully: an
+    it; otherwise the default is ``none`` so no Git-sourced code runs
+    implicitly. The retired ``tokensave`` option is accepted gracefully: an
     explicit ``tokensave`` selector (or the deprecated ``--no-tokensave`` flag)
-    now resolves to Serena.
+    now resolves to ``none``.
     """
     env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
     if env == "tokensave":
-        click.echo("  Note: the tokensave code-memory option was retired — using Serena instead.")
-        return _CODE_MEMORY_SERENA
+        click.echo("  Note: the tokensave code-memory option was retired — disabling code memory.")
+        return _CODE_MEMORY_NONE
     if env:
         if env not in _VALID_CODE_MEMORY:
             raise click.ClickException(
@@ -821,7 +821,9 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
         return env
     if kwargs.get("no_serena"):
         return _CODE_MEMORY_NONE
-    return _CODE_MEMORY_SERENA
+    if kwargs.get("serena"):
+        return _CODE_MEMORY_SERENA
+    return _CODE_MEMORY_NONE
 
 
 def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
@@ -844,7 +846,7 @@ _code_memory_option = click.option(
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'serena' (default) or 'none'. "
+        "Code-memory MCP to register: 'none' (default) or 'serena' (opt-in). "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
     ),
 )
@@ -1607,8 +1609,8 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
     Serena opens its web dashboard in a browser tab on launch by default
-    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
-    as the default code-memory MCP, flip that setting off so wrapped sessions
+    (``web_dashboard_open_on_launch: true``). When Headroom registers Serena
+    explicitly, it flips that setting off so wrapped sessions
     don't spawn a browser tab. The dashboard backend still runs and stays
     reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
     own config (authoritative, unlike a startup flag); other keys and comments are
@@ -2084,12 +2086,12 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
 
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default none).
 
     Selection (see :func:`_resolve_code_memory`):
 
-    * ``serena`` (default) — register Serena (mature, offline, symbol-level).
-    * ``none`` — register nothing.
+    * ``none`` (default) — register nothing.
+    * ``serena`` — explicitly register the Git-sourced Serena MCP.
 
     Either way, any Headroom-installed ``tokensave`` entry from a prior release
     is removed (tokensave was retired in favour of Serena). The deprecated
@@ -2250,7 +2252,8 @@ def _codex_session_launch_settings(
     """Build process-local routing while preserving the selected provider id."""
     config_file, _ = _codex_config_paths()
     try:
-        config = tomllib.loads(_read_text(config_file)) if config_file.exists() else {}
+        config_content = _read_text(config_file) if config_file.exists() else ""
+        config = tomllib.loads(config_content) if config_content else {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise click.ClickException(
             f"could not read Codex config for session routing: {exc}"
@@ -2294,12 +2297,20 @@ def _codex_session_launch_settings(
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
-        env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
-        display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
-        overrides.append(
-            f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
-            f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
+        upstream = upstream.rstrip("/")
+        forwarded_upstream = (
+            _detect_custom_codex_upstream_base_url(config_content)
+            if provider == "headroom"
+            and urllib.parse.urlsplit(upstream).hostname in {"127.0.0.1", "localhost", "::1"}
+            else upstream
         )
+        if forwarded_upstream:
+            env[_UPSTREAM_BASE_URL_ENV_VAR] = forwarded_upstream
+            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={forwarded_upstream}")
+            overrides.append(
+                f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
+                f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
+            )
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
@@ -4878,7 +4889,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+    help="Deprecated and ignored: tokensave was retired; code memory is opt-in.",
 )
 @click.option(
     "--serena",
@@ -4969,7 +4980,8 @@ def claude(
 
     \b
     Examples:
-        headroom wrap claude                    # Start everything (Serena code memory)
+        headroom wrap claude                    # Start proxy + MCP + Claude
+        headroom wrap claude --code-memory serena # Opt in to Serena code memory
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
@@ -6005,7 +6017,7 @@ def _run_codex_wrap(
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+    help="Deprecated and ignored: tokensave was retired; code memory is opt-in.",
 )
 @click.option(
     "--serena",
@@ -6502,7 +6514,7 @@ def kimi(
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
+    help="Deprecated and ignored: tokensave was retired; code memory is opt-in.",
 )
 @click.option(
     "--serena",
@@ -7678,6 +7690,7 @@ def openclaw(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_code_memory_option
 @_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
@@ -7749,7 +7762,7 @@ def opencode(
         headroom wrap opencode --no-context-tool       # Skip CLI context-tool setup
         headroom wrap opencode --no-project-rtk        # Keep project AGENTS.md unchanged
         headroom wrap opencode --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap opencode --no-serena             # Skip Serena MCP registration
+        headroom wrap opencode --code-memory serena    # Opt in to Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
@@ -7804,17 +7817,16 @@ def opencode(
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    if not no_serena:
-        from headroom.mcp_registry import OpencodeRegistrar
+    from headroom.mcp_registry import OpencodeRegistrar
 
-        # Serena ships no "opencode" context (only agent/codex/claude-code/ide/…);
-        # passing --context opencode crashes Serena on launch (#1549/#1572). Use
-        # the generic "agent" context, which OpenCode is.
-        _setup_serena_mcp(OpencodeRegistrar(), context="agent", verbose=verbose, force=True)
-    else:
-        from headroom.mcp_registry import OpencodeRegistrar
-
-        _disable_serena_mcp(OpencodeRegistrar(), verbose=verbose)
+    # Serena has no "opencode" context; the generic "agent" context is valid.
+    _setup_coding_compressor(
+        OpencodeRegistrar(),
+        serena_context="agent",
+        no_serena=no_serena,
+        verbose=verbose,
+        force=True,
+    )
 
     # Setup memory MCP server for OpenCode (native tool integration)
     if memory:

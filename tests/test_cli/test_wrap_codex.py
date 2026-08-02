@@ -1183,6 +1183,90 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
+def test_codex_session_launch_settings_do_not_chain_headroom_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    config_file = codex_home / "config.toml"
+    config_file.write_text(
+        'model_provider = "headroom"\n\n'
+        '[model_providers.headroom]\nbase_url = "http://127.0.0.1:8787/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("exec", "hello"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert 'model_providers.headroom.base_url="http://127.0.0.1:9898/v1"' in args
+    assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+    assert all("X-Headroom-Base-Url" not in arg for arg in args)
+    assert display == ["OPENAI_BASE_URL=http://127.0.0.1:9898/v1"]
+
+
+def test_codex_session_launch_settings_preserve_remote_provider_named_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "headroom"\n\n'
+        '[model_providers.headroom]\nbase_url = "https://api.example.test/v1/"\n',
+        encoding="utf-8",
+    )
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("exec", "hello"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
+    assert (
+        "model_providers.headroom.env_http_headers.X-Headroom-Base-Url"
+        '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+    ) in args
+    assert display[-1] == "HEADROOM_CODEX_UPSTREAM_BASE_URL=https://api.example.test/v1"
+
+
+def test_codex_session_launch_settings_preserve_custom_upstream_behind_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "headroom" # was: company\n\n'
+        '[model_providers.headroom]\nbase_url = "http://127.0.0.1:8787/v1"\n\n'
+        '[model_providers.company]\nbase_url = "https://api.example.test/v1/"\n',
+        encoding="utf-8",
+    )
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("exec", "hello"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
+    assert (
+        "model_providers.headroom.env_http_headers.X-Headroom-Base-Url"
+        '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+    ) in args
+    assert display[-1] == "HEADROOM_CODEX_UPSTREAM_BASE_URL=https://api.example.test/v1"
+
+
 def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
     """#2358: quoted segments are silently ignored by Codex's --config parser."""
     assert (
@@ -1651,13 +1735,30 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
     with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
         with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
             # Serena is the code-memory MCP; assert it lands in the codex config.
-            result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+            result = runner.invoke(
+                main,
+                ["wrap", "codex", "--prepare-only", "--code-memory", "serena"],
+            )
 
     assert result.exit_code == 0, result.output
     content = config_file.read_text(encoding="utf-8")
     assert "[mcp_servers.serena]" in content
     assert 'command = "uvx"' in content
     assert '"--context", "codex"' in content
+
+
+def test_wrap_codex_prepare_only_does_not_register_serena_by_default(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    assert "[mcp_servers.serena]" not in config_file.read_text(encoding="utf-8")
 
 
 def test_wrap_codex_prepare_only_no_serena_skips_serena(

@@ -58,6 +58,11 @@ from headroom.providers.vertex import (
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
+from headroom.proxy.project_context import (
+    classify_project,
+    set_current_project,
+    strip_project_path_prefix,
+)
 from headroom.proxy.request_scope import normalize_request_path
 
 logger = logging.getLogger("headroom.proxy.routes")
@@ -129,10 +134,13 @@ def _register_openai_responses_root_route(app: FastAPI, proxy: Any, path: str) -
 
 def _register_openai_responses_websocket_route(app: FastAPI, proxy: Any, path: str) -> None:
     async def openai_responses_ws(websocket: WebSocket):
+        prefix_project = strip_project_path_prefix(websocket.scope)
+        set_current_project(classify_project(websocket.headers) or prefix_project)
         await proxy.handle_openai_responses_ws(websocket)
 
     openai_responses_ws.__name__ = path.strip("/").replace("/", "_").replace("-", "_") + "_ws"
     app.websocket(path)(openai_responses_ws)
+    app.websocket(f"/p/{{project}}{path}")(openai_responses_ws)
 
 
 def _register_openai_responses_subpath_route(
