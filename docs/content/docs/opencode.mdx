@@ -29,7 +29,7 @@ headroom unwrap opencode
 | Provider compatibility | Leaves `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` untouched so OpenCode `/connect` providers keep their own routing |
 | Context tool | Injects RTK (or `lean-ctx`) instructions into `~/.config/opencode/AGENTS.md` and project `AGENTS.md` |
 | MCP setup | Registers the Headroom MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) |
-| Serena MCP | Optionally registers Serena code graph tools (`--no-serena` to skip) |
+| Serena MCP | Registers Serena code graph tools only with `--code-memory serena` |
 | Backup | Snapshots `opencode.json` to `opencode.json.headroom-backup` before making any changes |
 | Launch | Starts the `opencode` binary through the proxy |
 
@@ -40,7 +40,7 @@ headroom wrap opencode \
   --port 8787 \
   --no-rtk \
   --no-mcp \
-  --no-serena \
+  --code-memory serena \
   --code-graph \
   --no-proxy \
   --learn \

@@ -2297,10 +2297,12 @@ def _codex_session_launch_settings(
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
+        upstream = upstream.rstrip("/")
         forwarded_upstream = (
             _detect_custom_codex_upstream_base_url(config_content)
             if provider == "headroom"
-            else upstream.rstrip("/")
+            and urllib.parse.urlsplit(upstream).hostname in {"127.0.0.1", "localhost", "::1"}
+            else upstream
         )
         if forwarded_upstream:
             env[_UPSTREAM_BASE_URL_ENV_VAR] = forwarded_upstream
