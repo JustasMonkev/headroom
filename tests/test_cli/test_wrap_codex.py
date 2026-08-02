@@ -1651,13 +1651,30 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
     with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
         with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
             # Serena is the code-memory MCP; assert it lands in the codex config.
-            result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+            result = runner.invoke(
+                main,
+                ["wrap", "codex", "--prepare-only", "--code-memory", "serena"],
+            )
 
     assert result.exit_code == 0, result.output
     content = config_file.read_text(encoding="utf-8")
     assert "[mcp_servers.serena]" in content
     assert 'command = "uvx"' in content
     assert '"--context", "codex"' in content
+
+
+def test_wrap_codex_prepare_only_does_not_register_serena_by_default(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    assert "[mcp_servers.serena]" not in config_file.read_text(encoding="utf-8")
 
 
 def test_wrap_codex_prepare_only_no_serena_skips_serena(

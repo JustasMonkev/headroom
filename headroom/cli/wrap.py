@@ -789,7 +789,7 @@ _serena_instructions_option = click.option(
 
 
 # --- Code-memory MCP selection ------------------------------------------------
-# The code-memory MCP is Serena by default; turn it off with --code-memory none.
+# Code-memory MCPs are opt-in because Serena runs a Git-sourced uvx command.
 # Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
 # callback) so it works the same on every agent without threading a param
 # through each subcommand — the same approach as _rtk_option above.
@@ -804,15 +804,15 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
 
     Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
     wins; otherwise the deprecated ``--serena`` / ``--no-serena`` flags map into
-    it; otherwise the default is ``serena`` — mature, offline, symbol-level code
-    navigation. The retired ``tokensave`` option is accepted gracefully: an
+    it; otherwise the default is ``none`` so no Git-sourced code runs
+    implicitly. The retired ``tokensave`` option is accepted gracefully: an
     explicit ``tokensave`` selector (or the deprecated ``--no-tokensave`` flag)
-    now resolves to Serena.
+    now resolves to ``none``.
     """
     env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
     if env == "tokensave":
-        click.echo("  Note: the tokensave code-memory option was retired — using Serena instead.")
-        return _CODE_MEMORY_SERENA
+        click.echo("  Note: the tokensave code-memory option was retired — disabling code memory.")
+        return _CODE_MEMORY_NONE
     if env:
         if env not in _VALID_CODE_MEMORY:
             raise click.ClickException(
@@ -821,7 +821,9 @@ def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
         return env
     if kwargs.get("no_serena"):
         return _CODE_MEMORY_NONE
-    return _CODE_MEMORY_SERENA
+    if kwargs.get("serena"):
+        return _CODE_MEMORY_SERENA
+    return _CODE_MEMORY_NONE
 
 
 def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
@@ -844,7 +846,7 @@ _code_memory_option = click.option(
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'serena' (default) or 'none'. "
+        "Code-memory MCP to register: 'none' (default) or 'serena' (opt-in). "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
     ),
 )
@@ -2084,12 +2086,12 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
 
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default none).
 
     Selection (see :func:`_resolve_code_memory`):
 
-    * ``serena`` (default) — register Serena (mature, offline, symbol-level).
-    * ``none`` — register nothing.
+    * ``none`` (default) — register nothing.
+    * ``serena`` — explicitly register the Git-sourced Serena MCP.
 
     Either way, any Headroom-installed ``tokensave`` entry from a prior release
     is removed (tokensave was retired in favour of Serena). The deprecated
