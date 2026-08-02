@@ -1183,6 +1183,33 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
+def test_codex_session_launch_settings_do_not_chain_headroom_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    config_file = codex_home / "config.toml"
+    config_file.write_text(
+        'model_provider = "headroom"\n\n'
+        '[model_providers.headroom]\nbase_url = "http://127.0.0.1:8787/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("exec", "hello"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert 'model_providers.headroom.base_url="http://127.0.0.1:9898/v1"' in args
+    assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+    assert all("X-Headroom-Base-Url" not in arg for arg in args)
+    assert display == ["OPENAI_BASE_URL=http://127.0.0.1:9898/v1"]
+
+
 def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
     """#2358: quoted segments are silently ignored by Codex's --config parser."""
     assert (
