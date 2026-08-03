@@ -1405,6 +1405,11 @@ class TestWasteSignalScanBounding:
             "<!-- unclosed",
             "<!-- one --><!-- two -->",
             "<!-- one --> tail <!-- unclosed",
+            "<div>text</div>",
+            "<<<<<<< HEAD\ncode\n=======\nother\n>>>>>>> branch\n",
+            "a < b and c < d with no closing angle",
+            "<tag> then <unclosed",
+            "<" * 50,
         ],
     )
     def test_bounding_does_not_change_matches(self, text):
@@ -1412,6 +1417,8 @@ class TestWasteSignalScanBounding:
         from headroom.parser import (
             HTML_COMMENT_PATTERN,
             HTML_COMMENT_TERMINATOR,
+            HTML_TAG_PATTERN,
+            HTML_TAG_TERMINATOR,
             JSON_BLOCK_PATTERN,
             JSON_BLOCK_TERMINATOR,
             _bounded_search_region,
@@ -1423,16 +1430,22 @@ class TestWasteSignalScanBounding:
         assert HTML_COMMENT_PATTERN.findall(text) == HTML_COMMENT_PATTERN.findall(
             _bounded_search_region(text, HTML_COMMENT_TERMINATOR)
         )
+        assert HTML_TAG_PATTERN.findall(text) == HTML_TAG_PATTERN.findall(
+            _bounded_search_region(text, HTML_TAG_TERMINATOR)
+        )
 
     def test_unclosed_openers_do_not_blow_up(self):
-        """Regression: 80KB of unclosed openers took ~1-2.7s before bounding."""
+        """Regression: 80KB of unclosed openers took seconds before bounding.
+
+        Worst measured case was HTML_TAG_PATTERN — 400KB of "<" took 88s.
+        """
         import time
 
         from headroom.parser import detect_waste_signals
         from headroom.tokenizers import EstimatingTokenCounter
 
         tokenizer = EstimatingTokenCounter()
-        for unit in ("{ padding text here ", "<!-- unclosed comment "):
+        for unit in ("{ padding text here ", "<!-- unclosed comment ", "<"):
             text = unit * (80_000 // len(unit))
             start = time.perf_counter()
             detect_waste_signals(text, tokenizer)
