@@ -727,3 +727,126 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestEstimatorFastPaths:
+    """The estimator's hot paths are short-circuited for speed (it runs twice per
+    proxy request, on the full conversation). Each guard is a *necessary
+    condition* for the scan it skips, so counts must be unchanged — these tests
+    pin that equivalence rather than the speedup."""
+
+    # Reference implementations: the pre-optimization logic, kept verbatim so a
+    # future edit to the fast paths is caught by a real differential comparison.
+    @staticmethod
+    def _ref_cjk(counter, text):
+        return sum(1 for _ in counter.CJK_PATTERN.finditer(text))
+
+    @staticmethod
+    def _ref_overhead(counter, text):
+        overhead = 0
+        for url in counter.URL_PATTERN.findall(text):
+            overhead += url.count("/") + url.count("?") + url.count("&")
+        overhead += len(counter.UUID_PATTERN.findall(text)) * 2
+        return overhead
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "plain ascii text with no specials",
+            "これは日本語です",
+            "mixed 中文 and ascii",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "UPPER 550E8400-E29B-41D4-A716-446655440000 tail",
+            "two 550e8400-e29b-41d4-a716-446655440000 6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "https://example.com/a/b?c=1&d=2",
+            "http://x.io/p/q/r and https://y.io/z",
+            "2024-01-15T10:23:45.123Z INFO worker=3 done",  # hyphens, no UUID
+            "ab-cdef-12 -abcd- partial uuid-ish tokens",
+            "no hyphens at all here",
+            '{"a": 1, "b": [2, 3]}',
+            "def f(x):\n    return x\n" * 50,
+        ],
+    )
+    def test_fast_paths_match_reference(self, text):
+        """CJK counting and special-pattern overhead must equal the unguarded scans."""
+        counter = EstimatingTokenCounter()
+        assert counter._count_cjk_chars(text) == self._ref_cjk(counter, text)
+        assert counter._count_special_overhead(text) == self._ref_overhead(counter, text)
+
+    def test_ascii_shortcut_reports_no_cjk(self):
+        """ASCII text provably contains no dense-script codepoints."""
+        assert EstimatingTokenCounter()._count_cjk_chars("pure ascii, 100%") == 0
+
+    def test_uuid_prescan_does_not_miss_uuids(self):
+        """The prescan is only a filter — a real UUID must still be charged."""
+        counter = EstimatingTokenCounter()
+        with_uuid = "id=550e8400-e29b-41d4-a716-446655440000"
+        assert counter._count_special_overhead(with_uuid) == 2
+        # ...and hyphen-rich text without a UUID must cost nothing.
+        assert counter._count_special_overhead("2024-01-15 a-b-c-d-e") == 0
+
+    def test_code_ratio_decision_unchanged(self):
+        """Early-exit counting must preserve the code-vs-text ratio decision."""
+        counter = EstimatingTokenCounter()
+        code = "def f(x):\n    return x + 1\n" * 200
+        prose = "the quick brown fox jumps over the lazy dog. " * 200
+        assert counter._detect_ratio(code) == counter.CHARS_PER_TOKEN_CODE
+        assert counter._detect_ratio(prose) == counter.CHARS_PER_TOKEN
+
+    def test_large_json_detected_structurally(self):
+        """Above the blob threshold the ratio is decided without a full parse."""
+        import json
+
+        counter = EstimatingTokenCounter()
+        big = json.dumps({"items": [{"i": i, "s": "x" * 20} for i in range(4000)]})
+        assert len(big) > counter.LARGE_BLOB_CHARS
+        assert counter._detect_ratio(big) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_small_json_still_parsed_exactly(self):
+        """Below the threshold, malformed JSON must not be priced as JSON."""
+        counter = EstimatingTokenCounter()
+        assert counter._detect_ratio('{"a": 1}') == counter.CHARS_PER_TOKEN_JSON
+        assert counter._detect_ratio('{"a": ') != counter.CHARS_PER_TOKEN_JSON
+
+
+class TestTokenizerRegistryCacheBound:
+    """The registry cache is keyed by model name, which on the proxy path comes
+    straight from the request body — so it must not grow without bound."""
+
+    def test_cache_is_bounded_by_max_entries(self):
+        TokenizerRegistry.clear_cache()
+        try:
+            for i in range(TokenizerRegistry._MAX_CACHE_ENTRIES + 50):
+                get_tokenizer(f"unknown-model-{i}")
+            assert len(TokenizerRegistry._cache) <= TokenizerRegistry._MAX_CACHE_ENTRIES
+        finally:
+            TokenizerRegistry.clear_cache()
+
+    def test_recently_used_entry_survives_eviction(self):
+        """LRU, not FIFO: a model that keeps being used must never be evicted.
+
+        Asserts on *instance identity*, not mere presence — under FIFO the
+        keeper is evicted and simply rebuilt on the next touch, so a
+        ``key in _cache`` check would pass for both policies.
+        """
+        TokenizerRegistry.clear_cache()
+        try:
+            keeper = "kept-warm-model"
+            original = get_tokenizer(keeper)
+            for i in range(TokenizerRegistry._MAX_CACHE_ENTRIES + 20):
+                get_tokenizer(f"churn-model-{i}")
+                if i % 10 == 0:
+                    get_tokenizer(keeper)  # keep it at the MRU end
+            assert f"{keeper}:auto" in TokenizerRegistry._cache
+            assert get_tokenizer(keeper) is original
+        finally:
+            TokenizerRegistry.clear_cache()
+
+    def test_cache_still_returns_same_instance(self):
+        """Bounding must not break the memoization itself."""
+        TokenizerRegistry.clear_cache()
+        try:
+            assert get_tokenizer("gemini-1.5-pro") is get_tokenizer("gemini-1.5-pro")
+        finally:
+            TokenizerRegistry.clear_cache()

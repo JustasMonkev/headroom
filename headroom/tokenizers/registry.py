@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -109,8 +110,42 @@ class TokenizerRegistry:
     # names from MODEL_PATTERNS), making the documented factory API a no-op.
     _model_factories: dict[str, Callable[[str], TokenCounter]] = {}
 
-    # Cache for auto-detected tokenizers
+    # Cache for auto-detected tokenizers, bounded and LRU-evicted.
+    #
+    # Keys are derived from the model name, which on the proxy path comes
+    # straight out of the request body (``body.get("model")``). An unbounded
+    # dict therefore grows one permanent entry per distinct model string a
+    # client ever sends — a slow leak in a long-running proxy, and one a client
+    # controls. Real deployments touch a handful of models, so a small bound
+    # costs nothing in hit rate while capping worst-case retention.
     _cache: dict[str, TokenCounter] = {}
+    _MAX_CACHE_ENTRIES = 256
+
+    # Guards _cache bookkeeping only — never held across tokenizer construction,
+    # which can take seconds for a cold HuggingFace load and runs concurrently
+    # on the proxy's compression executor threads.
+    _cache_lock = threading.Lock()
+
+    @classmethod
+    def _cache_get(cls, key: str) -> TokenCounter | None:
+        """Return the cached tokenizer for ``key``, marking it recently used."""
+        with cls._cache_lock:
+            tokenizer = cls._cache.get(key)
+            if tokenizer is not None:
+                # Re-insert to move to the MRU end (dicts keep insertion order).
+                del cls._cache[key]
+                cls._cache[key] = tokenizer
+            return tokenizer
+
+    @classmethod
+    def _cache_put(cls, key: str, tokenizer: TokenCounter) -> None:
+        """Store ``tokenizer``, evicting least-recently-used entries past the bound."""
+        with cls._cache_lock:
+            if key in cls._cache:
+                del cls._cache[key]
+            cls._cache[key] = tokenizer
+            while len(cls._cache) > cls._MAX_CACHE_ENTRIES:
+                cls._cache.pop(next(iter(cls._cache)))
 
     def __new__(cls) -> TokenizerRegistry:
         """Singleton pattern."""
@@ -162,15 +197,16 @@ class TokenizerRegistry:
 
         # Check cache
         cache_key = f"{model_lower}:{backend or 'auto'}"
-        if cache_key in registry._cache:
-            return registry._cache[cache_key]
+        cached = cls._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         # Check for a per-model factory registered via register(model, factory=...)
         model_factory = registry._model_factories.get(model_lower)
         if model_factory is not None and backend is None:
             try:
                 tokenizer = model_factory(model)
-                registry._cache[cache_key] = tokenizer
+                cls._cache_put(cache_key, tokenizer)
                 return tokenizer
             except Exception as e:
                 if fallback:
@@ -188,7 +224,7 @@ class TokenizerRegistry:
         # Create tokenizer
         try:
             tokenizer = registry._create_tokenizer(model, backend)
-            registry._cache[cache_key] = tokenizer
+            cls._cache_put(cache_key, tokenizer)
             return tokenizer
         except Exception as e:
             if fallback:
@@ -235,9 +271,10 @@ class TokenizerRegistry:
         # Clear cache for this model. Cache keys are "<model>:<backend>", so
         # match on the full "model:" prefix — a bare startswith(model) would
         # also evict e.g. "gpt-4o:auto" when registering "gpt-4".
-        keys_to_remove = [k for k in registry._cache if k.startswith(f"{model_lower}:")]
-        for key in keys_to_remove:
-            del registry._cache[key]
+        with cls._cache_lock:
+            keys_to_remove = [k for k in registry._cache if k.startswith(f"{model_lower}:")]
+            for key in keys_to_remove:
+                del registry._cache[key]
 
     @classmethod
     def register_backend(
@@ -270,7 +307,8 @@ class TokenizerRegistry:
     def clear_cache(cls) -> None:
         """Clear the tokenizer cache."""
         registry = cls()
-        registry._cache.clear()
+        with cls._cache_lock:
+            registry._cache.clear()
 
     def _create_tokenizer(
         self,
