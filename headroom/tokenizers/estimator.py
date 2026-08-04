@@ -281,16 +281,12 @@ class EstimatingTokenCounter(BaseTokenizer):
                 + "".join(closers[opener] for opener in reversed(stack))
             )
         else:
-            candidates.append(prefix + "".join(closers[opener] for opener in reversed(stack)))
-        if not in_string:
-            # The probe may have stopped where a value is still owed (after a
-            # ":" or an opening bracket). Supplying one validates everything
-            # before it rather than discarding the whole probe.
-            candidates.append(
-                prefix.rstrip()
-                + "null"
-                + "".join(closers[opener] for opener in reversed(stack))
-            )
+            tail = "".join(closers[opener] for opener in reversed(stack))
+            candidates.append(prefix + tail)
+            # The probe may instead have stopped where a value is still owed
+            # (after a ":" or an opening bracket). Supplying one validates
+            # everything before it rather than discarding the whole probe.
+            candidates.append(prefix.rstrip() + "null" + tail)
         if comma_cut != -1:
             # Fallback for a probe that ends somewhere unclosable (right after a
             # comma, mid-number, mid-literal): rewind to the last complete
