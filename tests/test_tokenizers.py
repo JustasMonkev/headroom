@@ -794,14 +794,79 @@ class TestEstimatorFastPaths:
         assert counter._detect_ratio(code) == counter.CHARS_PER_TOKEN_CODE
         assert counter._detect_ratio(prose) == counter.CHARS_PER_TOKEN
 
-    def test_large_json_detected_structurally(self):
-        """Above the blob threshold the ratio is decided without a full parse."""
+    def test_large_json_detected_without_full_parse(self):
+        """Above the full-parse cap the ratio is decided from a bounded prefix."""
         import json
 
         counter = EstimatingTokenCounter()
-        big = json.dumps({"items": [{"i": i, "s": "x" * 20} for i in range(4000)]})
-        assert len(big) > counter.LARGE_BLOB_CHARS
+        big = json.dumps({"items": [{"i": i, "s": "x" * 40} for i in range(60_000)]})
+        assert len(big) > counter.JSON_FULL_PARSE_CHARS
         assert counter._detect_ratio(big) == counter.CHARS_PER_TOKEN_JSON
+
+    # Built lazily and identified by name: these payloads are megabytes each, and
+    # inlining them as parametrize values puts the whole blob in the test id.
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "js_object",  # JavaScript object literal — unquoted keys
+            "py_repr",  # Python repr — single-quoted strings
+            "js_array",  # JS array of object literals
+        ],
+    )
+    def test_oversized_json_lookalikes_are_not_priced_as_json(self, label):
+        """Opening/closing brackets alone must not qualify a payload as JSON.
+
+        A large JS object literal or Python repr opens and closes exactly like
+        JSON. Pricing it at the JSON ratio over-counts it by 9-25% and can trip
+        compression or context-pressure gates early, so the bounded check runs
+        the real JSON grammar over a prefix rather than matching delimiters.
+        """
+        bodies = {
+            "js_object": lambda: "{" + ", ".join(f"key{i}: value{i}" for i in range(90_000)) + "}",
+            "py_repr": lambda: "{" + ", ".join(f"'k{i}': 'v{i}'" for i in range(90_000)) + "}",
+            "js_array": lambda: (
+                "[" + ",".join(f"{{id: {i}, nm: 'x'}}" for i in range(70_000)) + "]"
+            ),
+        }
+        body = bodies[label]()
+        counter = EstimatingTokenCounter()
+        assert len(body) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(body) != counter.CHARS_PER_TOKEN_JSON, (
+            f"{label} payload was priced as JSON"
+        )
+
+    def test_oversized_json_with_trailing_junk_is_not_json(self):
+        """A complete value followed by garbage is 'Extra data' to a full parse."""
+        import json
+
+        counter = EstimatingTokenCounter()
+        text = json.dumps({"a": 1}) + "\n" + "z" * (counter.JSON_FULL_PARSE_CHARS + 1000)
+        assert counter._detect_ratio(text) != counter.CHARS_PER_TOKEN_JSON
+
+    def test_oversized_truncated_json_still_counts_as_json(self):
+        """Deliberate divergence from a full parse — see _prefix_parses_as_json.
+
+        A tool result cut off mid-document is still JSON by content and
+        tokenizes at JSON density, so the denser (over-counting) ratio is both
+        the better estimate and the safe direction for gating.
+        """
+        counter = EstimatingTokenCounter()
+        truncated = '{"a": [' + ",".join(str(i) for i in range(counter.JSON_FULL_PARSE_CHARS // 4))
+        assert len(truncated) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(truncated) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_bounded_check_is_constant_time_in_payload_size(self):
+        """The prefix probe must not scale with the payload."""
+        import json
+        import time
+
+        counter = EstimatingTokenCounter()
+        big = json.dumps({"items": [{"i": i, "s": "x" * 40} for i in range(200_000)]})
+        start = time.perf_counter()
+        counter._detect_ratio(big)
+        elapsed = time.perf_counter() - start
+        # A full json.loads of this payload is ~160ms; the probe is sub-ms.
+        assert elapsed < 0.05, f"bounded JSON check took {elapsed:.3f}s"
 
     def test_small_json_still_parsed_exactly(self):
         """Below the threshold, malformed JSON must not be priced as JSON."""

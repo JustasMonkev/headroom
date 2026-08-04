@@ -74,6 +74,19 @@ class EstimatingTokenCounter(BaseTokenizer):
         "\U00020000-\U0002a6df"  # CJK Unified Ideographs Extension B
         "]"
     )
+    # Payloads up to this size are content-typed by parsing them outright, which
+    # is exact. Beyond it, json.loads stops being reasonable on the request path:
+    # measured 67ms / 18MB of transient objects at 4.3MB of input and 291ms /
+    # 68MB at 16MB, all discarded immediately, and multiplied by every in-flight
+    # request. 1MB costs ~13ms / 4.5MB, which is affordable, and real JSON tool
+    # output very rarely exceeds it — so the bounded path below is reserved for
+    # genuinely oversized blobs.
+    JSON_FULL_PARSE_CHARS = 1_000_000
+    # How much of an oversized payload _prefix_parses_as_json feeds to the real
+    # JSON parser. Large enough to get well past the opening structure, small
+    # enough that the check is O(1) against payload size.
+    JSON_PREFIX_PROBE_CHARS = 8_192
+
     URL_PATTERN = re.compile(r"https?://\S+")
     UUID_PATTERN = re.compile(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
@@ -167,6 +180,82 @@ class EstimatingTokenCounter(BaseTokenizer):
         # twice per request (before and after compression).
         return sum(1 for _ in self.CJK_PATTERN.finditer(text))
 
+    def _prefix_parses_as_json(self, text: str) -> bool:
+        """Whether an oversized payload's opening conforms to JSON grammar.
+
+        Bounded stand-in for a full ``json.loads`` on a payload too large to
+        parse on the request path. A leading bracket alone is far too weak a
+        test: a large JavaScript object literal (``{key: value, ...}``) or a
+        Python repr (``{'k': 'v'}``) opens and closes like JSON but is not
+        JSON, and pricing it at the JSON ratio would over-count it by 9-25% and
+        could trip compression or context-pressure gates early.
+
+        So the real parser judges a bounded prefix. The prefix is cut back to
+        the last element boundary that lies outside a string, the containers
+        still open there are closed synthetically, and the result is handed to
+        ``json.loads``. That keeps the actual JSON grammar as the arbiter — an
+        unquoted key or a single-quoted string fails exactly as it would in a
+        full parse — while the work stays O(1) against the payload.
+
+        (Trusting the reported error position instead does not work: a prefix
+        cut in the middle of a string raises "Unterminated string starting at",
+        whose position is the *start* of that string, indistinguishable from a
+        real error much earlier in the document.)
+
+        One deliberate divergence from a full parse: an oversized payload whose
+        JSON is *truncated* (a tool result cut off mid-document) is accepted
+        here, where ``json.loads`` on the whole string would reject it. That is
+        the wanted answer — the content is JSON and tokenizes at JSON density,
+        so 3.2 estimates it better than the 4.0 prose ratio, and erring toward
+        the denser ratio over-counts, which is the safe direction for gating.
+        """
+        prefix = text[: self.JSON_PREFIX_PROBE_CHARS]
+
+        # Walk the prefix tracking string state and container nesting, so the
+        # cut point is never inside a string literal and the open containers are
+        # known. Bounded by JSON_PREFIX_PROBE_CHARS.
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        cut = -1  # index of the last element separator outside a string
+        # Containers open *at that comma*. It must be snapshotted there: by the
+        # end of the probe the stack has moved on (elements opened after the cut
+        # get closed again), so slicing the final stack closes the wrong ones.
+        cut_stack: list[str] = []
+        for index, char in enumerate(prefix):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if stack:
+                    stack.pop()
+            elif char == "," and stack:
+                cut = index
+                cut_stack = stack.copy()
+
+        if cut == -1:
+            # No complete element in the probe (one huge scalar, or a payload
+            # that never opens a container). Nothing to validate against.
+            return False
+
+        # Drop the trailing comma and close whatever was still open there.
+        closers = {"{": "}", "[": "]"}
+        candidate = prefix[:cut] + "".join(closers[opener] for opener in reversed(cut_stack))
+        try:
+            json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        return True
+
     def _detect_ratio(self, text: str) -> float:
         """Detect optimal chars-per-token ratio based on content.
 
@@ -177,38 +266,15 @@ class EstimatingTokenCounter(BaseTokenizer):
             Chars per token ratio.
         """
         # Check for JSON
-        json_open = self.JSON_PATTERN.match(text)
-        if json_open:
-            if len(text) > self.LARGE_BLOB_CHARS:
-                # Above the blob threshold, decide structurally instead of
-                # parsing. json.loads on a multi-megabyte tool output costs
-                # seconds of CPU and materializes an object graph many times
-                # the string's size, only to discard it — a transient memory
-                # spike on the request path, for a ratio that is a heuristic
-                # either way. A payload that opens and closes with matching
-                # brackets is treated as JSON, which agrees with the full parse
-                # for well-formed blobs (the case that reaches here). Mirrors
-                # the sampling that BaseTokenizer._count_serialized already
-                # applies to oversized blobs.
-                #
-                # Both ends are read without lstrip/rstrip, which would copy the
-                # entire multi-megabyte string just to look at one character.
-                # JSON_PATTERN already consumed the leading whitespace, so its
-                # match ends on the opening bracket.
-                opener = text[json_open.end() - 1]
-                closer = ""
-                for index in range(len(text) - 1, -1, -1):
-                    if not text[index].isspace():
-                        closer = text[index]
-                        break
-                if (opener, closer) in (("{", "}"), ("[", "]")):
-                    return self.CHARS_PER_TOKEN_JSON
-            else:
+        if self.JSON_PATTERN.match(text):
+            if len(text) <= self.JSON_FULL_PARSE_CHARS:
                 try:
                     json.loads(text)
                     return self.CHARS_PER_TOKEN_JSON
                 except (json.JSONDecodeError, ValueError):
                     pass
+            elif self._prefix_parses_as_json(text):
+                return self.CHARS_PER_TOKEN_JSON
 
         # Check for code. Only the threshold comparison matters, so stop
         # counting as soon as it is settled — findall would otherwise
