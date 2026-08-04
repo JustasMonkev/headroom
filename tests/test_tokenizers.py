@@ -900,6 +900,73 @@ class TestEstimatorFastPaths:
                     f"unit={unit!r} pad={pad}"
                 )
 
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "stray_closer",  # valid element, then a bare "]"
+            "js_second_field",  # valid element, then an unquoted key
+            "quoted_wrong",  # valid element, then single-quoted pairs
+            "garbage_element",  # valid element, then junk
+        ],
+    )
+    def test_rewind_must_not_discard_a_malformed_element(self, label):
+        """The rewind fallback drops what follows the last separator, so it must
+        not be able to accept a payload *because* it threw the bad part away.
+
+        ``{"a":1, ]`` and ``{"a":1, payload: "..."}`` both validate as
+        ``{"a":1}`` once the tail is discarded, which would over-count non-JSON
+        tool output by ~25%. The rewind is allowed only when what it drops
+        cannot hide a syntax error — whitespace and bare-token characters, i.e.
+        a genuinely truncated literal or number.
+        """
+        counter = EstimatingTokenCounter()
+        size = counter.JSON_FULL_PARSE_CHARS
+        bodies = {
+            "stray_closer": lambda: '{"a":1, ]' + " " * (size + 50),
+            "js_second_field": lambda: '{"a":1, payload: "' + "x" * (size + 5_000) + '"}',
+            "quoted_wrong": lambda: '{"a":1, ' + "'k': 'v'" * 200_000 + "}",
+            "garbage_element": lambda: '{"a":1, @@@@}' + " " * (size + 50),
+        }
+        body = bodies[label]()
+        assert len(body) > counter.JSON_FULL_PARSE_CHARS
+        import json
+
+        # Ground truth: a full parse rejects all of these.
+        with pytest.raises(ValueError):
+            json.loads(body)
+        assert counter._detect_ratio(body) != counter.CHARS_PER_TOKEN_JSON
+
+    @pytest.mark.parametrize(
+        "label", ["after_comma", "mid_literal", "mid_number", "after_colon", "mid_key"]
+    )
+    def test_probe_ending_mid_token_is_still_json(self, label):
+        """The guard above must not cost the truncation cases the rewind exists for.
+
+        ``mid_key`` is the subtle one: the probe stops inside an object *key*
+        (``{"id``), so closing the string alone yields ``{"id"}`` — a key with
+        no value — and the tail is structural, so the rewind is (correctly)
+        refused. The key/value pair has to be completed instead.
+        """
+        import json
+
+        counter = EstimatingTokenCounter()
+        size = counter.JSON_FULL_PARSE_CHARS
+        bodies = {
+            "after_comma": lambda: '{"a": 1,' + " " * 20_000 + '"b": 2}',
+            "mid_literal": lambda: "[" + ",".join("true" for _ in range(3_000)) + "]",
+            "mid_number": lambda: "[" + ",".join("123456789" for _ in range(3_000)) + "]",
+            "after_colon": lambda: '{"a":' + " " * 20_000 + "1}",
+            # 180-char keys put the 8KB probe boundary inside a key name, so
+            # closing the string yields {"kkk..."} — a key with no value.
+            "mid_key": lambda: json.dumps(
+                {"arr": [{"k" * 180 + str(i): "v" * 10} for i in range(6_000)]}
+            ),
+        }
+        body = bodies[label]()
+        body += " " * max(0, size + 50 - len(body))
+        assert json.loads(body) is not None  # ground truth: valid JSON
+        assert counter._detect_ratio(body) == counter.CHARS_PER_TOKEN_JSON
+
     def test_deeply_nested_json_does_not_raise(self):
         """json's scanner recurses per nesting level; picking a ratio must not crash.
 

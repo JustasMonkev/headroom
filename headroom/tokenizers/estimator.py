@@ -86,6 +86,12 @@ class EstimatingTokenCounter(BaseTokenizer):
     # JSON parser. Large enough to get well past the opening structure, small
     # enough that the check is O(1) against payload size.
     JSON_PREFIX_PROBE_CHARS = 8_192
+    # Anything that cannot appear in a *partial* trailing token. A probe may end
+    # part-way through a bare literal or number ("tru", "-12.3e"), which is only
+    # whitespace and word/number characters; structure, quotes or escapes there
+    # mean a real element follows, not a truncated one. Used to keep the
+    # rewind-to-last-separator fallback from discarding a malformed element.
+    PARTIAL_TOKEN_VIOLATION = re.compile(r"[^\s\w.+-]")
 
     URL_PATTERN = re.compile(r"https?://\S+")
     UUID_PATTERN = re.compile(
@@ -275,11 +281,13 @@ class EstimatingTokenCounter(BaseTokenizer):
             # {"content": "<a megabyte of text>"} — which has no element
             # separator anywhere in the probe. A string cannot contain
             # structure, so the end-of-probe stack is still the right one.
-            candidates.append(
-                prefix[:string_safe_len]
-                + '"'
-                + "".join(closers[opener] for opener in reversed(stack))
-            )
+            closed = prefix[:string_safe_len] + '"'
+            tail = "".join(closers[opener] for opener in reversed(stack))
+            candidates.append(closed + tail)
+            # The string may have been an object *key* the probe stopped inside
+            # ({"id), in which case closing it alone leaves {"id"} — a key with
+            # no value. Supplying one completes the pair.
+            candidates.append(closed + ":null" + tail)
         else:
             tail = "".join(closers[opener] for opener in reversed(stack))
             candidates.append(prefix + tail)
@@ -287,10 +295,17 @@ class EstimatingTokenCounter(BaseTokenizer):
             # (after a ":" or an opening bracket). Supplying one validates
             # everything before it rather than discarding the whole probe.
             candidates.append(prefix.rstrip() + "null" + tail)
-        if comma_cut != -1:
-            # Fallback for a probe that ends somewhere unclosable (right after a
-            # comma, mid-number, mid-literal): rewind to the last complete
-            # element instead.
+            # ...or immediately after a complete key, before its colon.
+            candidates.append(prefix.rstrip() + ":null" + tail)
+        if comma_cut != -1 and not self.PARTIAL_TOKEN_VIOLATION.search(prefix[comma_cut + 1 :]):
+            # Last resort for a probe that ends somewhere unclosable: right
+            # after a comma, or part-way through a bare literal ("tru", "nul").
+            # Rewinding drops whatever follows that comma, so it is allowed only
+            # when what it drops cannot hide a syntax error — i.e. the tail is
+            # whitespace and bare-token characters, with no structure in it.
+            # Without that guard the rewind would accept a payload precisely
+            # because it threw away the malformed part: '{"a":1, ]' and
+            # '{"a":1, payload: "..."}' both validate as '{"a":1}'.
             candidates.append(
                 prefix[:comma_cut] + "".join(closers[opener] for opener in reversed(comma_stack))
             )
