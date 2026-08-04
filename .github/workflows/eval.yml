@@ -10,6 +10,12 @@ on:
       - 'headroom/evals/**'
       - 'headroom/compress.py'
 
+# Supersede redundant runs: a PR that gets several pushes should not keep
+# already-obsolete runs going. Scoped like ci.yml — never cancel a main build.
+concurrency:
+  group: eval-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   # Fast smoke test on PRs touching compression code (~$0.05, ~2 min)
   smoke-test:

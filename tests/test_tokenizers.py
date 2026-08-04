@@ -727,3 +727,320 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestEstimatorFastPaths:
+    """The estimator's hot paths are short-circuited for speed (it runs twice per
+    proxy request, on the full conversation). Each guard is a *necessary
+    condition* for the scan it skips, so counts must be unchanged — these tests
+    pin that equivalence rather than the speedup."""
+
+    # Reference implementations: the pre-optimization logic, kept verbatim so a
+    # future edit to the fast paths is caught by a real differential comparison.
+    @staticmethod
+    def _ref_cjk(counter, text):
+        return sum(1 for _ in counter.CJK_PATTERN.finditer(text))
+
+    @staticmethod
+    def _ref_overhead(counter, text):
+        overhead = 0
+        for url in counter.URL_PATTERN.findall(text):
+            overhead += url.count("/") + url.count("?") + url.count("&")
+        overhead += len(counter.UUID_PATTERN.findall(text)) * 2
+        return overhead
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "plain ascii text with no specials",
+            "これは日本語です",
+            "mixed 中文 and ascii",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "UPPER 550E8400-E29B-41D4-A716-446655440000 tail",
+            "two 550e8400-e29b-41d4-a716-446655440000 6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "https://example.com/a/b?c=1&d=2",
+            "http://x.io/p/q/r and https://y.io/z",
+            "2024-01-15T10:23:45.123Z INFO worker=3 done",  # hyphens, no UUID
+            "ab-cdef-12 -abcd- partial uuid-ish tokens",
+            "no hyphens at all here",
+            '{"a": 1, "b": [2, 3]}',
+            "def f(x):\n    return x\n" * 50,
+        ],
+    )
+    def test_fast_paths_match_reference(self, text):
+        """CJK counting and special-pattern overhead must equal the unguarded scans."""
+        counter = EstimatingTokenCounter()
+        assert counter._count_cjk_chars(text) == self._ref_cjk(counter, text)
+        assert counter._count_special_overhead(text) == self._ref_overhead(counter, text)
+
+    def test_ascii_shortcut_reports_no_cjk(self):
+        """ASCII text provably contains no dense-script codepoints."""
+        assert EstimatingTokenCounter()._count_cjk_chars("pure ascii, 100%") == 0
+
+    def test_uuid_prescan_does_not_miss_uuids(self):
+        """The prescan is only a filter — a real UUID must still be charged."""
+        counter = EstimatingTokenCounter()
+        with_uuid = "id=550e8400-e29b-41d4-a716-446655440000"
+        assert counter._count_special_overhead(with_uuid) == 2
+        # ...and hyphen-rich text without a UUID must cost nothing.
+        assert counter._count_special_overhead("2024-01-15 a-b-c-d-e") == 0
+
+    def test_code_ratio_decision_unchanged(self):
+        """Early-exit counting must preserve the code-vs-text ratio decision."""
+        counter = EstimatingTokenCounter()
+        code = "def f(x):\n    return x + 1\n" * 200
+        prose = "the quick brown fox jumps over the lazy dog. " * 200
+        assert counter._detect_ratio(code) == counter.CHARS_PER_TOKEN_CODE
+        assert counter._detect_ratio(prose) == counter.CHARS_PER_TOKEN
+
+    def test_large_json_detected_without_full_parse(self):
+        """Above the full-parse cap the ratio is decided from a bounded prefix."""
+        import json
+
+        counter = EstimatingTokenCounter()
+        big = json.dumps({"items": [{"i": i, "s": "x" * 40} for i in range(60_000)]})
+        assert len(big) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(big) == counter.CHARS_PER_TOKEN_JSON
+
+    # Built lazily and identified by name: these payloads are megabytes each, and
+    # inlining them as parametrize values puts the whole blob in the test id.
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "js_object",  # JavaScript object literal — unquoted keys
+            "py_repr",  # Python repr — single-quoted strings
+            "js_array",  # JS array of object literals
+        ],
+    )
+    def test_oversized_json_lookalikes_are_not_priced_as_json(self, label):
+        """Opening/closing brackets alone must not qualify a payload as JSON.
+
+        A large JS object literal or Python repr opens and closes exactly like
+        JSON. Pricing it at the JSON ratio over-counts it by 9-25% and can trip
+        compression or context-pressure gates early, so the bounded check runs
+        the real JSON grammar over a prefix rather than matching delimiters.
+        """
+        bodies = {
+            "js_object": lambda: "{" + ", ".join(f"key{i}: value{i}" for i in range(90_000)) + "}",
+            "py_repr": lambda: "{" + ", ".join(f"'k{i}': 'v{i}'" for i in range(90_000)) + "}",
+            "js_array": lambda: (
+                "[" + ",".join(f"{{id: {i}, nm: 'x'}}" for i in range(70_000)) + "]"
+            ),
+        }
+        body = bodies[label]()
+        counter = EstimatingTokenCounter()
+        assert len(body) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(body) != counter.CHARS_PER_TOKEN_JSON, (
+            f"{label} payload was priced as JSON"
+        )
+
+    def test_oversized_json_with_trailing_junk_is_not_json(self):
+        """A complete value followed by garbage is 'Extra data' to a full parse."""
+        import json
+
+        counter = EstimatingTokenCounter()
+        text = json.dumps({"a": 1}) + "\n" + "z" * (counter.JSON_FULL_PARSE_CHARS + 1000)
+        assert counter._detect_ratio(text) != counter.CHARS_PER_TOKEN_JSON
+
+    def test_oversized_truncated_json_still_counts_as_json(self):
+        """Deliberate divergence from a full parse — see _prefix_parses_as_json.
+
+        A tool result cut off mid-document is still JSON by content and
+        tokenizes at JSON density, so the denser (over-counting) ratio is both
+        the better estimate and the safe direction for gating.
+        """
+        counter = EstimatingTokenCounter()
+        truncated = '{"a": [' + ",".join(str(i) for i in range(counter.JSON_FULL_PARSE_CHARS // 4))
+        assert len(truncated) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(truncated) == counter.CHARS_PER_TOKEN_JSON
+
+    @pytest.mark.parametrize(
+        "shape",
+        ["single_big_field", "array_of_one_big_string", "big_field_then_more", "nested_big_field"],
+    )
+    def test_oversized_json_with_no_element_separator_is_still_json(self, shape):
+        """A single huge field has no comma anywhere in the probe.
+
+        ``{"content": "<a megabyte of tool output>"}`` is the dominant shape for
+        wrapped tool results. An earlier revision required an element separator
+        inside the probe and so rejected these as non-JSON, falling back to the
+        4.0 prose ratio and under-counting them by ~20% — which delays
+        compression exactly on the largest payloads.
+        """
+        import json
+
+        counter = EstimatingTokenCounter()
+        size = counter.JSON_FULL_PARSE_CHARS + 5_000
+        payloads = {
+            "single_big_field": lambda: json.dumps({"content": "x" * size}),
+            "array_of_one_big_string": lambda: json.dumps(["y" * size]),
+            "big_field_then_more": lambda: json.dumps({"content": "z" * size, "n": 1}),
+            "nested_big_field": lambda: json.dumps({"o": {"i": {"content": "q" * size}}}),
+        }
+        body = payloads[shape]()
+        assert len(body) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(body) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_oversized_json_string_escapes_across_probe_boundary(self):
+        """The probe must never be closed mid-escape.
+
+        Shifting the payload moves the 8KB cut through every offset of an
+        escape sequence (\\n, \\\\, \\", \\uXXXX); closing the string at a
+        mid-escape position would produce invalid JSON and misclassify it.
+        """
+        import json
+
+        counter = EstimatingTokenCounter()
+        for unit in ("é", "\\", '"', "\n", "a"):
+            for pad in range(24):
+                body = json.dumps({"c": "p" * pad + unit * 4_000})
+                body += " " * max(0, counter.JSON_FULL_PARSE_CHARS + 10 - len(body))
+                assert counter._detect_ratio(body) == counter.CHARS_PER_TOKEN_JSON, (
+                    f"unit={unit!r} pad={pad}"
+                )
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "stray_closer",  # valid element, then a bare "]"
+            "js_second_field",  # valid element, then an unquoted key
+            "quoted_wrong",  # valid element, then single-quoted pairs
+            "garbage_element",  # valid element, then junk
+        ],
+    )
+    def test_rewind_must_not_discard_a_malformed_element(self, label):
+        """The rewind fallback drops what follows the last separator, so it must
+        not be able to accept a payload *because* it threw the bad part away.
+
+        ``{"a":1, ]`` and ``{"a":1, payload: "..."}`` both validate as
+        ``{"a":1}`` once the tail is discarded, which would over-count non-JSON
+        tool output by ~25%. The rewind is allowed only when what it drops
+        cannot hide a syntax error — whitespace and bare-token characters, i.e.
+        a genuinely truncated literal or number.
+        """
+        counter = EstimatingTokenCounter()
+        size = counter.JSON_FULL_PARSE_CHARS
+        bodies = {
+            "stray_closer": lambda: '{"a":1, ]' + " " * (size + 50),
+            "js_second_field": lambda: '{"a":1, payload: "' + "x" * (size + 5_000) + '"}',
+            "quoted_wrong": lambda: '{"a":1, ' + "'k': 'v'" * 200_000 + "}",
+            "garbage_element": lambda: '{"a":1, @@@@}' + " " * (size + 50),
+        }
+        body = bodies[label]()
+        assert len(body) > counter.JSON_FULL_PARSE_CHARS
+        import json
+
+        # Ground truth: a full parse rejects all of these.
+        with pytest.raises(ValueError):
+            json.loads(body)
+        assert counter._detect_ratio(body) != counter.CHARS_PER_TOKEN_JSON
+
+    @pytest.mark.parametrize(
+        "label", ["after_comma", "mid_literal", "mid_number", "after_colon", "mid_key"]
+    )
+    def test_probe_ending_mid_token_is_still_json(self, label):
+        """The guard above must not cost the truncation cases the rewind exists for.
+
+        ``mid_key`` is the subtle one: the probe stops inside an object *key*
+        (``{"id``), so closing the string alone yields ``{"id"}`` — a key with
+        no value — and the tail is structural, so the rewind is (correctly)
+        refused. The key/value pair has to be completed instead.
+        """
+        import json
+
+        counter = EstimatingTokenCounter()
+        size = counter.JSON_FULL_PARSE_CHARS
+        bodies = {
+            "after_comma": lambda: '{"a": 1,' + " " * 20_000 + '"b": 2}',
+            "mid_literal": lambda: "[" + ",".join("true" for _ in range(3_000)) + "]",
+            "mid_number": lambda: "[" + ",".join("123456789" for _ in range(3_000)) + "]",
+            "after_colon": lambda: '{"a":' + " " * 20_000 + "1}",
+            # 180-char keys put the 8KB probe boundary inside a key name, so
+            # closing the string yields {"kkk..."} — a key with no value.
+            "mid_key": lambda: json.dumps(
+                {"arr": [{"k" * 180 + str(i): "v" * 10} for i in range(6_000)]}
+            ),
+        }
+        body = bodies[label]()
+        body += " " * max(0, size + 50 - len(body))
+        assert json.loads(body) is not None  # ground truth: valid JSON
+        assert counter._detect_ratio(body) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_deeply_nested_json_does_not_raise(self):
+        """json's scanner recurses per nesting level; picking a ratio must not crash.
+
+        Both the full-parse branch and the bounded probe hand text to
+        json.loads, which raises RecursionError (not ValueError) on a deeply
+        nested payload. Pre-existing gap in the except clause — a crash here
+        propagates out of count_text and onto the request path.
+        """
+        counter = EstimatingTokenCounter()
+        nested = "[" * 3_000 + "1" + "]" * 3_000
+        # Small enough for the full parse...
+        assert counter._detect_ratio(nested) > 0
+        # ...and past the cap, for the bounded probe.
+        oversized = nested + " " * (counter.JSON_FULL_PARSE_CHARS + 10)
+        assert counter._detect_ratio(oversized) > 0
+        assert counter.count_text(oversized) > 0
+
+    def test_bounded_check_is_constant_time_in_payload_size(self):
+        """The prefix probe must not scale with the payload."""
+        import json
+        import time
+
+        counter = EstimatingTokenCounter()
+        big = json.dumps({"items": [{"i": i, "s": "x" * 40} for i in range(200_000)]})
+        start = time.perf_counter()
+        counter._detect_ratio(big)
+        elapsed = time.perf_counter() - start
+        # A full json.loads of this payload is ~160ms; the probe is sub-ms.
+        assert elapsed < 0.05, f"bounded JSON check took {elapsed:.3f}s"
+
+    def test_small_json_still_parsed_exactly(self):
+        """Below the threshold, malformed JSON must not be priced as JSON."""
+        counter = EstimatingTokenCounter()
+        assert counter._detect_ratio('{"a": 1}') == counter.CHARS_PER_TOKEN_JSON
+        assert counter._detect_ratio('{"a": ') != counter.CHARS_PER_TOKEN_JSON
+
+
+class TestTokenizerRegistryCacheBound:
+    """The registry cache is keyed by model name, which on the proxy path comes
+    straight from the request body — so it must not grow without bound."""
+
+    def test_cache_is_bounded_by_max_entries(self):
+        TokenizerRegistry.clear_cache()
+        try:
+            for i in range(TokenizerRegistry._MAX_CACHE_ENTRIES + 50):
+                get_tokenizer(f"unknown-model-{i}")
+            assert len(TokenizerRegistry._cache) <= TokenizerRegistry._MAX_CACHE_ENTRIES
+        finally:
+            TokenizerRegistry.clear_cache()
+
+    def test_recently_used_entry_survives_eviction(self):
+        """LRU, not FIFO: a model that keeps being used must never be evicted.
+
+        Asserts on *instance identity*, not mere presence — under FIFO the
+        keeper is evicted and simply rebuilt on the next touch, so a
+        ``key in _cache`` check would pass for both policies.
+        """
+        TokenizerRegistry.clear_cache()
+        try:
+            keeper = "kept-warm-model"
+            original = get_tokenizer(keeper)
+            for i in range(TokenizerRegistry._MAX_CACHE_ENTRIES + 20):
+                get_tokenizer(f"churn-model-{i}")
+                if i % 10 == 0:
+                    get_tokenizer(keeper)  # keep it at the MRU end
+            assert f"{keeper}:auto" in TokenizerRegistry._cache
+            assert get_tokenizer(keeper) is original
+        finally:
+            TokenizerRegistry.clear_cache()
+
+    def test_cache_still_returns_same_instance(self):
+        """Bounding must not break the memoization itself."""
+        TokenizerRegistry.clear_cache()
+        try:
+            assert get_tokenizer("gemini-1.5-pro") is get_tokenizer("gemini-1.5-pro")
+        finally:
+            TokenizerRegistry.clear_cache()

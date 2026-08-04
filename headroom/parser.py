@@ -20,6 +20,36 @@ BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
 WHITESPACE_PATTERN = re.compile(r"[ \t]{4,}|\n{3,}")
 JSON_BLOCK_PATTERN = re.compile(r"\{[\s\S]{500,}\}")
 
+# Closing delimiters for the three open-ended patterns above. Each scans a
+# wildcard run looking for a terminator, so on text that opens many times and
+# never closes — a truncated JSON tool result, minified assets, git conflict
+# markers ("<<<<<<<"), a log full of "{" — the engine restarts the scan at
+# every opener and the cost goes quadratic. All three scale ~4x per 2x of
+# input; measured worst cases: 80KB of unclosed "{" ~1.1s, 80KB of unclosed
+# "<!--" ~2.7s, and 400KB of "<" a full 88s. Since every match must END with
+# these terminators, nothing after the LAST one can be part of a match, so
+# truncating there is exactly equivalent and collapses the pathological case
+# to a single str.rfind. See _bounded_search_region.
+JSON_BLOCK_TERMINATOR = "}"
+HTML_COMMENT_TERMINATOR = "-->"
+HTML_TAG_TERMINATOR = ">"
+
+
+def _bounded_search_region(text: str, terminator: str) -> str:
+    """Return the prefix of ``text`` that can still contain a match.
+
+    A match ending in ``terminator`` cannot extend past the final occurrence of
+    ``terminator``, so the tail beyond it is dead weight for the regex engine —
+    but it is exactly the region a backtracking scan re-walks for every opener.
+    Returns ``""`` when the terminator is absent, in which case no match is
+    possible at all.
+    """
+    last = text.rfind(terminator)
+    if last == -1:
+        return ""
+    return text[: last + len(terminator)]
+
+
 # Tool results below this size legitimately repeat ("ok", empty diffs,
 # exit codes) and are not evidence of a re-read.
 REREAD_MIN_TOKENS = 50
@@ -174,7 +204,9 @@ def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
         return signals
 
     # HTML tags and comments
-    html_matches = HTML_TAG_PATTERN.findall(text) + HTML_COMMENT_PATTERN.findall(text)
+    html_matches = HTML_TAG_PATTERN.findall(
+        _bounded_search_region(text, HTML_TAG_TERMINATOR)
+    ) + HTML_COMMENT_PATTERN.findall(_bounded_search_region(text, HTML_COMMENT_TERMINATOR))
     if html_matches:
         html_text = "".join(html_matches)
         signals.html_noise_tokens = tokenizer.count_text(html_text)
@@ -196,7 +228,7 @@ def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
         )
 
     # Large JSON blocks
-    json_matches = JSON_BLOCK_PATTERN.findall(text)
+    json_matches = JSON_BLOCK_PATTERN.findall(_bounded_search_region(text, JSON_BLOCK_TERMINATOR))
     if json_matches:
         for match in json_matches:
             tokens = tokenizer.count_text(match)

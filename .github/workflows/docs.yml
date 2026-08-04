@@ -17,6 +17,12 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+# Supersede redundant runs: a PR that gets several pushes should not keep
+# already-obsolete runs going. Scoped like ci.yml — never cancel a main build.
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 

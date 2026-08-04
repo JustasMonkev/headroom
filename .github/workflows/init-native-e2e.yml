@@ -32,6 +32,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Supersede redundant runs: a PR that gets several pushes should not keep
+# already-obsolete runs going. Scoped like ci.yml — never cancel a main build.
+concurrency:
+  group: init-native-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   init-native:
     runs-on: ${{ matrix.os }}

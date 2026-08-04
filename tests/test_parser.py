@@ -1367,3 +1367,89 @@ class TestCallArgMatchReread:
         o_key = [b for b in o_blocks if b.kind == "tool_call"][0].flags["call_key"]
         a_key = [b for b in a_blocks if b.kind == "tool_call"][0].flags["call_key"]
         assert o_key == a_key
+
+
+class TestWasteSignalScanBounding:
+    """``detect_waste_signals`` runs on message text straight off the request.
+
+    Two of its patterns scan an open-ended wildcard run for a terminator, so on
+    text that opens many times and never closes — a truncated JSON tool result,
+    minified assets — a backtracking engine restarts at every opener and goes
+    quadratic. The scan region is bounded at the last terminator, which cannot
+    change any match. These tests pin both properties.
+    """
+
+    def test_bounded_region_is_empty_without_terminator(self):
+        from headroom.parser import _bounded_search_region
+
+        assert _bounded_search_region("{ no closing brace here", "}") == ""
+        assert _bounded_search_region("<!-- never closed", "-->") == ""
+
+    def test_bounded_region_keeps_everything_up_to_last_terminator(self):
+        from headroom.parser import _bounded_search_region
+
+        assert _bounded_search_region("a}b}c", "}") == "a}b}"
+        assert _bounded_search_region("x<!-- y -->z", "-->") == "x<!-- y -->"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "no braces at all",
+            "{" + "x" * 600 + "}",
+            "{" + "x" * 600 + "}" + "{ unclosed tail",
+            "{ short }",
+            "}" + "{" * 500,
+            '{"a": 1, "b": ' + '"' + "y" * 700 + '"}',
+            "<!-- a comment -->",
+            "<!-- unclosed",
+            "<!-- one --><!-- two -->",
+            "<!-- one --> tail <!-- unclosed",
+            "<div>text</div>",
+            "<<<<<<< HEAD\ncode\n=======\nother\n>>>>>>> branch\n",
+            "a < b and c < d with no closing angle",
+            "<tag> then <unclosed",
+            "<" * 50,
+        ],
+    )
+    def test_bounding_does_not_change_matches(self, text):
+        """The bounded region must yield exactly the unbounded match list."""
+        from headroom.parser import (
+            HTML_COMMENT_PATTERN,
+            HTML_COMMENT_TERMINATOR,
+            HTML_TAG_PATTERN,
+            HTML_TAG_TERMINATOR,
+            JSON_BLOCK_PATTERN,
+            JSON_BLOCK_TERMINATOR,
+            _bounded_search_region,
+        )
+
+        assert JSON_BLOCK_PATTERN.findall(text) == JSON_BLOCK_PATTERN.findall(
+            _bounded_search_region(text, JSON_BLOCK_TERMINATOR)
+        )
+        assert HTML_COMMENT_PATTERN.findall(text) == HTML_COMMENT_PATTERN.findall(
+            _bounded_search_region(text, HTML_COMMENT_TERMINATOR)
+        )
+        assert HTML_TAG_PATTERN.findall(text) == HTML_TAG_PATTERN.findall(
+            _bounded_search_region(text, HTML_TAG_TERMINATOR)
+        )
+
+    def test_unclosed_openers_do_not_blow_up(self):
+        """Regression: 80KB of unclosed openers took seconds before bounding.
+
+        Worst measured case was HTML_TAG_PATTERN — 400KB of "<" took 88s.
+        """
+        import time
+
+        from headroom.parser import detect_waste_signals
+        from headroom.tokenizers import EstimatingTokenCounter
+
+        tokenizer = EstimatingTokenCounter()
+        for unit in ("{ padding text here ", "<!-- unclosed comment ", "<"):
+            text = unit * (80_000 // len(unit))
+            start = time.perf_counter()
+            detect_waste_signals(text, tokenizer)
+            elapsed = time.perf_counter() - start
+            # Generous bound: the quadratic behaviour was ~1-3s here, and the
+            # bounded scan is sub-millisecond, so 2s cannot pass by accident.
+            assert elapsed < 2.0, f"waste-signal scan took {elapsed:.2f}s for {unit!r}"

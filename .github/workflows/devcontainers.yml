@@ -17,6 +17,12 @@ on:
       - "uv.lock"
   workflow_dispatch:
 
+# Supersede redundant runs: a PR that gets several pushes should not keep
+# already-obsolete runs going. Scoped like ci.yml — never cancel a main build.
+concurrency:
+  group: devcontainers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   validate:
     runs-on: ubuntu-latest
