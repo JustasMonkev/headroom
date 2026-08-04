@@ -855,6 +855,68 @@ class TestEstimatorFastPaths:
         assert len(truncated) > counter.JSON_FULL_PARSE_CHARS
         assert counter._detect_ratio(truncated) == counter.CHARS_PER_TOKEN_JSON
 
+    @pytest.mark.parametrize(
+        "shape",
+        ["single_big_field", "array_of_one_big_string", "big_field_then_more", "nested_big_field"],
+    )
+    def test_oversized_json_with_no_element_separator_is_still_json(self, shape):
+        """A single huge field has no comma anywhere in the probe.
+
+        ``{"content": "<a megabyte of tool output>"}`` is the dominant shape for
+        wrapped tool results. An earlier revision required an element separator
+        inside the probe and so rejected these as non-JSON, falling back to the
+        4.0 prose ratio and under-counting them by ~20% — which delays
+        compression exactly on the largest payloads.
+        """
+        import json
+
+        counter = EstimatingTokenCounter()
+        size = counter.JSON_FULL_PARSE_CHARS + 5_000
+        payloads = {
+            "single_big_field": lambda: json.dumps({"content": "x" * size}),
+            "array_of_one_big_string": lambda: json.dumps(["y" * size]),
+            "big_field_then_more": lambda: json.dumps({"content": "z" * size, "n": 1}),
+            "nested_big_field": lambda: json.dumps({"o": {"i": {"content": "q" * size}}}),
+        }
+        body = payloads[shape]()
+        assert len(body) > counter.JSON_FULL_PARSE_CHARS
+        assert counter._detect_ratio(body) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_oversized_json_string_escapes_across_probe_boundary(self):
+        """The probe must never be closed mid-escape.
+
+        Shifting the payload moves the 8KB cut through every offset of an
+        escape sequence (\\n, \\\\, \\", \\uXXXX); closing the string at a
+        mid-escape position would produce invalid JSON and misclassify it.
+        """
+        import json
+
+        counter = EstimatingTokenCounter()
+        for unit in ("é", "\\", '"', "\n", "a"):
+            for pad in range(24):
+                body = json.dumps({"c": "p" * pad + unit * 4_000})
+                body += " " * max(0, counter.JSON_FULL_PARSE_CHARS + 10 - len(body))
+                assert counter._detect_ratio(body) == counter.CHARS_PER_TOKEN_JSON, (
+                    f"unit={unit!r} pad={pad}"
+                )
+
+    def test_deeply_nested_json_does_not_raise(self):
+        """json's scanner recurses per nesting level; picking a ratio must not crash.
+
+        Both the full-parse branch and the bounded probe hand text to
+        json.loads, which raises RecursionError (not ValueError) on a deeply
+        nested payload. Pre-existing gap in the except clause — a crash here
+        propagates out of count_text and onto the request path.
+        """
+        counter = EstimatingTokenCounter()
+        nested = "[" * 3_000 + "1" + "]" * 3_000
+        # Small enough for the full parse...
+        assert counter._detect_ratio(nested) > 0
+        # ...and past the cap, for the bounded probe.
+        oversized = nested + " " * (counter.JSON_FULL_PARSE_CHARS + 10)
+        assert counter._detect_ratio(oversized) > 0
+        assert counter.count_text(oversized) > 0
+
     def test_bounded_check_is_constant_time_in_payload_size(self):
         """The prefix probe must not scale with the payload."""
         import json

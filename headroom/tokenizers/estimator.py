@@ -190,12 +190,21 @@ class EstimatingTokenCounter(BaseTokenizer):
         JSON, and pricing it at the JSON ratio would over-count it by 9-25% and
         could trip compression or context-pressure gates early.
 
-        So the real parser judges a bounded prefix. The prefix is cut back to
-        the last element boundary that lies outside a string, the containers
-        still open there are closed synthetically, and the result is handed to
-        ``json.loads``. That keeps the actual JSON grammar as the arbiter — an
-        unquoted key or a single-quoted string fails exactly as it would in a
-        full parse — while the work stays O(1) against the payload.
+        So the real parser judges a bounded prefix: the probe is closed off into
+        a syntactically complete document and handed to ``json.loads``. That
+        keeps the actual JSON grammar as the arbiter — an unquoted key or a
+        single-quoted string fails exactly as it would in a full parse — while
+        the work stays O(1) against the payload.
+
+        Closing off is tried two ways, most complete first. Normally the probe
+        is closed where it ends: a string literal still open is terminated (at
+        a boundary that is not mid-escape) and the open containers are closed.
+        That is what recognizes the single-large-field shape common in wrapped
+        tool output — ``{"content": "<a megabyte of text>"}`` contains no
+        element separator at all, so a rule that needed one would reject valid
+        JSON and under-count it by ~20%. If the probe happens to end somewhere
+        unclosable (right after a comma, mid-number, mid-literal), it rewinds to
+        the last complete element instead.
 
         (Trusting the reported error position instead does not work: a prefix
         cut in the middle of a string raises "Unterminated string starting at",
@@ -210,51 +219,97 @@ class EstimatingTokenCounter(BaseTokenizer):
         the denser ratio over-counts, which is the safe direction for gating.
         """
         prefix = text[: self.JSON_PREFIX_PROBE_CHARS]
+        closers = {"{": "}", "[": "]"}
 
-        # Walk the prefix tracking string state and container nesting, so the
-        # cut point is never inside a string literal and the open containers are
-        # known. Bounded by JSON_PREFIX_PROBE_CHARS.
+        # Walk the prefix tracking string state and container nesting, so a cut
+        # point is never left inside an escape sequence and the open containers
+        # are known. Bounded by JSON_PREFIX_PROBE_CHARS.
         stack: list[str] = []
         in_string = False
         escaped = False
-        cut = -1  # index of the last element separator outside a string
+        hex_left = 0  # remaining hex digits of a \uXXXX escape
+        comma_cut = -1  # last element separator outside a string
         # Containers open *at that comma*. It must be snapshotted there: by the
         # end of the probe the stack has moved on (elements opened after the cut
         # get closed again), so slicing the final stack closes the wrong ones.
-        cut_stack: list[str] = []
+        comma_stack: list[str] = []
+        # Longest prefix length that ends on a string-literal boundary a closing
+        # quote can legally follow — i.e. not mid-backslash-escape and not
+        # part-way through a \uXXXX.
+        string_safe_len = 0
         for index, char in enumerate(prefix):
             if in_string:
-                if escaped:
+                if hex_left:
+                    hex_left -= 1
+                elif escaped:
                     escaped = False
+                    if char == "u":
+                        hex_left = 4
                 elif char == "\\":
                     escaped = True
                 elif char == '"':
                     in_string = False
+                if in_string and not escaped and not hex_left:
+                    string_safe_len = index + 1
                 continue
             if char == '"':
                 in_string = True
+                escaped = False
+                hex_left = 0
+                string_safe_len = index + 1
             elif char in "{[":
                 stack.append(char)
             elif char in "}]":
                 if stack:
                     stack.pop()
             elif char == "," and stack:
-                cut = index
-                cut_stack = stack.copy()
+                comma_cut = index
+                comma_stack = stack.copy()
 
-        if cut == -1:
-            # No complete element in the probe (one huge scalar, or a payload
-            # that never opens a container). Nothing to validate against.
-            return False
+        # Candidates, most complete first. Each is handed to the real parser, so
+        # accepting one means JSON grammar genuinely held over that region.
+        candidates = []
+        if in_string:
+            # The probe ended inside a string literal. Closing it recovers the
+            # single-large-field shape that dominates wrapped tool output —
+            # {"content": "<a megabyte of text>"} — which has no element
+            # separator anywhere in the probe. A string cannot contain
+            # structure, so the end-of-probe stack is still the right one.
+            candidates.append(
+                prefix[:string_safe_len]
+                + '"'
+                + "".join(closers[opener] for opener in reversed(stack))
+            )
+        else:
+            candidates.append(prefix + "".join(closers[opener] for opener in reversed(stack)))
+        if not in_string:
+            # The probe may have stopped where a value is still owed (after a
+            # ":" or an opening bracket). Supplying one validates everything
+            # before it rather than discarding the whole probe.
+            candidates.append(
+                prefix.rstrip()
+                + "null"
+                + "".join(closers[opener] for opener in reversed(stack))
+            )
+        if comma_cut != -1:
+            # Fallback for a probe that ends somewhere unclosable (right after a
+            # comma, mid-number, mid-literal): rewind to the last complete
+            # element instead.
+            candidates.append(
+                prefix[:comma_cut] + "".join(closers[opener] for opener in reversed(comma_stack))
+            )
 
-        # Drop the trailing comma and close whatever was still open there.
-        closers = {"{": "}", "[": "]"}
-        candidate = prefix[:cut] + "".join(closers[opener] for opener in reversed(cut_stack))
-        try:
-            json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            return False
-        return True
+        for candidate in candidates:
+            try:
+                json.loads(candidate)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                # RecursionError: json's scanner recurses per nesting level, so
+                # a deeply nested payload blows the stack rather than returning
+                # a verdict. Treat it as "not JSON" — the point is to pick a
+                # ratio, never to take down the request path.
+                continue
+            return True
+        return False
 
     def _detect_ratio(self, text: str) -> float:
         """Detect optimal chars-per-token ratio based on content.
@@ -271,7 +326,13 @@ class EstimatingTokenCounter(BaseTokenizer):
                 try:
                     json.loads(text)
                     return self.CHARS_PER_TOKEN_JSON
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    # RecursionError: json's scanner recurses per nesting level,
+                    # so a deeply nested payload blows the stack instead of
+                    # returning a verdict. Picking a ratio must never be able to
+                    # take down the request path. (Pre-existing: the exception
+                    # list here has always been narrower than json.loads can
+                    # raise.)
                     pass
             elif self._prefix_parses_as_json(text):
                 return self.CHARS_PER_TOKEN_JSON
