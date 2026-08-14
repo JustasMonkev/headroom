@@ -3974,8 +3974,11 @@ def _ensure_proxy(
         )
     isolated_run = helpers._isolation_requested()
     if no_proxy and isolated_run:
+        # Isolation is the default, so the user may not have typed --isolated;
+        # word the warning around --no-proxy's effect, not a flag name.
         click.echo(
-            "  Warning: --isolated has no effect with --no-proxy (reusing the existing proxy)."
+            "  Warning: --no-proxy reuses the existing proxy, so this isolated run "
+            "gets no dedicated proxy instance (pass --shared for fully shared state)."
         )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)

@@ -140,7 +140,9 @@ class TestEnsureProxyIsolated:
 
         output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(8787, no_proxy=True))
 
-        assert "--isolated has no effect with --no-proxy" in output
+        # Isolation is the default, so the warning must explain --no-proxy's
+        # effect without naming a flag the user may never have typed.
+        assert "gets no dedicated proxy instance" in output
 
 
 def _invoke_with_fake_tool(cli_args: list[str]) -> tuple[Any, dict[str, Any]]:
