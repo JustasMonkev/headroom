@@ -143,73 +143,95 @@ class TestEnsureProxyIsolated:
         assert "--isolated has no effect with --no-proxy" in output
 
 
+def _invoke_with_fake_tool(cli_args: list[str]) -> tuple[Any, dict[str, Any]]:
+    """Invoke `headroom wrap <cli_args>` with a temporary no-op subcommand
+    that records the workspace resolved inside the subcommand body."""
+
+    seen: dict[str, Any] = {}
+
+    @click.command("fake-tool")
+    def fake_tool() -> None:
+        seen["workspace"] = paths.workspace_dir()
+
+    wrap_mod.wrap.add_command(fake_tool)
+    try:
+        runner = CliRunner()
+        result = runner.invoke(main, cli_args)
+    finally:
+        wrap_mod.wrap.commands.pop("fake-tool", None)
+    return result, seen
+
+
 class TestWrapGroupFlag:
-    def test_isolated_flag_activates_per_run_workspace(self, tmp_path: Path) -> None:
-        """`headroom wrap --isolated <tool>` activates a fresh workspace
-        before the subcommand body runs."""
+    def test_default_is_isolated(self, tmp_path: Path) -> None:
+        """With no flag and no env override, every wrap run gets its own
+        per-run workspace — isolation is the default."""
 
-        seen: dict[str, Any] = {}
-
-        @click.command("fake-tool")
-        def fake_tool() -> None:
-            seen["workspace"] = paths.workspace_dir()
-
-        wrap_mod.wrap.add_command(fake_tool)
-        try:
-            runner = CliRunner()
-            result = runner.invoke(main, ["wrap", "--isolated", "fake-tool"])
-        finally:
-            wrap_mod.wrap.commands.pop("fake-tool", None)
+        result, seen = _invoke_with_fake_tool(["wrap", "fake-tool"])
 
         assert result.exit_code == 0, result.output
         assert "Isolated run: workspace" in result.output
         assert seen["workspace"].parent == tmp_path / "ws" / "runs"
         assert seen["workspace"].name.startswith("run-")
 
+    def test_isolated_flag_activates_per_run_workspace(self, tmp_path: Path) -> None:
+        result, seen = _invoke_with_fake_tool(["wrap", "--isolated", "fake-tool"])
+
+        assert result.exit_code == 0, result.output
+        assert "Isolated run: workspace" in result.output
+        assert seen["workspace"].parent == tmp_path / "ws" / "runs"
+
     def test_env_var_activates_isolation(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
-        seen: dict[str, Any] = {}
 
-        @click.command("fake-tool")
-        def fake_tool() -> None:
-            seen["workspace"] = paths.workspace_dir()
-
-        wrap_mod.wrap.add_command(fake_tool)
-        try:
-            runner = CliRunner()
-            result = runner.invoke(main, ["wrap", "fake-tool"])
-        finally:
-            wrap_mod.wrap.commands.pop("fake-tool", None)
+        result, seen = _invoke_with_fake_tool(["wrap", "fake-tool"])
 
         assert result.exit_code == 0, result.output
         assert seen["workspace"].parent == tmp_path / "ws" / "runs"
 
-    def test_without_flag_workspace_is_shared(self, tmp_path: Path) -> None:
-        seen: dict[str, Any] = {}
+    def test_shared_flag_opts_out(self, tmp_path: Path) -> None:
+        """`headroom wrap --shared <tool>` restores the legacy shared
+        workspace and records the choice for nested processes."""
 
-        @click.command("fake-tool")
-        def fake_tool() -> None:
-            seen["workspace"] = paths.workspace_dir()
+        result, seen = _invoke_with_fake_tool(["wrap", "--shared", "fake-tool"])
 
-        wrap_mod.wrap.add_command(fake_tool)
-        try:
-            runner = CliRunner()
-            result = runner.invoke(main, ["wrap", "fake-tool"])
-        finally:
-            wrap_mod.wrap.commands.pop("fake-tool", None)
+        assert result.exit_code == 0, result.output
+        assert "Isolated run" not in result.output
+        assert seen["workspace"] == tmp_path / "ws"
+        # The explicit opt-out is recorded so _ensure_proxy and nested
+        # Headroom invocations don't re-default to isolated.
+        assert os.environ.get(isolation.HEADROOM_ISOLATED_ENV) == "0"
+
+    def test_env_var_zero_opts_out(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "0")
+
+        result, seen = _invoke_with_fake_tool(["wrap", "fake-tool"])
 
         assert result.exit_code == 0, result.output
         assert seen["workspace"] == tmp_path / "ws"
 
-    def test_misplaced_isolated_flag_is_rejected(self) -> None:
-        """`headroom wrap claude --isolated` must fail loudly instead of
-        forwarding --isolated to the wrapped CLI (ignore_unknown_options)."""
+    def test_selfheal_is_exempt_from_isolation(self, tmp_path: Path) -> None:
+        """The SessionStart-hook selfheal subcommand must not create a
+        per-run workspace on every Claude session start."""
 
         runner = CliRunner()
-        result = runner.invoke(main, ["wrap", "claude", "--isolated"])
+        result = runner.invoke(main, ["wrap", "selfheal"])
+
+        assert result.exit_code == 0, result.output
+        assert "Isolated run" not in result.output
+        assert not (tmp_path / "ws" / "runs").exists()
+
+    @pytest.mark.parametrize("flag", ["--isolated", "--shared"])
+    def test_misplaced_group_flag_is_rejected(self, flag: str) -> None:
+        """`headroom wrap claude --isolated/--shared` must fail loudly
+        instead of forwarding the flag to the wrapped CLI
+        (ignore_unknown_options)."""
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["wrap", "claude", flag])
 
         assert result.exit_code != 0
         assert "goes before the tool name" in result.output
-        assert "headroom wrap --isolated claude" in result.output
+        assert f"headroom wrap {flag} claude" in result.output

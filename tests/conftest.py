@@ -28,6 +28,14 @@ def _scrub_developer_headroom_env(monkeypatch):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # `headroom wrap` defaults to per-run isolation (headroom/isolation.py):
+    # the group callback would redirect HEADROOM_WORKSPACE_DIR to a fresh
+    # runs/run-* dir on every CliRunner invocation and start dedicated
+    # proxies on shifted ports, invalidating the shared-mode semantics the
+    # wrap suites pin. Run tests in shared mode by default; the
+    # isolation-default behavior itself is covered by
+    # tests/test_cli/test_wrap_isolated.py, which removes this override.
+    monkeypatch.setenv("HEADROOM_ISOLATED", "0")
 
 
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that

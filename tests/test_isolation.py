@@ -56,6 +56,60 @@ class TestIsolationRequested:
         assert isolation.isolation_requested() is False
 
 
+def _make_stale(path: Path) -> None:
+    stale = 1_000_000_000.0  # 2001 — far past any GC cutoff
+    os.utime(path, (stale, stale))
+
+
+class TestPruneStaleRuns:
+    def test_removes_only_stale_run_dirs(self, tmp_path: Path) -> None:
+        runs = tmp_path / "ws" / "runs"
+        old = runs / "run-old"
+        old.mkdir(parents=True)
+        fresh = runs / "run-fresh"
+        fresh.mkdir()
+        unrelated = runs / "keep-me"
+        unrelated.mkdir()
+        _make_stale(old)
+        _make_stale(unrelated)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not old.exists()
+        assert fresh.exists()
+        # Only run-* dirs are eligible; anything else is never touched.
+        assert unrelated.exists()
+
+    def test_recent_child_activity_protects_stale_dir_mtime(self, tmp_path: Path) -> None:
+        """A long-lived run whose root dir mtime is old but whose memory.db
+        was written recently must survive GC (file writes don't bump the
+        parent dir's mtime)."""
+
+        runs = tmp_path / "ws" / "runs"
+        live = runs / "run-live"
+        live.mkdir(parents=True)
+        (live / "memory.db").write_text("x")
+        _make_stale(live)  # dir mtime stale, child mtime fresh
+
+        isolation.prune_stale_runs(runs)
+
+        assert live.exists()
+
+    def test_missing_runs_root_is_a_noop(self, tmp_path: Path) -> None:
+        isolation.prune_stale_runs(tmp_path / "does-not-exist")
+
+    def test_activation_garbage_collects_stale_runs(self, tmp_path: Path) -> None:
+        runs = tmp_path / "ws" / "runs"
+        old = runs / "run-old"
+        old.mkdir(parents=True)
+        _make_stale(old)
+
+        run_dir = isolation.activate_isolated_workspace()
+
+        assert not old.exists()
+        assert run_dir.exists()
+
+
 class TestActivateIsolatedWorkspace:
     def test_creates_unique_run_dir_under_runs(self, tmp_path: Path) -> None:
         run_dir = isolation.activate_isolated_workspace()

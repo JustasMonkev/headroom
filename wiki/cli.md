@@ -730,24 +730,26 @@ Wrap external coding tools so their traffic flows through Headroom.
 - `-v`, `--verbose` means **verbose output**
 - Hidden `--prepare-only` exists for internal Docker-native bridge flows and is intentionally omitted from normal usage
 
-### Concurrent runs and `--isolated`
+### Concurrent runs: isolated by default, `--shared` to opt out
 
-By default, concurrent `headroom wrap` runs **share state**: the second run
-reuses the proxy already listening on the shared port, and every run reads
-and writes the same workspace (`~/.headroom` — savings ledger, memory DB,
-TOIN telemetry, logs). That sharing is deliberate (cross-agent memory,
-combined savings), but it means two coding agents launched side by side are
-not independent.
+`headroom wrap` runs in **isolated mode by default**: every run is fully
+independent, so two coding agents launched side by side never share a proxy
+or state. `headroom wrap --shared <tool>` (a **group-level** flag — it goes
+before the tool name; also honored as `HEADROOM_ISOLATED=0`) restores the
+legacy behavior: the run reuses the proxy already listening on the shared
+port, and reads/writes the shared workspace (`~/.headroom` — savings
+ledger, memory DB, TOIN telemetry, logs). Shared mode is what enables
+cross-agent memory and combined savings; `--isolated` exists as the
+explicit spelling of the default.
 
-`headroom wrap --isolated <tool>` (a **group-level** flag — it goes before
-the tool name; also honored as `HEADROOM_ISOLATED=1`) makes the current run
-independent:
+In isolated mode, each run gets:
 
-- a fresh per-run workspace is created under
+- a fresh per-run workspace created under
   `~/.headroom/runs/run-<timestamp>-<pid>-<rand>` and exported as
   `HEADROOM_WORKSPACE_DIR`, so the proxy, the wrapped agent, and any MCP
-  children it spawns all inherit it;
-- a dedicated proxy instance is started on the first free port **above**
+  children it spawns all inherit it (run dirs idle for more than 7 days are
+  garbage-collected on the next launch);
+- a dedicated proxy instance started on the first free port **above**
   `--port` — an already-running proxy is never reused, and the base port is
   left reserved for the shared proxy;
 - the read-mostly config root stays shared (pinned via
@@ -756,17 +758,24 @@ independent:
 
 ```bash
 # Terminal 1 and 2 — fully independent proxies, savings, memory, logs:
-headroom wrap --isolated claude
-headroom wrap --isolated codex
+headroom wrap claude
+headroom wrap codex
+
+# Legacy behavior: one proxy, one workspace, cross-agent memory:
+headroom wrap --shared claude
+headroom wrap --shared codex
 ```
 
-Trade-offs: isolation severs cross-agent memory for the run (each isolated
-run has its own `memory.db`), per-run savings are not merged into the
-shared ledger, and the isolated proxy shuts down with the run. Agent-level
-config that Headroom writes into the wrapped tool's own settings (e.g. the
-MCP retrieve-tool registration, which bakes in a proxy URL) is still a
-shared, last-writer-wins file — already-running sessions keep the
-registration they started with.
+Trade-offs of the isolated default: it severs cross-agent memory for the
+run (each isolated run has its own `memory.db`), per-run savings are not
+merged into the shared ledger, the isolated proxy shuts down with the run,
+and a persistent deployment listening on the shared port is only picked up
+by `--shared` runs. Agent-level config that Headroom writes into the
+wrapped tool's own settings (e.g. the MCP retrieve-tool registration, which
+bakes in a proxy URL) is still a shared, last-writer-wins file —
+already-running sessions keep the registration they started with. The
+hidden `wrap selfheal` maintenance subcommand is exempt from isolation (it
+runs from a SessionStart hook and must not create run dirs).
 
 ### `headroom wrap claude`
 

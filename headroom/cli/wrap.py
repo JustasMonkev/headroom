@@ -73,7 +73,14 @@ from headroom.isolation import (
     activate_isolated_workspace as _activate_isolated_workspace,
 )
 from headroom.isolation import (
-    isolation_requested as _isolation_requested,
+    disable_isolation as _disable_isolation,
+)
+
+# Referenced as `helpers._isolation_requested()` (via _live_wrap_module) so
+# tests can monkeypatch it on this module; the alias below keeps the name a
+# real module attribute even though no call site references it statically.
+from headroom.isolation import (
+    isolation_requested as _isolation_requested,  # noqa: F401
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
@@ -4495,18 +4502,19 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
 
 
 def _reject_misplaced_isolated_flag(args: tuple, tool: str) -> None:
-    """Fail loudly when ``--isolated`` lands after the tool name.
+    """Fail loudly when ``--isolated``/``--shared`` lands after the tool name.
 
-    ``--isolated`` is a group-level flag. The wrap subcommands run with
-    ``ignore_unknown_options``, so a trailing ``--isolated`` would be
-    silently forwarded to the wrapped CLI instead of isolating the run.
+    They are group-level flags. The wrap subcommands run with
+    ``ignore_unknown_options``, so a trailing occurrence would be silently
+    forwarded to the wrapped CLI instead of steering isolation.
     """
 
-    if "--isolated" in args:
-        raise click.UsageError(
-            "--isolated is a `wrap` group flag and goes before the tool name: "
-            f"headroom wrap --isolated {tool} ..."
-        )
+    for flag in ("--isolated", "--shared"):
+        if flag in args:
+            raise click.UsageError(
+                f"{flag} is a `wrap` group flag and goes before the tool name: "
+                f"headroom wrap {flag} {tool} ..."
+            )
 
 
 def _launch_tool(
@@ -4791,19 +4799,30 @@ def _copy_openclaw_plugin_into_extensions(
     return target_dir
 
 
+# Utility subcommands that must not spin up a per-run workspace: selfheal is
+# fired by a SessionStart hook on every Claude session and only repairs a
+# stale base_url in Claude's own settings — creating (and GC-scanning) a run
+# dir for it would be pure churn.
+_WRAP_ISOLATION_EXEMPT_SUBCOMMANDS = frozenset({"selfheal"})
+
+
 @main.group()
 @click.option(
-    "--isolated",
-    is_flag=True,
+    "--isolated/--shared",
+    "isolated",
+    default=True,
     envvar="HEADROOM_ISOLATED",
     help=(
-        "Give this run its own workspace and a dedicated proxy instance so "
-        "concurrent runs don't share state (savings, memory DB, logs, proxy). "
-        "Also honored as HEADROOM_ISOLATED=1. Note: this severs cross-agent "
-        "memory for the run by design."
+        "Isolated (the default) gives this run its own workspace and a "
+        "dedicated proxy instance so concurrent runs don't share state "
+        "(savings, memory DB, logs, proxy) — this severs cross-agent memory "
+        "for the run by design. --shared restores the legacy behavior: one "
+        "proxy on the shared port and one ~/.headroom workspace for every "
+        "run. Also honored as HEADROOM_ISOLATED=1/0."
     ),
 )
-def wrap(isolated: bool) -> None:
+@click.pass_context
+def wrap(ctx: click.Context, isolated: bool) -> None:
     """Wrap CLI tools to run through Headroom.
 
     \b
@@ -4811,9 +4830,10 @@ def wrap(isolated: bool) -> None:
     the target tool so all API calls route through Headroom automatically.
 
     \b
-    Concurrent runs share one proxy and one workspace (~/.headroom) by
-    default. Use `headroom wrap --isolated <tool>` (flag goes before the
-    tool name) to give each run its own workspace and proxy instead.
+    Each run is isolated by default: its own workspace and its own proxy,
+    so concurrent runs are fully independent. Use `headroom wrap --shared
+    <tool>` (flag goes before the tool name) to share one proxy and one
+    ~/.headroom workspace across runs (cross-agent memory, merged savings).
 
     \b
     Supported tools (one Click subcommand per tool):
@@ -4850,9 +4870,15 @@ def wrap(isolated: bool) -> None:
     # paths.py re-reads the environment on every call, and every child we
     # spawn (proxy, wrapped agent, its MCP servers) inherits os.environ, so
     # a single env override here isolates the whole process tree.
-    if isolated or _isolation_requested():
+    if ctx.invoked_subcommand in _WRAP_ISOLATION_EXEMPT_SUBCOMMANDS:
+        return
+    if isolated:
         run_dir = _activate_isolated_workspace()
         click.echo(f"  Isolated run: workspace {run_dir}")
+    else:
+        # Record the explicit --shared choice so _ensure_proxy and nested
+        # Headroom invocations don't re-default to isolated.
+        _disable_isolation()
 
 
 @main.group()
