@@ -41,6 +41,13 @@ from pathlib import Path
 
 HEADROOM_CONFIG_DIR_ENV = "HEADROOM_CONFIG_DIR"
 HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR"
+# The persistent, never-isolated workspace root. Per-run isolation
+# (headroom/isolation.py) relocates HEADROOM_WORKSPACE_DIR to an ephemeral
+# run directory but pins this to the real ~/.headroom so that resources which
+# must survive across runs — managed binaries, Copilot auth, the MCP
+# ownership ledger, the license cache — never land in a throwaway run dir.
+# Unset in the common case, where it is identical to the workspace root.
+HEADROOM_SHARED_WORKSPACE_DIR_ENV = "HEADROOM_SHARED_WORKSPACE_DIR"
 
 # ---------------------------------------------------------------------------
 # Legacy per-resource env vars (kept for backward compatibility)
@@ -181,10 +188,42 @@ def config_dir() -> Path:
     return Path.home() / _WORKSPACE_DIR_DEFAULT / _CONFIG_DIR_DEFAULT_SUFFIX
 
 
+def shared_workspace_dir() -> Path:
+    """Return the persistent (never-isolated) workspace root.
+
+    Resolution order:
+
+    1. ``$HEADROOM_SHARED_WORKSPACE_DIR`` (trimmed, tilde-expanded) if set.
+       Per-run isolation pins this to the pre-isolation workspace so
+       cross-run resources keep resolving there after the workspace root is
+       relocated to an ephemeral run directory.
+    2. :func:`workspace_dir` otherwise — in the common (non-isolated) case
+       the shared root *is* the workspace root, so behavior is unchanged.
+
+    Use this for state that must persist across runs and be visible to every
+    concurrent session (managed ``rtk``/``lean-ctx`` binaries, Copilot auth,
+    the MCP install ledger, the cached license). Use :func:`workspace_dir`
+    for genuinely run-specific state (savings, telemetry, logs, memory).
+    """
+
+    env_value = _env(HEADROOM_SHARED_WORKSPACE_DIR_ENV)
+    if env_value:
+        return Path(env_value).expanduser()
+    return workspace_dir()
+
+
 def ensure_workspace_dir() -> Path:
     """Return :func:`workspace_dir`, creating it if it does not yet exist."""
 
     path = workspace_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def ensure_shared_workspace_dir() -> Path:
+    """Return :func:`shared_workspace_dir`, creating it if it does not exist."""
+
+    path = shared_workspace_dir()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -260,9 +299,14 @@ def native_memory_dir() -> Path:
 
 
 def license_cache_path() -> Path:
-    """Return the path for the cached license envelope."""
+    """Return the path for the cached license envelope.
 
-    return workspace_dir() / _LICENSE_CACHE_FILE
+    Machine-scoped and persistent, so it resolves against the shared
+    workspace: an isolated run must reuse the cached license rather than
+    re-fetch one into a throwaway directory.
+    """
+
+    return shared_workspace_dir() / _LICENSE_CACHE_FILE
 
 
 def session_stats_path() -> Path:
@@ -323,9 +367,16 @@ def codex_wire_debug_dir() -> Path:
 
 
 def bin_dir() -> Path:
-    """Return the directory where Headroom ships vendored binaries."""
+    """Return the directory where Headroom ships vendored binaries.
 
-    return workspace_dir() / _BIN_DIR
+    Managed ``rtk``/``lean-ctx`` downloads are large and cross-run, so they
+    resolve against the shared workspace: an isolated run reuses the already
+    downloaded binary instead of fetching another copy into an ephemeral run
+    directory that garbage collection would later delete out from under a
+    globally installed agent hook.
+    """
+
+    return shared_workspace_dir() / _BIN_DIR
 
 
 def proxy_clients_dir(port: int) -> Path:
@@ -429,8 +480,10 @@ __all__ = [
     "process_is_stateless",
     "config_dir",
     "workspace_dir",
+    "shared_workspace_dir",
     "ensure_config_dir",
     "ensure_workspace_dir",
+    "ensure_shared_workspace_dir",
     "savings_path",
     "toin_path",
     "subscription_state_path",

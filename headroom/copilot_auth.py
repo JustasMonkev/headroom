@@ -138,12 +138,19 @@ def _github_host() -> str:
 
 
 def headroom_copilot_auth_path() -> Path:
-    """Return the path where Headroom stores its Copilot OAuth token."""
+    """Return the path where Headroom stores its Copilot OAuth token.
+
+    Resolves against the shared workspace so a credential saved by
+    ``headroom copilot-auth login`` stays reachable from a default-isolated
+    ``wrap copilot --subscription`` run; otherwise isolation would redirect
+    the lookup into an empty per-run directory and tell an already
+    authenticated user to log in again.
+    """
 
     override = os.environ.get("HEADROOM_COPILOT_AUTH_FILE", "").strip()
     if override:
         return Path(override).expanduser()
-    return paths.workspace_dir() / "copilot_auth.json"
+    return paths.shared_workspace_dir() / "copilot_auth.json"
 
 
 def normalize_copilot_enterprise_url(enterprise_url: str) -> str:

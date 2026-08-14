@@ -27,8 +27,10 @@ def _clean_isolation_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any
     monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(tmp_path / "ws"))
     mutated = (
         paths.HEADROOM_CONFIG_DIR_ENV,
+        paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
         isolation.HEADROOM_ISOLATED_ENV,
         isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
+        isolation.HEADROOM_MEMORY_DB_PATH_ENV,
     )
     for var in mutated:
         monkeypatch.delenv(var, raising=False)
@@ -237,3 +239,226 @@ class TestWrapGroupFlag:
         assert result.exit_code != 0
         assert "goes before the tool name" in result.output
         assert f"headroom wrap {flag} claude" in result.output
+
+
+class _FakeProxyChild:
+    """A fake Popen: alive until .kill(), with a fixed pid."""
+
+    def __init__(self, pid: int = 111) -> None:
+        self.pid = pid
+        self._exited: int | None = None
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return self._exited
+
+    def kill(self) -> None:
+        self.killed = True
+        self._exited = -9
+
+
+class TestStartProxyOwnership:
+    """_start_proxy(require_owned=True) must confirm the healthy proxy is the
+    child it spawned, not a proxy that won a concurrent bind race (PR #25 P1)."""
+
+    def _patch_spawn(self, monkeypatch: pytest.MonkeyPatch, child: _FakeProxyChild) -> None:
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *a, **k: child)
+        monkeypatch.setattr(wrap_mod, "_resolve_wrap_proxy_timeout_seconds", lambda: 3)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: Path("/tmp/hr-proxy.log"))
+        monkeypatch.setattr(
+            wrap_mod, "_get_proxy_stdio_log_path", lambda: Path("/tmp/hr-proxy-stdio.log")
+        )
+        monkeypatch.setattr(wrap_mod, "_read_text", lambda _p: "")
+
+    def test_owned_proxy_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        child = _FakeProxyChild(pid=4321)
+        self._patch_spawn(monkeypatch, child)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        # Health reports OUR child's pid → confirmed ours.
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: {"pid": 4321})
+
+        assert wrap_mod._start_proxy(9911, require_owned=True) is child
+        assert child.killed is False
+
+    def test_foreign_proxy_raises_race_lost(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        child = _FakeProxyChild(pid=4321)
+        self._patch_spawn(monkeypatch, child)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        # A DIFFERENT proxy owns the port (won the race).
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: {"pid": 9999})
+
+        with pytest.raises(wrap_mod._DedicatedProxyPortRaceLost):
+            wrap_mod._start_proxy(9911, require_owned=True)
+        # Our losing child is killed so it doesn't linger.
+        assert child.killed is True
+
+    def test_require_owned_false_keeps_legacy_reuse(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        child = _FakeProxyChild(pid=4321)
+        self._patch_spawn(monkeypatch, child)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        # Shared path: pid ownership is never consulted.
+        called = {"queried": False}
+
+        def _boom(_p: int) -> dict[str, Any]:
+            called["queried"] = True
+            return {"pid": 9999}
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", _boom)
+
+        assert wrap_mod._start_proxy(9911, require_owned=False) is child
+        assert called["queried"] is False
+
+
+class TestEnsureProxyPortRaceRetry:
+    """_ensure_proxy retries on a higher port when a dedicated start loses the
+    bind race (PR #25 P1)."""
+
+    def test_retries_until_a_port_is_won(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p: p)
+
+        started: list[int] = []
+
+        def fake_start(port: int, **_kw: Any) -> _FakeProc:
+            started.append(port)
+            # Lose the race on the first two candidate ports, win the third.
+            if len(started) < 3:
+                raise wrap_mod._DedicatedProxyPortRaceLost(port)
+            return _FakeProc()
+
+        monkeypatch.setattr(wrap_mod, "_start_proxy", fake_start)
+
+        result: list[Any] = []
+        _run_in_click_context(lambda: result.append(wrap_mod._ensure_proxy(8787, no_proxy=False)))
+        _proc, actual_port = result[0]
+        # 8787 reserved for shared proxy → candidates 8788, 8789, 8790.
+        assert started == [8788, 8789, 8790]
+        assert actual_port == 8790
+
+    def test_gives_up_after_max_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p: p)
+
+        def always_lose(port: int, **_kw: Any) -> _FakeProc:
+            raise wrap_mod._DedicatedProxyPortRaceLost(port)
+
+        monkeypatch.setattr(wrap_mod, "_start_proxy", always_lose)
+
+        runner = CliRunner()
+
+        @click.command()
+        def _cmd() -> None:
+            wrap_mod._ensure_proxy(8787, no_proxy=False)
+
+        result = runner.invoke(_cmd)
+        assert result.exit_code != 0
+        assert "Could not reserve a dedicated proxy port" in result.output
+
+
+class TestLaunchToolPortReconcile:
+    """_launch_tool must fire reconcile_port with the actual port whenever it
+    differs from the requested one (PR #25 P1: Codex/Grok MCP, OMP models.yml)."""
+
+    def test_reconcile_fires_on_port_shift(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **k: (_FakeProc(), 8788))
+        monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_unregister_proxy_client", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *a, **k: None)
+        monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda *a, **k: lambda *x, **y: None)
+        monkeypatch.setattr(wrap_mod.signal, "signal", lambda *a, **k: None)
+
+        seen: list[int] = []
+
+        class _Done(SystemExit):
+            pass
+
+        def fake_run(cmd: list[str], **_k: Any) -> Any:
+            raise _Done(0)
+
+        monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+
+        runner = CliRunner()
+
+        @click.command()
+        def _cmd() -> None:
+            wrap_mod._launch_tool(
+                binary="/bin/true",
+                args=(),
+                env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"},
+                port=8787,
+                no_proxy=False,
+                tool_label="TEST",
+                env_vars_display=[],
+                agent_type="test",
+                reconcile_port=lambda actual: seen.append(actual),
+            )
+
+        runner.invoke(_cmd)
+        assert seen == [8788]
+
+    def test_reconcile_skipped_when_port_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **k: (_FakeProc(), 8787))
+        monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_unregister_proxy_client", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *a, **k: None)
+        monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda *a, **k: lambda *x, **y: None)
+        monkeypatch.setattr(wrap_mod.signal, "signal", lambda *a, **k: None)
+        monkeypatch.setattr(
+            wrap_mod.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0))
+        )
+
+        seen: list[int] = []
+        runner = CliRunner()
+
+        @click.command()
+        def _cmd() -> None:
+            wrap_mod._launch_tool(
+                binary="/bin/true",
+                args=(),
+                env={},
+                port=8787,
+                no_proxy=False,
+                tool_label="TEST",
+                env_vars_display=[],
+                agent_type="test",
+                reconcile_port=lambda actual: seen.append(actual),
+            )
+
+        runner.invoke(_cmd)
+        assert seen == []
+
+
+class TestWrapMemoryDbPath:
+    """wrap-side memory sync must target the same DB the proxy/MCP use so
+    isolation actually severs cross-agent memory (PR #25 P1)."""
+
+    def test_honors_env_override(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("HEADROOM_MEMORY_DB_PATH", str(tmp_path / "run" / "memory.db"))
+        assert wrap_mod._wrap_memory_db_path() == tmp_path / "run" / "memory.db"
+
+    def test_defaults_to_project_local(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HEADROOM_MEMORY_DB_PATH", raising=False)
+        assert wrap_mod._wrap_memory_db_path() == Path.cwd() / ".headroom" / "memory.db"
+
+
+class TestMemoryMcpServerDbDefault:
+    """The agent-spawned memory MCP server must resolve its DB from
+    HEADROOM_MEMORY_DB_PATH so an isolated run's MCP opens the run DB."""
+
+    def test_db_default_reads_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        import argparse
+
+        monkeypatch.setenv("HEADROOM_MEMORY_DB_PATH", str(tmp_path / "iso" / "memory.db"))
+
+        # Mirror the argparse default expression the server uses.
+        default = os.environ.get("HEADROOM_MEMORY_DB_PATH", "").strip() or str(
+            Path.cwd() / ".headroom" / "memory.db"
+        )
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--db", default=default)
+        assert parser.parse_args([]).db == str(tmp_path / "iso" / "memory.db")

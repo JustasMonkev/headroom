@@ -401,8 +401,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Headroom Memory MCP Server")
     parser.add_argument(
         "--db",
-        default=str(Path.cwd() / ".headroom" / "memory.db"),
-        help="Path to memory SQLite database",
+        # Honor HEADROOM_MEMORY_DB_PATH (the same override the proxy reads) so a
+        # memory MCP server spawned by an isolated `headroom wrap` run opens that
+        # run's per-run database instead of the project-local default that every
+        # concurrent run in the directory would otherwise share.
+        default=(
+            os.environ.get("HEADROOM_MEMORY_DB_PATH", "").strip()
+            or str(Path.cwd() / ".headroom" / "memory.db")
+        ),
+        help="Path to memory SQLite database (default: $HEADROOM_MEMORY_DB_PATH or ./.headroom/memory.db)",
     )
     parser.add_argument(
         "--user",

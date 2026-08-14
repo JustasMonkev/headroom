@@ -747,14 +747,23 @@ In isolated mode, each run gets:
 - a fresh per-run workspace created under
   `~/.headroom/runs/run-<timestamp>-<pid>-<rand>` and exported as
   `HEADROOM_WORKSPACE_DIR`, so the proxy, the wrapped agent, and any MCP
-  children it spawns all inherit it (run dirs idle for more than 7 days are
-  garbage-collected on the next launch);
+  children it spawns all inherit it. This carries the run-specific state:
+  savings, TOIN telemetry, logs, and — via a per-run `HEADROOM_MEMORY_DB_PATH`
+  — its own `memory.db`, so `--memory` truly isolates even for two runs in
+  the same project. Run dirs are garbage-collected on a later launch once
+  they are both older than 7 days **and** their creating process has exited
+  (a paused long-running session is never pruned out from under itself);
 - a dedicated proxy instance started on the first free port **above**
-  `--port` — an already-running proxy is never reused, and the base port is
-  left reserved for the shared proxy;
-- the read-mostly config root stays shared (pinned via
-  `HEADROOM_CONFIG_DIR` before the workspace override), so model catalogs
-  and plugin settings still come from your real configuration.
+  `--port`. An already-running proxy is never reused, the base port is left
+  reserved for the shared proxy, and the launcher confirms it actually owns
+  the port it bound (retrying higher if a concurrent isolated launch wins
+  the race), so a run never silently routes through another run's proxy;
+- **persistent, cross-run state stays shared** (pinned to the real
+  `~/.headroom` via `HEADROOM_SHARED_WORKSPACE_DIR`): the read-mostly config
+  root, managed `rtk`/`lean-ctx` binaries, the cached license, Copilot auth
+  saved by `headroom copilot-auth login`, and the MCP install ledger used by
+  `headroom unwrap`. These would be wrong to duplicate into a throwaway run
+  dir, so isolation deliberately keeps them on the shared root.
 
 ```bash
 # Terminal 1 and 2 — fully independent proxies, savings, memory, logs:
@@ -766,16 +775,18 @@ headroom wrap --shared claude
 headroom wrap --shared codex
 ```
 
+For a tool that records the proxy port in its own on-disk config (Codex and
+Grok register the `headroom` retrieve MCP server; OMP writes `models.yml`),
+the dedicated port is reapplied after the proxy binds, so retrieval and
+inference target the run's actual proxy rather than the reserved base port.
+
 Trade-offs of the isolated default: it severs cross-agent memory for the
 run (each isolated run has its own `memory.db`), per-run savings are not
 merged into the shared ledger, the isolated proxy shuts down with the run,
 and a persistent deployment listening on the shared port is only picked up
-by `--shared` runs. Agent-level config that Headroom writes into the
-wrapped tool's own settings (e.g. the MCP retrieve-tool registration, which
-bakes in a proxy URL) is still a shared, last-writer-wins file —
-already-running sessions keep the registration they started with. The
-hidden `wrap selfheal` maintenance subcommand is exempt from isolation (it
-runs from a SessionStart hook and must not create run dirs).
+by `--shared` runs. The hidden `wrap selfheal` maintenance subcommand is
+exempt from isolation (it runs from a SessionStart hook and must not create
+run dirs).
 
 ### `headroom wrap claude`
 

@@ -22,8 +22,16 @@ _LEDGER_FILE = "mcp_installs.json"
 
 
 def ledger_path() -> Path:
-    """Return the Headroom MCP install ledger path."""
-    return paths.workspace_dir() / _LEDGER_FILE
+    """Return the Headroom MCP install ledger path.
+
+    The ledger records MCP servers Headroom installed into the user's global
+    agent config, which is persistent and shared. It therefore resolves
+    against the shared workspace, not a per-run isolated workspace: otherwise
+    an isolated wrap would write ownership records into a throwaway directory,
+    and a later ``headroom unwrap`` (reading the shared ledger) could not
+    prove ownership and would leave Headroom-installed entries behind.
+    """
+    return paths.shared_workspace_dir() / _LEDGER_FILE
 
 
 def spec_fingerprint(spec: ServerSpec) -> str:

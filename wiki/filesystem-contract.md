@@ -11,8 +11,17 @@ they behave inside Docker containers.
 |---|---|---|---|
 | `HEADROOM_CONFIG_DIR` | `~/.headroom/config` | User/admin-authored configuration (model catalogs, plugin settings, etc.) | Read-mostly |
 | `HEADROOM_WORKSPACE_DIR` | `~/.headroom` | Runtime state written by the proxy and CLI (savings, logs, memory DB, telemetry, caches) | Read-write |
+| `HEADROOM_SHARED_WORKSPACE_DIR` | `= HEADROOM_WORKSPACE_DIR` | Persistent, cross-run state that must never land in a throwaway per-run workspace (managed binaries, Copilot auth, MCP install ledger, license cache) | Read-write |
 
-Both variables are recognized by the Python proxy / CLI and the npm SDK.
+`HEADROOM_SHARED_WORKSPACE_DIR` is normally **unset and identical to
+`HEADROOM_WORKSPACE_DIR`**. Per-run isolation (`headroom wrap`, isolated by
+default) relocates `HEADROOM_WORKSPACE_DIR` to
+`~/.headroom/runs/run-<...>` and pins `HEADROOM_SHARED_WORKSPACE_DIR` to the
+original `~/.headroom`, so a handful of persistent resources keep resolving
+there while run-specific state moves into the run directory. See
+[cli.md](cli.md) for the isolation model.
+
+All three variables are recognized by the Python proxy / CLI and the npm SDK.
 They are **additive** — every pre-existing per-resource env var
 (`HEADROOM_SAVINGS_PATH`, `HEADROOM_TOIN_PATH`,
 `HEADROOM_SUBSCRIPTION_STATE_PATH`, `HEADROOM_MODEL_LIMITS`, ...)
@@ -52,17 +61,28 @@ Examples:
 | Proxy savings ledger | `${WORKSPACE_DIR}/proxy_savings.json` | `HEADROOM_SAVINGS_PATH` |
 | TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.json` | `HEADROOM_TOIN_PATH` |
 | Subscription tracker state | `${WORKSPACE_DIR}/subscription_state.json` | `HEADROOM_SUBSCRIPTION_STATE_PATH` |
-| Memory SQLite | `${WORKSPACE_DIR}/memory.db` | CLI `--memory-db-path` |
+| Memory SQLite | `${WORKSPACE_DIR}/memory.db` | CLI `--memory-db-path`, env `HEADROOM_MEMORY_DB_PATH` |
 | Native memory directory | `${WORKSPACE_DIR}/memories/` | `MemoryConfig.native_memory_dir` |
-| License cache | `${WORKSPACE_DIR}/license_cache.json` | — |
 | Session stats JSONL | `${WORKSPACE_DIR}/session_stats.jsonl` | — |
 | Memory sync state | `${WORKSPACE_DIR}/sync_state.json` | — |
 | Memory bridge state | `${WORKSPACE_DIR}/bridge_state.json` | — |
 | Proxy log directory | `${WORKSPACE_DIR}/logs/` | — |
 | HTTP 400 debug dumps | `${WORKSPACE_DIR}/logs/debug_400/` | — |
-| Vendored `rtk` binary | `${WORKSPACE_DIR}/bin/rtk[.exe]` | — |
 | Deployment profiles | `${WORKSPACE_DIR}/deploy/` | — |
 | Beacon lock file | `${WORKSPACE_DIR}/.beacon_lock_<port>` | — |
+
+### Shared-workspace bucket (`HEADROOM_SHARED_WORKSPACE_DIR`)
+
+Persistent, cross-run resources. Identical to the workspace bucket unless a
+per-run isolated `headroom wrap` is active, in which case these stay on the
+real `~/.headroom` while the workspace bucket above moves into the run dir.
+
+| Resource | Default path | Legacy env var |
+|---|---|---|
+| Vendored `rtk` / `lean-ctx` binaries | `${SHARED_WORKSPACE_DIR}/bin/` | — |
+| License cache | `${SHARED_WORKSPACE_DIR}/license_cache.json` | — |
+| Copilot OAuth token | `${SHARED_WORKSPACE_DIR}/copilot_auth.json` | `HEADROOM_COPILOT_AUTH_FILE` |
+| MCP install ledger | `${SHARED_WORKSPACE_DIR}/mcp_installs.json` | — |
 
 ### Config bucket (`HEADROOM_CONFIG_DIR`)
 

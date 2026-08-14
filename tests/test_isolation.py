@@ -17,8 +17,10 @@ from headroom import isolation, paths
 
 _MUTATED_VARS = (
     paths.HEADROOM_CONFIG_DIR_ENV,
+    paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
     isolation.HEADROOM_ISOLATED_ENV,
     isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
+    isolation.HEADROOM_MEMORY_DB_PATH_ENV,
 )
 
 
@@ -167,3 +169,168 @@ class TestActivateIsolatedWorkspace:
 
         assert first != second
         assert first.parent == second.parent
+
+
+class TestSharedWorkspacePinning:
+    """Persistent, cross-run resources must resolve against the pre-isolation
+    workspace, not the ephemeral per-run directory (PR #25 review, P1/P2)."""
+
+    def test_activation_records_shared_root(self, tmp_path: Path) -> None:
+        pre = paths.workspace_dir()
+        run_dir = isolation.activate_isolated_workspace()
+
+        assert run_dir != pre
+        assert paths.workspace_dir() == run_dir
+        # Shared root pinned to the pre-isolation workspace.
+        assert os.environ[paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV] == str(pre)
+        assert paths.shared_workspace_dir() == pre
+
+    def test_managed_binaries_stay_on_shared_root(self, tmp_path: Path) -> None:
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        # rtk/lean-ctx binary dir must not move into the run dir.
+        assert paths.bin_dir() == pre / "bin"
+        assert paths.rtk_path().parent == pre / "bin"
+        assert paths.license_cache_path() == pre / "license_cache.json"
+
+    def test_copilot_auth_stays_on_shared_root(self, tmp_path: Path) -> None:
+        from headroom.copilot_auth import headroom_copilot_auth_path
+
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        assert headroom_copilot_auth_path() == pre / "copilot_auth.json"
+
+    def test_mcp_ledger_stays_on_shared_root(self, tmp_path: Path) -> None:
+        from headroom.mcp_registry.ledger import ledger_path
+
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        assert ledger_path() == pre / "mcp_installs.json"
+
+    def test_shared_root_falls_back_when_unset(self, tmp_path: Path) -> None:
+        # No isolation active: shared root IS the workspace root.
+        assert paths.shared_workspace_dir() == paths.workspace_dir()
+
+
+class TestMemoryIsolation:
+    def test_activation_pins_memory_db_into_run_dir(self, tmp_path: Path) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(run_dir / "memory.db")
+
+    def test_user_memory_db_override_is_respected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, str(tmp_path / "mine.db"))
+
+        isolation.activate_isolated_workspace()
+
+        # setdefault: user's explicit DB path must win.
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(tmp_path / "mine.db")
+
+    def test_two_runs_get_distinct_memory_dbs(self, tmp_path: Path) -> None:
+        first = isolation.activate_isolated_workspace(run_id="a")
+        first_db = os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV]
+
+        # Simulate a second process (no inherited markers).
+        for var in (
+            isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
+            isolation.HEADROOM_MEMORY_DB_PATH_ENV,
+            paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
+        ):
+            os.environ.pop(var, None)
+        os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(first.parent.parent)
+
+        isolation.activate_isolated_workspace(run_id="b")
+        second_db = os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV]
+
+        assert first_db != second_db
+
+
+class TestDisableIsolationRestore:
+    def test_nested_shared_restores_workspace(self, tmp_path: Path) -> None:
+        """A --shared run launched from an isolated parent must fall back to
+        the shared workspace, not keep writing the parent's run dir."""
+
+        pre = paths.workspace_dir()
+        run_dir = isolation.activate_isolated_workspace()
+        assert paths.workspace_dir() == run_dir  # now isolated
+
+        isolation.disable_isolation()
+
+        assert isolation.isolation_requested() is False
+        assert paths.workspace_dir() == pre
+        assert isolation.active_isolated_workspace() is None
+        # The isolation-set memory path is dropped so memory resolves shared.
+        assert isolation.HEADROOM_MEMORY_DB_PATH_ENV not in os.environ
+
+    def test_disable_preserves_user_memory_override(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, str(tmp_path / "mine.db"))
+        isolation.activate_isolated_workspace()
+
+        isolation.disable_isolation()
+
+        # User's explicit DB path survives the opt-out.
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(tmp_path / "mine.db")
+
+    def test_top_level_shared_does_not_clobber_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # No parent isolation: disable_isolation must not touch the workspace.
+        explicit = tmp_path / "explicit-ws"
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(explicit))
+
+        isolation.disable_isolation()
+
+        assert paths.workspace_dir() == explicit
+
+
+class TestPrunePidLiveness:
+    @staticmethod
+    def _make_stale(path: Path) -> None:
+        stale = 1_000_000_000.0
+        os.utime(path, (stale, stale))
+
+    def test_owner_pid_parsed_from_name(self, tmp_path: Path) -> None:
+        d = tmp_path / "run-20260814-061101-17840-4988a4"
+        assert isolation._run_dir_owner_pid(d) == 17840
+        assert isolation._run_dir_owner_pid(tmp_path / "keep-me") is None
+        assert isolation._run_dir_owner_pid(tmp_path / "run-garbage") is None
+
+    def test_live_owner_dir_is_never_pruned(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        # Embed THIS process's PID (guaranteed alive) in the run name.
+        live = runs / f"run-20200101-000000-{os.getpid()}-abcdef"
+        live.mkdir(parents=True)
+        self._make_stale(live)
+
+        isolation.prune_stale_runs(runs)
+
+        assert live.exists()
+
+    def test_dead_owner_stale_dir_is_pruned(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        # PID 2 is init-adjacent and effectively never a live wrap owner;
+        # use a clearly-dead high PID sentinel instead.
+        dead = runs / "run-20200101-000000-2147480000-abcdef"
+        dead.mkdir(parents=True)
+        self._make_stale(dead)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not dead.exists()
+
+    def test_recent_dead_owner_dir_is_kept(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        recent = runs / "run-20200101-000000-2147480000-abcdef"
+        recent.mkdir(parents=True)
+        # Fresh mtime → below the age cutoff → kept regardless of PID.
+
+        isolation.prune_stale_runs(runs)
+
+        assert recent.exists()

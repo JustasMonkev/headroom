@@ -537,6 +537,45 @@ def _get_proxy_stdio_log_path() -> Path:
     return _get_log_path().with_name("proxy-stdio.log")
 
 
+# Bounded retries when a dedicated proxy keeps losing the port bind race to
+# concurrent launches. High enough to clear a realistic fan-out of parallel
+# isolated wraps, low enough to fail fast if something is systematically
+# squatting ports.
+_MAX_DEDICATED_PORT_ATTEMPTS = 20
+
+
+class _DedicatedProxyPortRaceLost(Exception):
+    """A dedicated proxy start lost a concurrent bind race for its port.
+
+    Raised by :func:`_start_proxy` when ``require_owned`` is set and the
+    proxy that became healthy on the port is not the child we spawned — i.e.
+    another concurrent launch won the race. The caller retries on a fresh
+    port so an isolated run never routes through another run's proxy.
+    """
+
+    def __init__(self, port: int) -> None:
+        super().__init__(f"lost dedicated-proxy bind race for port {port}")
+        self.port = port
+
+
+def _proxy_reported_pid(port: int) -> int | None:
+    """Return the PID the proxy on ``port`` reports via /health, else None.
+
+    None means "could not determine" (health not ready or unreachable) — the
+    caller must treat that as inconclusive, never as proof of foreign
+    ownership.
+    """
+
+    config = _query_proxy_config(port)
+    if not isinstance(config, dict):
+        return None
+    pid = config.get("pid")
+    try:
+        return int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _start_proxy(
     port: int,
     *,
@@ -554,6 +593,7 @@ def _start_proxy(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    require_owned: bool = False,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -705,11 +745,32 @@ def _start_proxy(
         # uvicorn binds the port. On slower machines this can take 20-30 seconds.
         for _i in range(timeout_seconds):
             time.sleep(1)
+            child_exited = proc.poll() is not None
             if _check_proxy(port):
-                click.echo(f"  Logs: {log_path}")
-                return proc
+                if not require_owned:
+                    click.echo(f"  Logs: {log_path}")
+                    return proc
+                # Dedicated proxy: a plain bind-probe releases the port before
+                # the child binds it, so a concurrent launch can win the race
+                # and be the one now healthy here. Confirm the listener is OUR
+                # child (its /health PID matches) before trusting it; otherwise
+                # retry on a fresh port so we never route through another run.
+                owner_pid = _proxy_reported_pid(port)
+                if owner_pid is not None and owner_pid == proc.pid:
+                    click.echo(f"  Logs: {log_path}")
+                    return proc
+                if owner_pid is not None and owner_pid != proc.pid:
+                    if not child_exited:
+                        proc.kill()
+                    raise _DedicatedProxyPortRaceLost(port)
+                # owner_pid is None: PID not yet reported. If our child is gone,
+                # something else owns the port (race lost); otherwise /health
+                # just isn't ready — keep waiting.
+                if child_exited:
+                    raise _DedicatedProxyPortRaceLost(port)
+                continue
             # Check if process died
-            if proc.poll() is not None:
+            if child_exited:
                 # Read last few lines of log for error context
                 try:
                     tail = _read_text(stdio_log_path)[-500:]
@@ -4273,51 +4334,76 @@ def _ensure_proxy(
         # — an isolated proxy squatting the shared port would be silently
         # reused (and its ephemeral workspace written to) by the next plain
         # `headroom wrap` on the default port.
-        port_search_start = port + 1 if dedicated_session_proxy else port
-        try:
-            actual_port = helpers._find_available_port(port_search_start)
-        except OSError as e:
-            raise click.ClickException(f"Port {port} is unavailable: {e}") from e
-        except RuntimeError as e:
-            raise click.ClickException(str(e)) from e
+        # Dedicated (isolated / subscription-seeded) proxies must OWN the port
+        # they bind. `_find_available_port` only bind-probes and releases, so
+        # two concurrent dedicated launches can pick the same port; the loser
+        # would otherwise route through the winner's proxy and workspace,
+        # defeating isolation. `_start_proxy(require_owned=True)` raises when it
+        # loses that race, and we retry on a higher port. The shared path keeps
+        # its single-shot behavior (a shared proxy is meant to be reused).
+        search_from = port + 1 if dedicated_session_proxy else port
+        attempt = 0
+        while True:
+            try:
+                actual_port = helpers._find_available_port(search_from)
+            except OSError as e:
+                raise click.ClickException(f"Port {port} is unavailable: {e}") from e
+            except RuntimeError as e:
+                raise click.ClickException(str(e)) from e
 
-        if actual_port != port:
-            if dedicated_session_proxy:
-                click.echo(
-                    f"  Port {port} is reserved for the shared proxy; "
-                    f"using port {actual_port} for this dedicated session instead."
+            if actual_port != port:
+                if dedicated_session_proxy:
+                    click.echo(
+                        f"  Port {port} is reserved for the shared proxy; "
+                        f"using port {actual_port} for this dedicated session instead."
+                    )
+                else:
+                    click.echo(f"  Port {port} is in use, using port {actual_port} instead.")
+
+            click.echo(f"  Starting Headroom proxy on port {actual_port}...")
+            try:
+                proc = cast(
+                    subprocess.Popen[Any],
+                    _live_wrap_module()._start_proxy(
+                        actual_port,
+                        learn=learn,
+                        memory=memory,
+                        agent_type=agent_type,
+                        code_graph=code_graph,
+                        backend=backend,
+                        anyllm_provider=anyllm_provider,
+                        region=region,
+                        openai_api_url=openai_api_url,
+                        anthropic_api_url=anthropic_api_url,
+                        vertex_api_url=vertex_api_url,
+                        clear_vertex_api_url=clear_vertex_api_url,
+                        copilot_api_token=copilot_api_token,
+                        copilot_refresh_oauth_token=copilot_refresh_oauth_token,
+                        copilot_api_token_expires_at=copilot_api_token_expires_at,
+                        require_owned=dedicated_session_proxy,
+                    ),
                 )
-            else:
-                click.echo(f"  Port {port} is in use, using port {actual_port} instead.")
+            except _DedicatedProxyPortRaceLost:
+                attempt += 1
+                if attempt >= _MAX_DEDICATED_PORT_ATTEMPTS:
+                    raise click.ClickException(
+                        f"Could not reserve a dedicated proxy port near {port} after "
+                        f"{attempt} attempts; concurrent launches keep winning the race. "
+                        "Retry, or pass an explicit free --port."
+                    ) from None
+                click.echo(
+                    f"  Port {actual_port} was claimed by another proxy; "
+                    "retrying on a higher port..."
+                )
+                search_from = actual_port + 1
+                continue
+            except RuntimeError as e:
+                click.echo(f"  Error: {e}")
+                raise SystemExit(1) from e
 
-        click.echo(f"  Starting Headroom proxy on port {actual_port}...")
-        try:
-            proc = cast(
-                subprocess.Popen[Any],
-                _live_wrap_module()._start_proxy(
-                    actual_port,
-                    learn=learn,
-                    memory=memory,
-                    agent_type=agent_type,
-                    code_graph=code_graph,
-                    backend=backend,
-                    anyllm_provider=anyllm_provider,
-                    region=region,
-                    openai_api_url=openai_api_url,
-                    anthropic_api_url=anthropic_api_url,
-                    vertex_api_url=vertex_api_url,
-                    clear_vertex_api_url=clear_vertex_api_url,
-                    copilot_api_token=copilot_api_token,
-                    copilot_refresh_oauth_token=copilot_refresh_oauth_token,
-                    copilot_api_token_expires_at=copilot_api_token_expires_at,
-                ),
-            )
             click.echo(f"  Proxy ready on http://127.0.0.1:{actual_port}")
             click.echo(f"  Dashboard:    http://127.0.0.1:{actual_port}/dashboard")
             return proc, actual_port
-        except RuntimeError as e:
-            click.echo(f"  Error: {e}")
-            raise SystemExit(1) from e
     else:
         if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
@@ -4520,6 +4606,23 @@ def _reject_misplaced_isolated_flag(args: tuple, tool: str) -> None:
             )
 
 
+def _wrap_memory_db_path() -> Path:
+    """Resolve the memory SQLite path for wrap-side memory sync.
+
+    Mirrors the proxy's own resolution (``HEADROOM_MEMORY_DB_PATH``, default
+    ``<cwd>/.headroom/memory.db``) so an isolated run — which pins that env
+    var into its per-run directory — syncs the SAME database the proxy and
+    the memory MCP server use. Without this, wrap would sync the project-local
+    default that every concurrent isolated run in the project shares, silently
+    defeating memory isolation.
+    """
+
+    override = os.environ.get("HEADROOM_MEMORY_DB_PATH", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.cwd() / ".headroom" / "memory.db"
+
+
 def _launch_tool(
     binary: str,
     args: tuple,
@@ -4545,8 +4648,16 @@ def _launch_tool(
         tuple[tuple, dict[str, str], list[str]],
     ]
     | None = None,
+    reconcile_port: Callable[[int], None] | None = None,
 ) -> None:
-    """Common logic: start proxy, launch tool, clean up."""
+    """Common logic: start proxy, launch tool, clean up.
+
+    ``reconcile_port`` is invoked with the actual bound port whenever it
+    differs from the requested one, so flows that pre-write the port into
+    files the launch env cannot reach (an agent's MCP registration, OMP's
+    ``models.yml``) can rewrite them before the tool starts. It always fires
+    for a dedicated/isolated proxy, which binds one port above the request.
+    """
     _reject_misplaced_isolated_flag(args, agent_type if agent_type != "unknown" else binary)
     proxy_holder: list[subprocess.Popen | None] = [None]
     port_holder: list[int] = [port]
@@ -4591,6 +4702,12 @@ def _launch_tool(
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
+
+        # Rewrite any on-disk config that captured the requested port before
+        # the proxy bumped it (agent MCP registration, OMP models.yml). Must
+        # run before the tool launches and reads that config.
+        if actual_port != port and reconcile_port is not None:
+            reconcile_port(actual_port)
 
         # Reduce-at-source: fill in SAFE quiet-CLI env defaults for the launched
         # agent (git/npm/pip/pytest emit less noise), unless the user opted out.
@@ -5125,9 +5242,9 @@ def claude(
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
         try:
-            mem_dir = Path.cwd() / ".headroom"
-            mem_dir.mkdir(parents=True, exist_ok=True)
-            _sync_db = str(mem_dir / "memory.db")
+            _mem_db = _wrap_memory_db_path()
+            _mem_db.parent.mkdir(parents=True, exist_ok=True)
+            _sync_db = str(_mem_db)
             _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
             click.echo(f"  Syncing memory (user={_sync_user})...")
@@ -5944,9 +6061,9 @@ def _prepare_codex_wrap_state(
     # Setup memory MCP server for Codex (native tool integration)
     if memory:
         click.echo("  Setting up memory for Codex...")
-        mem_dir = Path.cwd() / ".headroom"
-        mem_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(mem_dir / "memory.db")
+        _mem_db = _wrap_memory_db_path()
+        _mem_db.parent.mkdir(parents=True, exist_ok=True)
+        db_path = str(_mem_db)
         mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
         # Register MCP server in Codex config
@@ -6063,6 +6180,16 @@ def _run_codex_wrap(
             environ=current_env,
         )
 
+    def reconcile_codex_port(actual_port: int) -> None:
+        # Codex starts a long-lived MCP subprocess from config.toml, written
+        # against the requested port in _prepare_codex_wrap_state. A dedicated
+        # proxy binds a different port, so re-register the retrieve server (and
+        # provider config) against the real one before Codex reads the config.
+        if not no_mcp:
+            from headroom.mcp_registry import CodexRegistrar
+
+            _setup_headroom_mcp(CodexRegistrar(), actual_port, verbose=verbose, force=True)
+
     _launch_tool(
         binary=codex_bin,
         args=codex_args,
@@ -6079,6 +6206,7 @@ def _run_codex_wrap(
         anyllm_provider=anyllm_provider,
         region=region,
         configure_launch=configure_codex_launch,
+        reconcile_port=reconcile_codex_port,
     )
 
 
@@ -6713,6 +6841,15 @@ def grok(
         port, os.environ, project=_project_name_from_cwd()
     )
 
+    def reconcile_grok_port(actual_port: int) -> None:
+        # Grok's headroom_retrieve MCP server was registered against the
+        # requested port; a dedicated proxy binds a different one. Re-register
+        # against the real port so retrieval targets the right proxy.
+        if not no_mcp:
+            from headroom.mcp_registry import GrokRegistrar
+
+            _setup_headroom_mcp(GrokRegistrar(), actual_port, verbose=verbose, force=True)
+
     _launch_tool(
         binary=grok_bin,
         args=grok_args,
@@ -6729,6 +6866,7 @@ def grok(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url="https://api.x.ai",
+        reconcile_port=reconcile_grok_port,
     )
 
 
@@ -8429,6 +8567,14 @@ def omp(
     models_file, _ = _inject_omp_models_override(port, _project_name_from_cwd())
     click.echo(f"  models.yml override written: {models_file}")
 
+    def reconcile_omp_port(actual_port: int) -> None:
+        # models.yml is omp's AUTHORITATIVE inference endpoint (ANTHROPIC_BASE_URL
+        # only affects its web-search helper). It was written with the requested
+        # port; a dedicated proxy binds a different one, so rewrite it — otherwise
+        # omp would route inference to the reserved shared port, not its proxy.
+        rewritten, _ = _inject_omp_models_override(actual_port, _project_name_from_cwd())
+        click.echo(f"  models.yml override updated for port {actual_port}: {rewritten}")
+
     _launch_tool(
         binary=omp_bin,
         args=omp_args,
@@ -8441,6 +8587,7 @@ def omp(
         memory=memory,
         agent_type="omp",
         code_graph=code_graph,
+        reconcile_port=reconcile_omp_port,
     )
 
 
