@@ -730,6 +730,44 @@ Wrap external coding tools so their traffic flows through Headroom.
 - `-v`, `--verbose` means **verbose output**
 - Hidden `--prepare-only` exists for internal Docker-native bridge flows and is intentionally omitted from normal usage
 
+### Concurrent runs and `--isolated`
+
+By default, concurrent `headroom wrap` runs **share state**: the second run
+reuses the proxy already listening on the shared port, and every run reads
+and writes the same workspace (`~/.headroom` — savings ledger, memory DB,
+TOIN telemetry, logs). That sharing is deliberate (cross-agent memory,
+combined savings), but it means two coding agents launched side by side are
+not independent.
+
+`headroom wrap --isolated <tool>` (a **group-level** flag — it goes before
+the tool name; also honored as `HEADROOM_ISOLATED=1`) makes the current run
+independent:
+
+- a fresh per-run workspace is created under
+  `~/.headroom/runs/run-<timestamp>-<pid>-<rand>` and exported as
+  `HEADROOM_WORKSPACE_DIR`, so the proxy, the wrapped agent, and any MCP
+  children it spawns all inherit it;
+- a dedicated proxy instance is started on the first free port **above**
+  `--port` — an already-running proxy is never reused, and the base port is
+  left reserved for the shared proxy;
+- the read-mostly config root stays shared (pinned via
+  `HEADROOM_CONFIG_DIR` before the workspace override), so model catalogs
+  and plugin settings still come from your real configuration.
+
+```bash
+# Terminal 1 and 2 — fully independent proxies, savings, memory, logs:
+headroom wrap --isolated claude
+headroom wrap --isolated codex
+```
+
+Trade-offs: isolation severs cross-agent memory for the run (each isolated
+run has its own `memory.db`), per-run savings are not merged into the
+shared ledger, and the isolated proxy shuts down with the run. Agent-level
+config that Headroom writes into the wrapped tool's own settings (e.g. the
+MCP retrieve-tool registration, which bakes in a proxy URL) is still a
+shared, last-writer-wins file — already-running sessions keep the
+registration they started with.
+
 ### `headroom wrap claude`
 
 ```bash

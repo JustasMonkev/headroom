@@ -69,6 +69,12 @@ from headroom.copilot_auth import (
     resolve_copilot_api_url,
     resolve_subscription_bearer_token_details,
 )
+from headroom.isolation import (
+    activate_isolated_workspace as _activate_isolated_workspace,
+)
+from headroom.isolation import (
+    isolation_requested as _isolation_requested,
+)
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -3959,6 +3965,11 @@ def _ensure_proxy(
             "  Warning: --backend/--region/--anyllm-provider have no effect with --no-proxy "
             "(reusing the existing proxy)."
         )
+    isolated_run = helpers._isolation_requested()
+    if no_proxy and isolated_run:
+        click.echo(
+            "  Warning: --isolated has no effect with --no-proxy (reusing the existing proxy)."
+        )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
@@ -3969,7 +3980,12 @@ def _ensure_proxy(
                 "  Copilot subscription seeds are session-specific; "
                 "starting a dedicated local proxy instance for this wrap session."
             )
-        if not isolated_copilot_subscription_proxy and manifest is not None:
+        elif isolated_run:
+            click.echo("  Isolated run: starting a dedicated proxy instance for this wrap session.")
+        # Both flavors of dedicated session skip every reuse path below and
+        # start their own proxy instance instead of attaching to a shared one.
+        dedicated_session_proxy = isolated_copilot_subscription_proxy or isolated_run
+        if not dedicated_session_proxy and manifest is not None:
             from headroom.install.health import probe_ready
 
             if probe_ready(manifest.health_url):
@@ -4110,7 +4126,7 @@ def _ensure_proxy(
                 "is stale; starting a fresh proxy instead."
             )
 
-        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
+        if not dedicated_session_proxy and helpers._check_proxy(port):
             # Proxy is running — check if it has the features we need
             needs_restart = False
             health_payload = helpers._query_proxy_health(port)
@@ -4243,8 +4259,11 @@ def _ensure_proxy(
         # Start (or restart) the proxy with the requested flags.
         # Subscription-seeded sessions must not claim the shared port even if
         # it is momentarily free; the persistent install or shared proxy still
-        # owns that slot semantically.
-        port_search_start = port + 1 if isolated_copilot_subscription_proxy else port
+        # owns that slot semantically. Isolated runs reserve it unconditionally
+        # — an isolated proxy squatting the shared port would be silently
+        # reused (and its ephemeral workspace written to) by the next plain
+        # `headroom wrap` on the default port.
+        port_search_start = port + 1 if dedicated_session_proxy else port
         try:
             actual_port = helpers._find_available_port(port_search_start)
         except OSError as e:
@@ -4253,7 +4272,7 @@ def _ensure_proxy(
             raise click.ClickException(str(e)) from e
 
         if actual_port != port:
-            if isolated_copilot_subscription_proxy:
+            if dedicated_session_proxy:
                 click.echo(
                     f"  Port {port} is reserved for the shared proxy; "
                     f"using port {actual_port} for this dedicated session instead."
@@ -4475,6 +4494,21 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     return None
 
 
+def _reject_misplaced_isolated_flag(args: tuple, tool: str) -> None:
+    """Fail loudly when ``--isolated`` lands after the tool name.
+
+    ``--isolated`` is a group-level flag. The wrap subcommands run with
+    ``ignore_unknown_options``, so a trailing ``--isolated`` would be
+    silently forwarded to the wrapped CLI instead of isolating the run.
+    """
+
+    if "--isolated" in args:
+        raise click.UsageError(
+            "--isolated is a `wrap` group flag and goes before the tool name: "
+            f"headroom wrap --isolated {tool} ..."
+        )
+
+
 def _launch_tool(
     binary: str,
     args: tuple,
@@ -4502,6 +4536,7 @@ def _launch_tool(
     | None = None,
 ) -> None:
     """Common logic: start proxy, launch tool, clean up."""
+    _reject_misplaced_isolated_flag(args, agent_type if agent_type != "unknown" else binary)
     proxy_holder: list[subprocess.Popen | None] = [None]
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
@@ -4757,12 +4792,28 @@ def _copy_openclaw_plugin_into_extensions(
 
 
 @main.group()
-def wrap() -> None:
+@click.option(
+    "--isolated",
+    is_flag=True,
+    envvar="HEADROOM_ISOLATED",
+    help=(
+        "Give this run its own workspace and a dedicated proxy instance so "
+        "concurrent runs don't share state (savings, memory DB, logs, proxy). "
+        "Also honored as HEADROOM_ISOLATED=1. Note: this severs cross-agent "
+        "memory for the run by design."
+    ),
+)
+def wrap(isolated: bool) -> None:
     """Wrap CLI tools to run through Headroom.
 
     \b
     Starts a Headroom proxy, configures the environment, and launches
     the target tool so all API calls route through Headroom automatically.
+
+    \b
+    Concurrent runs share one proxy and one workspace (~/.headroom) by
+    default. Use `headroom wrap --isolated <tool>` (flag goes before the
+    tool name) to give each run its own workspace and proxy instead.
 
     \b
     Supported tools (one Click subcommand per tool):
@@ -4795,6 +4846,13 @@ def wrap() -> None:
     \b
     `openclaw` is a separate tool — different from opencode.
     """
+    # Activate isolation before any subcommand touches workspace paths.
+    # paths.py re-reads the environment on every call, and every child we
+    # spawn (proxy, wrapped agent, its MCP servers) inherits os.environ, so
+    # a single env override here isolates the whole process tree.
+    if isolated or _isolation_requested():
+        run_dir = _activate_isolated_workspace()
+        click.echo(f"  Isolated run: workspace {run_dir}")
 
 
 @main.group()
@@ -4991,6 +5049,7 @@ def claude(
         headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --1m               # Preserve the 1M context window
     """
+    _reject_misplaced_isolated_flag(claude_args, "claude")
     # RTK/context-tool is opt-in (off by default): --context-tool (legacy) and
     # --rtk both enable it. Mirror --context-tool into HEADROOM_RTK so the central
     # RTK gate (_rtk_opt_in) fires for the legacy flag too.
@@ -6094,6 +6153,7 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    _reject_misplaced_isolated_flag(codex_args, "codex")
     return _run_codex_wrap(
         port=port,
         no_rtk=no_rtk,
@@ -7767,6 +7827,7 @@ def opencode(
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
+    _reject_misplaced_isolated_flag(opencode_args, "opencode")
     subscription_resolution = None
     if copilot_subscription:
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -8306,6 +8367,7 @@ def omp(
         headroom wrap omp --no-context-tool     # Skip CLI context-tool setup
         headroom unwrap omp                     # Restore pre-wrap models.yml
     """
+    _reject_misplaced_isolated_flag(omp_args, "omp")
     # Setup CLI context tool for omp — it reads AGENTS.md from the project root.
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
