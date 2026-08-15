@@ -355,3 +355,108 @@ class TestProxyClientMarkersShared:
         # Keyed by port, so a dedicated proxy never collides with the shared one.
         assert paths.proxy_clients_dir(8788) == pre / "clients" / "8788"
         assert paths.proxy_clients_dir(8788) != paths.proxy_clients_dir(8787)
+
+
+class TestBlankEnvOverridesTreatedAsUnset:
+    """`paths._env` treats a blank/whitespace override as unset, so isolation
+    must pin those roots rather than let `setdefault` see a key and skip
+    (PR #25 review round 3, P1/P2)."""
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_blank_config_dir_is_still_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blank: str
+    ) -> None:
+        monkeypatch.setenv(paths.HEADROOM_CONFIG_DIR_ENV, blank)
+        pre_config = paths.config_dir()
+
+        isolation.activate_isolated_workspace()
+
+        # Config must NOT follow the workspace into the empty run dir.
+        assert paths.config_dir() == pre_config
+        assert paths.config_dir() != paths.workspace_dir() / "config"
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_blank_shared_root_is_still_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blank: str
+    ) -> None:
+        monkeypatch.setenv(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, blank)
+        pre = paths.workspace_dir()
+
+        isolation.activate_isolated_workspace()
+
+        assert paths.shared_workspace_dir() == pre
+        # ...so managed binaries / auth / ledger stay off the run dir.
+        assert paths.bin_dir() == pre / "bin"
+
+    @pytest.mark.parametrize("blank", ["", "  "])
+    def test_blank_memory_db_path_is_still_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blank: str
+    ) -> None:
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, blank)
+
+        run_dir = isolation.activate_isolated_workspace()
+
+        # A blank value is not a user override; memory must still isolate.
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(run_dir / "memory.db")
+
+
+class TestSettingsAndSharedCaches:
+    """Persistent, machine-wide state must not land in a run dir (round 3)."""
+
+    def test_dashboard_settings_stay_shared(self, tmp_path: Path) -> None:
+        pre_settings = paths.settings_path()
+
+        isolation.activate_isolated_workspace()
+
+        assert paths.settings_path() == pre_settings
+        assert paths.settings_path().parent != paths.workspace_dir()
+
+    def test_settings_path_pinned_in_env_for_children(self, tmp_path: Path) -> None:
+        pre_settings = paths.settings_path()
+
+        isolation.activate_isolated_workspace()
+
+        # The proxy subprocess resolves it from the environment.
+        assert os.environ[paths.HEADROOM_SETTINGS_PATH_ENV] == str(pre_settings)
+
+    def test_update_check_cache_stays_shared(self, tmp_path: Path) -> None:
+        from headroom.update_check import _cache_path
+
+        pre = _cache_path()
+        isolation.activate_isolated_workspace()
+
+        assert _cache_path() == pre
+
+    def test_legacy_models_json_stays_shared(self, tmp_path: Path) -> None:
+        """The supported legacy ~/.headroom/models.json fallback must keep
+        resolving against the shared root, or a user's custom context limits
+        and pricing silently vanish under the isolated default."""
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        assert paths.shared_workspace_dir() / "models.json" == pre / "models.json"
+
+
+class TestDisableIsolationScope:
+    def test_top_level_shared_keeps_two_distinct_configured_roots(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A user may configure workspace and shared roots as different
+        directories; `--shared` with no isolated parent must not collapse
+        the former onto the latter (round 3, P2)."""
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(tmp_path / "run-data"))
+        monkeypatch.setenv(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(tmp_path / "persistent"))
+
+        isolation.disable_isolation()
+
+        assert paths.workspace_dir() == tmp_path / "run-data"
+        assert paths.shared_workspace_dir() == tmp_path / "persistent"
+
+    def test_nested_shared_still_restores(self, tmp_path: Path) -> None:
+        """The nested opt-out path (an isolated parent) must still restore."""
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        isolation.disable_isolation()
+
+        assert paths.workspace_dir() == pre

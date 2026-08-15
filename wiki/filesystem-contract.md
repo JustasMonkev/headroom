@@ -84,6 +84,9 @@ real `~/.headroom` while the workspace bucket above moves into the run dir.
 | Copilot OAuth token | `${SHARED_WORKSPACE_DIR}/copilot_auth.json` | `HEADROOM_COPILOT_AUTH_FILE` |
 | MCP install ledger | `${SHARED_WORKSPACE_DIR}/mcp_installs.json` | — |
 | Proxy client markers | `${SHARED_WORKSPACE_DIR}/clients/<port>/` | — |
+| Dashboard settings | `${SHARED_WORKSPACE_DIR}/settings.json` | `HEADROOM_SETTINGS_PATH` |
+| Update-check cache | `${SHARED_WORKSPACE_DIR}/update_check.json` | — |
+| Legacy models catalog (fallback) | `${SHARED_WORKSPACE_DIR}/models.json` | — |
 
 Proxy client markers reference-count a proxy instance identified by
 `127.0.0.1:<port>`, which is machine-wide — every client of a given proxy
@@ -105,7 +108,9 @@ workspace root, not in `config/`). For a seamless migration the Python
 providers check **both** locations in this order:
 
 1. `${HEADROOM_CONFIG_DIR}/models.json` (new canonical location)
-2. `${HEADROOM_WORKSPACE_DIR}/models.json` (legacy fallback)
+2. `${HEADROOM_SHARED_WORKSPACE_DIR}/models.json` (legacy fallback — the
+   *shared* root, so a per-run isolated wrap still sees a catalog kept at the
+   legacy `~/.headroom/models.json` location)
 
 Existing installs continue to work unchanged. New installs are encouraged
 to put `models.json` in the config bucket.

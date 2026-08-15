@@ -252,12 +252,17 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
 
 
 def settings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
-    """Return the path for the dashboard-managed settings JSON file."""
+    """Return the path for the dashboard-managed settings JSON file.
+
+    A persistent user preference rather than run state, so it derives from the
+    shared workspace: an option saved through ``/dashboard/settings`` during an
+    isolated run must survive that run rather than vanish with its directory.
+    """
 
     return _resolve(
         explicit,
         HEADROOM_SETTINGS_PATH_ENV,
-        workspace_dir() / _SETTINGS_FILE,
+        shared_workspace_dir() / _SETTINGS_FILE,
     )
 
 

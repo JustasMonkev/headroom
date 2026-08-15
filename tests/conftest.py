@@ -35,6 +35,13 @@ def _scrub_developer_headroom_env(monkeypatch):
     # wrap suites pin. Run tests in shared mode by default; the
     # isolation-default behavior itself is covered by
     # tests/test_cli/test_wrap_isolated.py, which removes this override.
+    #
+    # CAVEAT: because this pins the suite to shared mode, a regression that
+    # only manifests under the real (isolated) default is invisible to tests
+    # that do not clear it — that is how the `wrap openclaw --prepare-only`
+    # stdout-pollution bug slipped past an existing `json.loads(result.output)`
+    # assertion. When adding a test that depends on wrap's default behavior,
+    # delete this variable in the test and assert against isolation being ON.
     monkeypatch.setenv("HEADROOM_ISOLATED", "0")
 
 

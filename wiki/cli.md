@@ -779,13 +779,21 @@ For a tool that records the proxy port in its own on-disk config (Codex and
 Grok register the `headroom` retrieve MCP server; OMP writes `models.yml`),
 the dedicated port is reapplied after the proxy binds, so retrieval and
 inference target the run's actual proxy rather than the reserved base port.
-Because `models.yml` is a single shared file that omp-spawned children
-re-read, an isolated OMP run additionally gets its own copy of omp's agent
-directory (via `PI_CODING_AGENT_DIR`, seeded from the existing one so the
-model catalog and credentials carry over) — otherwise two concurrent runs
-would overwrite each other's endpoint. `wrap claude` records the actual
-bound port in its `.headroom_wrap_marker.json`, so the SessionStart
-self-heal hook does not mistake a live run on 8788 for a dead one.
+Some agents keep that endpoint (and the Headroom MCP registration) in a
+single shared file their own processes re-read — `~/.omp/agent/models.yml`,
+`$CODEX_HOME/config.toml`, `~/.grok/config.toml`. Rewriting it after the
+proxy binds only narrows the race, so an isolated run instead gets its own
+copy of that config home (`PI_CODING_AGENT_DIR` / `CODEX_HOME` /
+`GROK_HOME`), seeded from the existing one so the model catalog,
+credentials, and settings carry over. An explicitly set value is always
+respected. `wrap claude` records the actual bound port in its
+`.headroom_wrap_marker.json`, so the SessionStart self-heal hook does not
+mistake a live run on 8788 for a dead one.
+
+`--prepare-only` is exempt from isolation: it starts no proxy, and its
+stdout is machine-readable (`scripts/install.sh` pipes it into `openclaw
+config set --strict-json`). Isolation diagnostics go to stderr for the same
+reason.
 
 One project-local file cannot hold two different routes: if you run two
 isolated `wrap claude` sessions **from the same directory**, both write

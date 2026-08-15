@@ -112,9 +112,13 @@ def installed_version() -> str | None:
 
 
 def _cache_path() -> Path:
-    from headroom.paths import workspace_dir
+    # Machine-wide rate-limit cache, resolved against the SHARED workspace:
+    # under per-run isolation the worker finishes after the workspace has been
+    # relocated, so a run-dir cache would leave the shared one permanently
+    # stale and every wrap would re-hit PyPI.
+    from headroom.paths import shared_workspace_dir
 
-    return workspace_dir() / _CACHE_FILE
+    return shared_workspace_dir() / _CACHE_FILE
 
 
 def read_cache() -> dict[str, Any] | None:
@@ -133,9 +137,10 @@ def read_cache() -> dict[str, Any] | None:
 def write_cache(latest_version: str, *, now: float | None = None) -> None:
     """Persist the latest-known version + check timestamp. Never raises."""
     try:
-        from headroom.paths import ensure_workspace_dir
+        # Must match _cache_path()'s root, which is the shared workspace.
+        from headroom.paths import ensure_shared_workspace_dir
 
-        ensure_workspace_dir()
+        ensure_shared_workspace_dir()
         payload = {
             "last_check": now if now is not None else time.time(),
             "latest_version": latest_version,

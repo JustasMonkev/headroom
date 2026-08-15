@@ -716,3 +716,152 @@ class TestCopilotBackendProbeGate:
 
         # --no-proxy explicitly attaches to the running proxy.
         assert seen == ["anyllm"]
+
+
+class TestPrepareOnlyIsExemptFromIsolation:
+    """`--prepare-only` is a machine-readable config step whose stdout is piped
+    into `openclaw config set --strict-json` by scripts/install.sh. It must not
+    be isolated (no run dir to GC) and must not have its stdout polluted
+    (PR #25 review round 3, P1)."""
+
+    def test_detects_prepare_only_from_argv(self) -> None:
+        ctx = click.Context(click.Command("wrap"))
+        assert (
+            wrap_mod._prepare_only_invocation(
+                ctx, argv=["headroom", "wrap", "openclaw", "--prepare-only"]
+            )
+            is True
+        )
+        assert wrap_mod._prepare_only_invocation(ctx, argv=["headroom", "wrap", "claude"]) is False
+
+    def test_openclaw_prepare_only_emits_pure_json_and_no_run_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The real default: isolation ON (the suite-wide conftest pins it off).
+        monkeypatch.delenv(isolation.HEADROOM_ISOLATED_ENV, raising=False)
+        # Mirror the argv scripts/install.sh actually produces.
+        monkeypatch.setattr(
+            wrap_mod.sys, "argv", ["headroom", "wrap", "openclaw", "--prepare-only"]
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["wrap", "openclaw", "--prepare-only"])
+
+        assert result.exit_code == 0, result.output
+        # stdout must parse as JSON with nothing prepended.
+        payload = json.loads(result.stdout)
+        assert "config" in payload
+        # ...and no ephemeral run directory was created for it.
+        assert not (tmp_path / "ws" / "runs").exists()
+        assert isolation.HEADROOM_ISOLATED_ENV not in os.environ
+
+
+class TestLaunchToolSighup:
+    def test_launch_tool_registers_sighup(self) -> None:
+        """Closing the terminal sends SIGHUP; without a handler the wrapper
+        dies and its detached dedicated proxy survives forever on the per-run
+        port (round 3, P2). claude() already does this."""
+        import inspect
+
+        src = inspect.getsource(wrap_mod._launch_tool)
+        assert 'hasattr(signal, "SIGHUP")' in src
+        assert "signal.signal(signal.SIGHUP, cleanup)" in src
+
+
+class TestIsolateAgentConfigHomes:
+    """Codex/Grok/OMP keep their endpoint + Headroom MCP entry in one shared
+    config file their processes re-read, so concurrent isolated runs need
+    private copies rather than a post-hoc rewrite (round 3, P1)."""
+
+    def _fake_home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        home = tmp_path / "home"
+        monkeypatch.setattr(wrap_mod.Path, "home", classmethod(lambda _cls: home))
+        return home
+
+    @pytest.mark.parametrize(
+        "helper,env_var,rel,dir_name",
+        [
+            ("_isolate_codex_home", "CODEX_HOME", (".codex",), "codex-home"),
+            ("_isolate_grok_home", "GROK_HOME", (".grok",), "grok-home"),
+            ("_isolate_omp_agent_dir", "PI_CODING_AGENT_DIR", (".omp", "agent"), "omp-agent"),
+        ],
+    )
+    def test_isolated_run_gets_private_config_home(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        helper: str,
+        env_var: str,
+        rel: tuple[str, ...],
+        dir_name: str,
+    ) -> None:
+        monkeypatch.delenv(env_var, raising=False)
+        home = self._fake_home(monkeypatch, tmp_path)
+        source = home.joinpath(*rel)
+        source.mkdir(parents=True)
+        (source / "config.toml").write_text("user = true\n")
+        run_dir = isolation.activate_isolated_workspace()
+
+        target = getattr(wrap_mod, helper)()
+
+        assert target == run_dir / dir_name
+        assert os.environ[env_var] == str(target)
+        # Seeded from the user's own config so catalog/credentials survive.
+        assert (target / "config.toml").read_text() == "user = true\n"
+
+    @pytest.mark.parametrize(
+        "helper,env_var",
+        [
+            ("_isolate_codex_home", "CODEX_HOME"),
+            ("_isolate_grok_home", "GROK_HOME"),
+            ("_isolate_omp_agent_dir", "PI_CODING_AGENT_DIR"),
+        ],
+    )
+    def test_noop_without_isolation(
+        self, monkeypatch: pytest.MonkeyPatch, helper: str, env_var: str
+    ) -> None:
+        monkeypatch.delenv(env_var, raising=False)
+        assert getattr(wrap_mod, helper)() is None
+        assert env_var not in os.environ
+
+    @pytest.mark.parametrize(
+        "helper,env_var",
+        [
+            ("_isolate_codex_home", "CODEX_HOME"),
+            ("_isolate_grok_home", "GROK_HOME"),
+        ],
+    )
+    def test_explicit_user_value_is_respected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, helper: str, env_var: str
+    ) -> None:
+        monkeypatch.setenv(env_var, str(tmp_path / "mine"))
+        isolation.activate_isolated_workspace()
+
+        assert getattr(wrap_mod, helper)() is None
+        assert os.environ[env_var] == str(tmp_path / "mine")
+
+    def test_two_isolated_runs_get_distinct_codex_configs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+        home = self._fake_home(monkeypatch, tmp_path)
+        (home / ".codex").mkdir(parents=True)
+
+        isolation.activate_isolated_workspace(run_id="a")
+        first = wrap_mod._isolate_codex_home()
+
+        # A second process inherits none of the first run's markers.
+        for var in (
+            isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
+            isolation.HEADROOM_MEMORY_DB_PATH_ENV,
+            paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
+            paths.HEADROOM_SETTINGS_PATH_ENV,
+            "CODEX_HOME",
+        ):
+            os.environ.pop(var, None)
+        os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(tmp_path / "ws")
+        isolation.activate_isolated_workspace(run_id="b")
+        second = wrap_mod._isolate_codex_home()
+
+        assert first is not None and second is not None
+        assert first != second

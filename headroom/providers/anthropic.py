@@ -236,7 +236,9 @@ def _load_custom_model_config() -> dict[str, Any]:
     # back to the legacy workspace-root location for backward compatibility.
     config_file = _paths.models_config_path()
     if not config_file.exists():
-        legacy_models = _paths.workspace_dir() / "models.json"
+        # Shared root: model catalogs are user configuration, and per-run
+        # isolation relocates workspace_dir() to an empty run directory.
+        legacy_models = _paths.shared_workspace_dir() / "models.json"
         if legacy_models.exists():
             config_file = legacy_models
     if config_file.exists():

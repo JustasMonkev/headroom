@@ -60,6 +60,32 @@ _MEMORY_DB_FILE = "memory.db"
 _RUN_DIR_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 
+def _trimmed_env(name: str) -> str:
+    """Environment value with surrounding whitespace stripped, or ``""``.
+
+    Mirrors ``paths._env``: the filesystem contract treats a blank or
+    whitespace-only override as *unset*, so isolation must use the same
+    definition rather than mere key presence.
+    """
+
+    return os.environ.get(name, "").strip()
+
+
+def _pin_env(name: str, value: str) -> None:
+    """Set ``name`` unless it already holds a MEANINGFUL value.
+
+    ``os.environ.setdefault`` is wrong here: it treats a present-but-blank
+    variable as already configured and refuses to write. Every consumer reads
+    blank as unset, so the pin would be skipped while the resource still
+    resolved against the relocated (per-run) workspace — silently making
+    config, Copilot auth, managed binaries, the MCP ledger, or the memory DB
+    ephemeral.
+    """
+
+    if not _trimmed_env(name):
+        os.environ[name] = value
+
+
 def isolation_requested() -> bool:
     """True when this process should run with per-run isolation.
 
@@ -92,16 +118,22 @@ def disable_isolation() -> None:
     os.environ[HEADROOM_ISOLATED_ENV] = "0"
     isolated_ws = os.environ.pop(HEADROOM_ISOLATED_WORKSPACE_ENV, None)
 
-    shared = os.environ.get(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, "").strip()
+    # ONLY undo an actual isolation activation. A top-level user may legitimately
+    # configure HEADROOM_WORKSPACE_DIR and HEADROOM_SHARED_WORKSPACE_DIR as two
+    # distinct roots; collapsing the former onto the latter just because
+    # `--shared` was passed would silently redirect all their workspace state.
+    if not isolated_ws:
+        return
+
+    shared = _trimmed_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV)
     if shared:
         os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = shared
 
     # Only clear the memory path if *isolation* set it (== <run_dir>/memory.db);
     # never discard a user-supplied HEADROOM_MEMORY_DB_PATH.
-    if isolated_ws:
-        isolated_db = str(Path(isolated_ws) / _MEMORY_DB_FILE)
-        if os.environ.get(HEADROOM_MEMORY_DB_PATH_ENV) == isolated_db:
-            os.environ.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
+    isolated_db = str(Path(isolated_ws) / _MEMORY_DB_FILE)
+    if os.environ.get(HEADROOM_MEMORY_DB_PATH_ENV) == isolated_db:
+        os.environ.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
 
 
 def active_isolated_workspace() -> Path | None:
@@ -209,8 +241,14 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
     # Pin config + shared roots BEFORE relocating the workspace: both derive
     # from HEADROOM_WORKSPACE_DIR when unset, and the per-run workspace must
     # not shadow the user's real config or persistent shared state.
-    os.environ.setdefault(paths.HEADROOM_CONFIG_DIR_ENV, str(paths.config_dir()))
-    os.environ.setdefault(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(paths.workspace_dir()))
+    # `_pin_env`, not `setdefault` — a present-but-blank override reads as
+    # unset everywhere else and must not block the pin.
+    _pin_env(paths.HEADROOM_CONFIG_DIR_ENV, str(paths.config_dir()))
+    _pin_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(paths.workspace_dir()))
+    # The dashboard-managed settings file is a persistent user preference, not
+    # run state: pin it to the shared root so an edit made from an isolated
+    # run's dashboard is not written into a directory GC later deletes.
+    _pin_env(paths.HEADROOM_SETTINGS_PATH_ENV, str(paths.settings_path()))
 
     runs_root = paths.workspace_dir() / _RUNS_DIR
     prune_stale_runs(runs_root)
@@ -219,7 +257,7 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
 
     os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(run_dir)
     # Route memory into the run dir unless the user pinned an explicit DB path.
-    os.environ.setdefault(HEADROOM_MEMORY_DB_PATH_ENV, str(run_dir / _MEMORY_DB_FILE))
+    _pin_env(HEADROOM_MEMORY_DB_PATH_ENV, str(run_dir / _MEMORY_DB_FILE))
     os.environ[HEADROOM_ISOLATED_ENV] = "1"
     os.environ[HEADROOM_ISOLATED_WORKSPACE_ENV] = str(run_dir)
     return run_dir
