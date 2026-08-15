@@ -21,7 +21,6 @@ _MUTATED_VARS = (
     isolation.HEADROOM_ISOLATED_ENV,
     isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
     isolation.HEADROOM_MEMORY_DB_PATH_ENV,
-    isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV,
     isolation.HEADROOM_PREISOLATION_WORKSPACE_ENV,
     paths.HEADROOM_SETTINGS_PATH_ENV,
     "CODEX_HOME",
@@ -466,56 +465,6 @@ class TestDisableIsolationScope:
         isolation.disable_isolation()
 
         assert paths.workspace_dir() == pre
-
-
-class TestAgentConfigHomeRelease:
-    """A nested `wrap --shared` must hand the child back the user's shared
-    Codex/Grok/OMP config, not the live outer session's private per-run copy
-    (PR #25 review round 4, P2)."""
-
-    def test_records_and_releases_agent_homes(self, tmp_path: Path) -> None:
-        run_dir = isolation.activate_isolated_workspace()
-        codex = run_dir / "codex-home"
-        codex.mkdir()
-        os.environ["CODEX_HOME"] = str(codex)
-        isolation.record_isolated_agent_home("CODEX_HOME")
-
-        assert os.environ[isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV] == "CODEX_HOME"
-
-        isolation.disable_isolation()
-
-        # Unset, so the agent falls back to the user's shared ~/.codex.
-        assert "CODEX_HOME" not in os.environ
-        assert isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV not in os.environ
-
-    def test_records_each_var_once(self, tmp_path: Path) -> None:
-        isolation.record_isolated_agent_home("CODEX_HOME")
-        isolation.record_isolated_agent_home("GROK_HOME")
-        isolation.record_isolated_agent_home("CODEX_HOME")
-
-        assert os.environ[isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV] == "CODEX_HOME,GROK_HOME"
-
-    def test_value_outside_the_run_dir_is_left_alone(self, tmp_path: Path) -> None:
-        """Never clobber a value the child pointed somewhere of its own."""
-        isolation.activate_isolated_workspace()
-        outside = tmp_path / "user-codex"
-        outside.mkdir()
-        os.environ["CODEX_HOME"] = str(outside)
-        isolation.record_isolated_agent_home("CODEX_HOME")
-
-        isolation.disable_isolation()
-
-        assert os.environ["CODEX_HOME"] == str(outside)
-
-    def test_no_release_without_an_isolated_parent(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """A top-level --shared must not touch an explicitly set agent home."""
-        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "mine"))
-
-        isolation.disable_isolation()
-
-        assert os.environ["CODEX_HOME"] == str(tmp_path / "mine")
 
 
 class TestPathsPublicApi:

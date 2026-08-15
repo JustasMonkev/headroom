@@ -33,11 +33,9 @@ def _clean_isolation_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any
         isolation.HEADROOM_ISOLATED_ENV,
         isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
         isolation.HEADROOM_MEMORY_DB_PATH_ENV,
-        isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV,
-        # Agent config homes: `_isolate_*_home()` writes these directly into
-        # os.environ, so without an explicit clean they leak a per-run path
-        # into every later test in the session (observed breaking
-        # tests/test_install/test_providers.py, which writes Codex config).
+        # Agent config homes. Isolation no longer relocates these (see the
+        # revert in the isolation docs), but keep them scrubbed so a stray
+        # value in the developer's shell cannot steer these tests.
         "CODEX_HOME",
         "GROK_HOME",
         "PI_CODING_AGENT_DIR",
@@ -624,60 +622,6 @@ class TestClaudeWrapMarkerConcurrency:
         assert "ANTHROPIC_BASE_URL" not in payload.get("env", {})
 
 
-class TestIsolateOmpAgentDir:
-    """Concurrent isolated OMP runs must not fight over ~/.omp/agent/models.yml."""
-
-    def test_noop_without_isolation(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
-        assert wrap_mod._isolate_omp_agent_dir() is None
-        assert "PI_CODING_AGENT_DIR" not in os.environ
-
-    def test_isolated_run_gets_its_own_agent_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
-        run_dir = isolation.activate_isolated_workspace()
-
-        target = wrap_mod._isolate_omp_agent_dir()
-
-        assert target == run_dir / "omp-agent"
-        assert target.is_dir()
-        assert os.environ["PI_CODING_AGENT_DIR"] == str(target)
-        # models.yml now resolves inside the run dir, so a concurrent run's
-        # rewrite cannot touch this run's endpoint.
-        from headroom.providers.omp import models_yml_path
-
-        assert models_yml_path() == target / "models.yml"
-
-    def test_seeds_from_the_users_existing_agent_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """The copy preserves omp's bundled catalog and stored credentials."""
-        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
-        fake_home = tmp_path / "home"
-        source = fake_home / ".omp" / "agent"
-        source.mkdir(parents=True)
-        (source / "models.yml").write_text("providers: {anthropic: {}}\n")
-        (source / "credentials.json").write_text("{}")
-        monkeypatch.setattr(wrap_mod.Path, "home", classmethod(lambda _cls: fake_home))
-        isolation.activate_isolated_workspace()
-
-        target = wrap_mod._isolate_omp_agent_dir()
-
-        assert target is not None
-        assert (target / "models.yml").read_text() == "providers: {anthropic: {}}\n"
-        assert (target / "credentials.json").exists()
-
-    def test_explicit_user_agent_dir_wins(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "mine"))
-        isolation.activate_isolated_workspace()
-
-        assert wrap_mod._isolate_omp_agent_dir() is None
-        assert os.environ["PI_CODING_AGENT_DIR"] == str(tmp_path / "mine")
-
-
 class TestCopilotBackendProbeGate:
     """`wrap copilot` must only inherit a running proxy's backend when it will
     actually REUSE that proxy. An isolated run (the default) starts its own
@@ -777,100 +721,44 @@ class TestLaunchToolSighup:
         assert "signal.signal(signal.SIGHUP, cleanup)" in src
 
 
-class TestIsolateAgentConfigHomes:
-    """Codex/Grok/OMP keep their endpoint + Headroom MCP entry in one shared
-    config file their processes re-read, so concurrent isolated runs need
-    private copies rather than a post-hoc rewrite (round 3, P1)."""
+class TestMcpRegistrationForcesActualPort:
+    """A dedicated proxy binds a port that differs from any previously
+    registered `headroom` MCP entry. Without force the registrar reports
+    MISMATCH and leaves the STALE endpoint, so retrieval would hit the shared
+    proxy, another run's workspace, or a dead port (round 6, P1)."""
 
-    def _fake_home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-        home = tmp_path / "home"
-        monkeypatch.setattr(wrap_mod.Path, "home", classmethod(lambda _cls: home))
-        return home
+    def test_every_registrar_call_site_forces(self) -> None:
+        import inspect
 
-    @pytest.mark.parametrize(
-        "helper,env_var,rel,dir_name",
-        [
-            ("_isolate_codex_home", "CODEX_HOME", (".codex",), "codex-home"),
-            ("_isolate_grok_home", "GROK_HOME", (".grok",), "grok-home"),
-            ("_isolate_omp_agent_dir", "PI_CODING_AGENT_DIR", (".omp", "agent"), "omp-agent"),
-        ],
-    )
-    def test_isolated_run_gets_private_config_home(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        helper: str,
-        env_var: str,
-        rel: tuple[str, ...],
-        dir_name: str,
-    ) -> None:
-        monkeypatch.delenv(env_var, raising=False)
-        home = self._fake_home(monkeypatch, tmp_path)
-        source = home.joinpath(*rel)
-        source.mkdir(parents=True)
-        (source / "config.toml").write_text("user = true\n")
-        run_dir = isolation.activate_isolated_workspace()
+        src = inspect.getsource(wrap_mod)
+        calls = [
+            line.strip()
+            for line in src.splitlines()
+            if "_setup_headroom_mcp(" in line and "def _setup_headroom_mcp" not in line
+        ]
+        assert calls, "expected to find _setup_headroom_mcp call sites"
+        unforced = [c for c in calls if "force=True" not in c]
+        assert not unforced, f"registration without force=True: {unforced}"
 
-        target = getattr(wrap_mod, helper)()
+    def test_claude_registration_is_forced(self) -> None:
+        import inspect
 
-        assert target == run_dir / dir_name
-        assert os.environ[env_var] == str(target)
-        # Seeded from the user's own config so catalog/credentials survive.
-        assert (target / "config.toml").read_text() == "user = true\n"
+        src = inspect.getsource(wrap_mod.claude.callback)
+        assert "_setup_headroom_mcp(ClaudeRegistrar(), actual_port" in src
+        assert "force=True" in src
 
-    @pytest.mark.parametrize(
-        "helper,env_var",
-        [
-            ("_isolate_codex_home", "CODEX_HOME"),
-            ("_isolate_grok_home", "GROK_HOME"),
-            ("_isolate_omp_agent_dir", "PI_CODING_AGENT_DIR"),
-        ],
-    )
-    def test_noop_without_isolation(
-        self, monkeypatch: pytest.MonkeyPatch, helper: str, env_var: str
-    ) -> None:
-        monkeypatch.delenv(env_var, raising=False)
-        assert getattr(wrap_mod, helper)() is None
-        assert env_var not in os.environ
 
-    @pytest.mark.parametrize(
-        "helper,env_var",
-        [
-            ("_isolate_codex_home", "CODEX_HOME"),
-            ("_isolate_grok_home", "GROK_HOME"),
-        ],
-    )
-    def test_explicit_user_value_is_respected(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, helper: str, env_var: str
-    ) -> None:
-        monkeypatch.setenv(env_var, str(tmp_path / "mine"))
-        isolation.activate_isolated_workspace()
+class TestProxyOnlyWatcherSighup:
+    """cursor / grok-build / cline / zcode / continue start a DETACHED
+    dedicated proxy and then just wait. Closing the terminal sends SIGHUP, so
+    without a handler the watcher exits and the proxy lives on forever on the
+    per-run port (round 6, P2)."""
 
-        assert getattr(wrap_mod, helper)() is None
-        assert os.environ[env_var] == str(tmp_path / "mine")
+    def test_watcher_registers_sighup_and_exits(self) -> None:
+        import inspect
 
-    def test_two_isolated_runs_get_distinct_codex_configs(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.delenv("CODEX_HOME", raising=False)
-        home = self._fake_home(monkeypatch, tmp_path)
-        (home / ".codex").mkdir(parents=True)
-
-        isolation.activate_isolated_workspace(run_id="a")
-        first = wrap_mod._isolate_codex_home()
-
-        # A second process inherits none of the first run's markers.
-        for var in (
-            isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
-            isolation.HEADROOM_MEMORY_DB_PATH_ENV,
-            paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
-            paths.HEADROOM_SETTINGS_PATH_ENV,
-            "CODEX_HOME",
-        ):
-            os.environ.pop(var, None)
-        os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(tmp_path / "ws")
-        isolation.activate_isolated_workspace(run_id="b")
-        second = wrap_mod._isolate_codex_home()
-
-        assert first is not None and second is not None
-        assert first != second
+        src = inspect.getsource(wrap_mod._run_proxy_only_watcher)
+        assert 'hasattr(signal, "SIGHUP")' in src
+        assert "signal.signal(signal.SIGHUP" in src
+        # Cleanup alone is not enough — it must not fall back into the loop.
+        assert "SystemExit" in src

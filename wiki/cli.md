@@ -779,16 +779,23 @@ For a tool that records the proxy port in its own on-disk config (Codex and
 Grok register the `headroom` retrieve MCP server; OMP writes `models.yml`),
 the dedicated port is reapplied after the proxy binds, so retrieval and
 inference target the run's actual proxy rather than the reserved base port.
-Some agents keep that endpoint (and the Headroom MCP registration) in a
-single shared file their own processes re-read — `~/.omp/agent/models.yml`,
-`$CODEX_HOME/config.toml`, `~/.grok/config.toml`. Rewriting it after the
-proxy binds only narrows the race, so an isolated run instead gets its own
-copy of that config home (`PI_CODING_AGENT_DIR` / `CODEX_HOME` /
-`GROK_HOME`), seeded from the existing one so the model catalog,
-credentials, and settings carry over. An explicitly set value is always
-respected, and a nested `wrap --shared` launched from such a session gets
-the user's shared agent config back rather than the outer session's private
-copy. `wrap claude` records the actual bound port in its
+**Known limitation — concurrent runs of the *same* agent.** Some agents keep
+their endpoint (and the Headroom MCP registration) in a single shared file
+their own processes re-read: `~/.omp/agent/models.yml`,
+`$CODEX_HOME/config.toml`, `~/.grok/config.toml`. Isolation deliberately
+does **not** relocate those config homes, because they also hold durable
+state — Codex keeps its transcripts and history under `$CODEX_HOME/sessions`,
+so a per-run home would hide wrapped sessions from `codex resume` and let
+run-directory GC delete them. Losing transcripts is worse than the race it
+would prevent.
+
+The consequence: with two concurrent isolated runs of the same agent, the
+later launch's port wins in that shared file, so the earlier run's
+retrieval (`headroom_retrieve`) may reach the other run's proxy — or a dead
+port once that run exits. Model routing is unaffected for Codex (its
+endpoint is passed per-process via `--config` overrides). To keep two
+same-agent runs fully independent today, give them separate config homes
+yourself (`CODEX_HOME=... headroom wrap codex`). `wrap claude` records the actual bound port in its
 `.headroom_wrap_marker.json`, so the SessionStart self-heal hook does not
 mistake a live run on 8788 for a dead one.
 

@@ -82,9 +82,6 @@ from headroom.isolation import (
 from headroom.isolation import (
     isolation_requested as _isolation_requested,  # noqa: F401
 )
-from headroom.isolation import (
-    record_isolated_agent_home as _record_isolated_agent_home,
-)
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -3227,6 +3224,18 @@ def _run_proxy_only_watcher(
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+    if hasattr(signal, "SIGHUP"):
+        # This watcher has no child process to outlive it — closing the
+        # terminal (SIGHUP, not SIGTERM) would otherwise end the watcher while
+        # its DETACHED dedicated proxy keeps running on the per-run port, and
+        # the run dir's recorded owner PID is then dead so GC can delete a live
+        # proxy's state. Clean up, then exit rather than returning into the
+        # wait loop.
+        def _hangup(signum: int | None = None, frame: Any = None) -> None:
+            cleanup(signum, frame)
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGHUP, _hangup)
 
     try:
         _print_wrap_banner(agent_label)
@@ -4703,106 +4712,6 @@ def _reject_misplaced_isolated_flag(args: tuple, tool: str) -> None:
             )
 
 
-def _isolate_agent_config_home(
-    env_var: str,
-    source: Path,
-    dir_name: str,
-    *,
-    label: str,
-    verbose: bool = False,
-) -> Path | None:
-    """Point an agent's config-home env var at a per-run copy. Returns it, or None.
-
-    Several wrapped agents keep their AUTHORITATIVE endpoint (and the Headroom
-    MCP registration) in one shared file that the agent — or its spawned child
-    sessions — re-read at will: ``~/.omp/agent/models.yml``,
-    ``$CODEX_HOME/config.toml``, ``~/.grok/config.toml``. Concurrent isolated
-    runs each need a *different* proxy port in that file, so sharing it lets a
-    later launch silently re-route an earlier run through ITS proxy — or, once
-    it exits, at a dead port. Rewriting the shared file after the proxy binds
-    only narrows that race; it cannot close it.
-
-    Each agent exposes an env var that relocates its whole config home
-    (``PI_CODING_AGENT_DIR`` / ``CODEX_HOME`` / ``GROK_HOME``), so an isolated
-    run gets a private copy instead. The directory is COPIED, not just
-    referenced, so the agent keeps its model catalog, credentials, and user
-    settings; the copy lives in the run directory and disappears with it.
-
-    Best-effort and conservative: an explicit user-set value is always
-    respected, and any failure falls back to the shared directory (with a
-    warning on stderr) rather than blocking the launch.
-    """
-
-    from headroom import paths as _paths
-
-    if not _isolation_requested():
-        return None
-    if os.environ.get(env_var, "").strip():
-        # The user pinned an explicit config home — never second-guess it.
-        return None
-
-    target = _paths.workspace_dir() / dir_name
-    try:
-        if source.is_dir() and not target.exists():
-            shutil.copytree(source, target, dirs_exist_ok=True)
-        target.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        click.echo(
-            f"  Warning: could not create a per-run {label} config ({exc}); "
-            f"falling back to the shared {source}.",
-            err=True,
-        )
-        return None
-
-    os.environ[env_var] = str(target)
-    # Record it so a nested `wrap --shared` hands the child back the user's
-    # shared agent config instead of this live session's private copy.
-    _record_isolated_agent_home(env_var)
-    if verbose:
-        click.echo(f"  Isolated {label} config: {target}", err=True)
-    return target
-
-
-def _isolate_omp_agent_dir(*, verbose: bool = False) -> Path | None:
-    """Per-run ``~/.omp/agent`` (models.yml) for an isolated run."""
-
-    return _isolate_agent_config_home(
-        "PI_CODING_AGENT_DIR",
-        Path.home() / ".omp" / "agent",
-        "omp-agent",
-        label="omp",
-        verbose=verbose,
-    )
-
-
-def _isolate_codex_home(*, verbose: bool = False) -> Path | None:
-    """Per-run ``$CODEX_HOME`` (config.toml) for an isolated run.
-
-    Must run BEFORE anything resolves ``_codex_home_dir()`` or registers the
-    Codex MCP server, so the whole flow lands in the per-run copy.
-    """
-
-    return _isolate_agent_config_home(
-        "CODEX_HOME",
-        Path.home() / ".codex",
-        "codex-home",
-        label="Codex",
-        verbose=verbose,
-    )
-
-
-def _isolate_grok_home(*, verbose: bool = False) -> Path | None:
-    """Per-run ``$GROK_HOME`` (config.toml) for an isolated run."""
-
-    return _isolate_agent_config_home(
-        "GROK_HOME",
-        Path.home() / ".grok",
-        "grok-home",
-        label="Grok",
-        verbose=verbose,
-    )
-
-
 def _wrap_memory_db_path() -> Path:
     """Resolve the memory SQLite path for wrap-side memory sync.
 
@@ -5586,7 +5495,13 @@ def claude(
         if not no_mcp:
             from headroom.mcp_registry import ClaudeRegistrar
 
-            _setup_headroom_mcp(ClaudeRegistrar(), actual_port, verbose=verbose)
+            # force: an isolated run's dedicated proxy binds a port that
+            # differs from any previously registered entry (typically 8787).
+            # Without force the registrar returns MISMATCH and LEAVES the old
+            # endpoint in place, so `headroom_retrieve` would call the shared
+            # proxy, another run's workspace, or a dead port. Every other
+            # agent's registration already forces for exactly this reason.
+            _setup_headroom_mcp(ClaudeRegistrar(), actual_port, verbose=verbose, force=True)
         elif verbose:
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
@@ -6375,10 +6290,6 @@ def _run_codex_wrap(
     codex_args: tuple,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
-    # BEFORE any _codex_home_dir() / MCP registration: an isolated run writes
-    # its dedicated port into a PRIVATE config.toml, so two concurrent Codex
-    # wraps can't overwrite each other's endpoint between write and launch.
-    _isolate_codex_home(verbose=verbose)
     if prepare_only:
         _prepare_codex_wrap_state(
             port=port,
@@ -7046,10 +6957,6 @@ def grok(
         headroom wrap grok --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap grok --port 9999             # Custom proxy port
     """
-    # BEFORE the MCP registration below: an isolated run registers its
-    # dedicated port in a PRIVATE ~/.grok/config.toml copy, so concurrent Grok
-    # wraps can't overwrite each other's `headroom` MCP entry.
-    _isolate_grok_home(verbose=verbose)
     agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
     if not no_rtk:
         _setup_context_tool_for_agent(
@@ -8788,9 +8695,6 @@ def omp(
         headroom unwrap omp                     # Restore pre-wrap models.yml
     """
     _reject_misplaced_isolated_flag(omp_args, "omp")
-    # Before ANY models.yml work: an isolated run gets its own omp agent dir so
-    # concurrent runs don't overwrite each other's endpoint in the shared file.
-    _isolate_omp_agent_dir(verbose=verbose)
     # Setup CLI context tool for omp — it reads AGENTS.md from the project root.
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
