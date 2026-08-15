@@ -21,16 +21,19 @@ token breakdowns per window that enable:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from headroom import _filelock
 from headroom import paths as _paths
 from headroom.offline import is_offline
 from headroom.subscription.base import QuotaTracker
@@ -547,6 +550,76 @@ class SubscriptionTracker(QuotaTracker):
         except Exception:
             pass
 
+    @contextlib.contextmanager
+    def _poll_ownership(self) -> Iterator[bool]:
+        """Hold the account-poll lock for the duration of one usage request.
+
+        Non-blocking and NOT cached, unlike the RTK lock: a wrap session is
+        short-lived, so ownership has to be able to move to another live proxy
+        as soon as the current holder exits. Yields whether this process won
+        the election — the caller polls either way (see the call site), but
+        only an owner publishes.
+        """
+
+        path = _paths.subscription_poll_lock_path()
+        handle = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 — closed below
+        except OSError:
+            yield True  # cannot coordinate; behave as before
+            return
+        acquired = _filelock.acquire(handle, timeout=0)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                _filelock.release(handle)
+            with contextlib.suppress(OSError):
+                handle.close()
+
+    def _adopt_shared_snapshot(self) -> SubscriptionSnapshot | None:
+        """The account snapshot another proxy published, if it is still fresh.
+
+        "Fresh" is one poll interval: adopting anything older would leave a
+        session reporting usage windows it should have refreshed by now.
+        """
+
+        try:
+            raw = json.loads(_paths.subscription_snapshot_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        try:
+            snapshot = SubscriptionSnapshot.from_dict(raw)
+        except (TypeError, ValueError):
+            return None
+        age = (_utc_now() - snapshot.polled_at).total_seconds()
+        if age < 0 or age > self._poll_interval_s:
+            return None
+        logger.debug("event=subscription_snapshot_adopted age_s=%.1f", age)
+        return snapshot
+
+    def _publish_shared_snapshot(self, snapshot: SubscriptionSnapshot) -> None:
+        """Publish an account snapshot for the other proxies on this machine.
+
+        Best-effort and atomic: a peer must never read a half-written file, but
+        a failure here only costs the peers one extra poll of their own.
+        """
+
+        path = _paths.subscription_snapshot_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=path.parent, delete=False, suffix=".tmp", encoding="utf-8"
+            ) as fh:
+                json.dump(snapshot.to_dict(), fh, indent=2)
+                tmp_path = fh.name
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            logger.debug("Failed to publish shared subscription snapshot: %s", exc)
+
     def _rtk_poll_lock_path(self) -> Path:
         """Return the path to the RTK poll lock file."""
         override = os.environ.get(_RTK_POLL_LOCK_ENV, "").strip()
@@ -746,7 +819,25 @@ class SubscriptionTracker(QuotaTracker):
                 return
             token = token or bg_token
 
-        snapshot = await self._client.fetch(token)
+        # The usage windows below describe the ACCOUNT, not this run. Isolation
+        # gives every concurrent wrap its own proxy, each with its own tracker
+        # on its own five-minute loop — so a fan-out of N agents on one OAuth
+        # account would make N account-usage requests per interval, which is
+        # what the tracker's own rate-limit and token-flagging safeguards exist
+        # to prevent. Elect one poller through a SHARED lock; everyone else
+        # adopts what it published.
+        snapshot = self._adopt_shared_snapshot()
+        if snapshot is None:
+            with self._poll_ownership() as owns_poll:
+                if not owns_poll:
+                    # Another proxy holds the lock but has not published a
+                    # fresh snapshot yet (it may be mid-fetch, or have died
+                    # before writing). Polling ourselves is the safe failure:
+                    # a duplicate request beats a session with no usage data.
+                    logger.debug("event=subscription_poll_not_owner falling_back=fetch")
+                snapshot = await self._client.fetch(token)
+                if snapshot is not None and owns_poll:
+                    self._publish_shared_snapshot(snapshot)
         if snapshot is None:
             with self._lock:
                 self._state.mark_error("fetch returned None")

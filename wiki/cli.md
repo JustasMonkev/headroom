@@ -789,15 +789,23 @@ so a per-run home would hide wrapped sessions from `codex resume` and let
 run-directory GC delete them. Losing transcripts is worse than the race it
 would prevent.
 
-The consequence: with two concurrent isolated runs of the same agent, the
-later launch's port wins in that shared file, so the earlier run's
-retrieval (`headroom_retrieve`) may reach the other run's proxy — or a dead
-port once that run exits. Model routing is unaffected for Codex (its
-endpoint is passed per-process via `--config` overrides). To keep two
-same-agent runs fully independent today, give them separate config homes
-yourself (`CODEX_HOME=... headroom wrap codex`). `wrap claude` records the actual bound port in its
-`.headroom_wrap_marker.json`, so the SessionStart self-heal hook does not
-mistake a live run on 8788 for a dead one.
+Retrieval is no longer affected by that. An isolated run registers a
+**port-agnostic** `headroom` MCP entry — every concurrent run writes the
+identical entry, so there is nothing left to overwrite in the shared file and
+nothing pointing at a dead port after a run exits. The real port reaches the
+server another way: it is a stdio server spawned as a child of the agent, and
+`headroom mcp serve --proxy-url` reads `HEADROOM_PROXY_URL`, which the
+launcher exports per run. Shared (`--shared`) runs keep the explicit pin,
+since there is only one proxy to name.
+
+What remains: config that records the port for **model routing** rather than
+for MCP — OMP's `~/.omp/agent/models.yml` — still holds a single value, so
+the later launch wins there. Codex is unaffected (its endpoint is passed
+per-process via `--config` overrides). To make two same-agent runs fully
+independent including that, give them separate config homes yourself
+(`CODEX_HOME=... headroom wrap codex`). `wrap claude` records the actual
+bound port in its `.headroom_wrap_marker.json`, so the SessionStart self-heal
+hook does not mistake a live run on 8788 for a dead one.
 
 `--prepare-only` is exempt from isolation: it starts no proxy, and its
 stdout is machine-readable (`scripts/install.sh` pipes it into `openclaw
@@ -855,7 +863,12 @@ database would give the session two conflicting memory views. Headroom adopts
 the database a persistent deployment recorded when there is one, and otherwise
 simply drops the per-run pin so every consumer falls back to the same default
 the proxy itself resolved (`{cwd}/.headroom/memory.db`) — substituting a
-workspace path would invent a third store rather than reconcile.
+workspace path would invent a third store rather than reconcile. That
+reconciliation happens **before** any memory setup, not just before the proxy
+is contacted: the Claude and Codex flows both import native memories while
+preparing the session, and settling the database afterwards would leave those
+memories in the throwaway run database where neither the proxy nor the MCP
+server would ever see them.
 
 The exemptions above also apply when a wrap is nested inside an
 already-isolated agent: `selfheal`, `openclaw` and `--prepare-only` return to

@@ -72,6 +72,8 @@ _SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
+_SUBSCRIPTION_SNAPSHOT_FILE = "subscription_snapshot.json"
+_SUBSCRIPTION_POLL_LOCK_FILE = "subscription_poll.lock"
 _MEMORY_DB_FILE = "memory.db"
 _MEMORIES_DIR = "memories"
 _LICENSE_CACHE_FILE = "license_cache.json"
@@ -291,6 +293,37 @@ def subscription_state_path(explicit: str | os.PathLike[str] | None = None) -> P
         HEADROOM_SUBSCRIPTION_STATE_PATH_ENV,
         workspace_dir() / _SUBSCRIPTION_FILE,
     )
+
+
+def subscription_snapshot_path() -> Path:
+    """Return the path for the ACCOUNT-GLOBAL subscription usage snapshot.
+
+    The usage windows this holds describe an Anthropic account, not a run, and
+    every concurrent isolated proxy authenticated as that account would
+    otherwise poll ``/api/oauth/usage`` on its own five-minute interval —
+    multiplying account-level requests by the number of agents a fan-out
+    launched, which is exactly what the tracker's rate-limit safeguards exist
+    to avoid. So it resolves against the SHARED workspace: one proxy polls and
+    publishes here, the rest adopt what it published.
+
+    This run's own contribution counters stay in its private
+    ``subscription_state.json`` (see :func:`subscription_state_path`) — those
+    are per-session measurements, and sharing them would let concurrent runs
+    overwrite each other's totals.
+    """
+
+    return shared_workspace_dir() / _SUBSCRIPTION_SNAPSHOT_FILE
+
+
+def subscription_poll_lock_path() -> Path:
+    """Return the lock deciding which proxy polls account usage.
+
+    Shared-rooted for the same reason as :func:`subscription_snapshot_path`:
+    a per-run lock hands every concurrent proxy its own file and serializes
+    nothing.
+    """
+
+    return shared_workspace_dir() / _SUBSCRIPTION_POLL_LOCK_FILE
 
 
 def memory_db_path() -> Path:
@@ -555,6 +588,8 @@ __all__ = [
     "license_cache_path",
     "verbosity_profile_path",
     "output_savings_baseline_path",
+    "subscription_snapshot_path",
+    "subscription_poll_lock_path",
     "session_stats_path",
     "savings_events_path",
     "settings_path",

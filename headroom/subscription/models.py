@@ -89,6 +89,22 @@ class RateLimitWindow:
             resets_at=_parse_timestamp(data.get("resets_at")),
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RateLimitWindow:
+        """Inverse of :meth:`to_dict`.
+
+        Distinct from :meth:`from_api_dict` because the two shapes differ:
+        ``to_dict`` renames ``utilization`` to ``utilization_pct`` and adds a
+        derived ``seconds_to_reset``, so the API parser silently reads a zero
+        utilization back out of our own serialization.
+        """
+        return cls(
+            used=int(data.get("used") or 0),
+            limit=int(data.get("limit") or 0),
+            utilization_pct=float(data.get("utilization_pct") or 0.0),
+            resets_at=_parse_timestamp(data.get("resets_at")),
+        )
+
     def seconds_to_reset(self, *, now: datetime | None = None) -> float | None:
         if self.resets_at is None:
             return None
@@ -254,6 +270,18 @@ class ExtraUsage:
             utilization_pct=_safe_float(data.get("utilization")),
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExtraUsage:
+        """Inverse of :meth:`to_dict` (which publishes USD, not cents)."""
+        limit_usd = _safe_float(data.get("monthly_limit_usd"))
+        used_usd = _safe_float(data.get("used_credits_usd"))
+        return cls(
+            is_enabled=bool(data.get("is_enabled", False)),
+            monthly_limit_cents=None if limit_usd is None else round(limit_usd * 100),
+            used_credits_cents=None if used_usd is None else round(used_usd * 100),
+            utilization_pct=_safe_float(data.get("utilization_pct")),
+        )
+
     @property
     def monthly_limit_usd(self) -> float | None:
         if self.monthly_limit_cents is None:
@@ -312,6 +340,27 @@ class SubscriptionSnapshot:
             snap.seven_day_sonnet = RateLimitWindow.from_api_dict(data["seven_day_sonnet"])
         if "extra_usage" in data and data["extra_usage"]:
             snap.extra_usage = ExtraUsage.from_api_dict(data["extra_usage"])
+        return snap
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubscriptionSnapshot:
+        """Inverse of :meth:`to_dict`.
+
+        Used to adopt an account-global snapshot another proxy polled and
+        published, so concurrent isolated runs sharing one OAuth account do not
+        each hit the usage API on their own interval.
+        """
+        snap = cls(token_prefix=str(data.get("token_prefix") or ""))
+        for name in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+            raw = data.get(name)
+            if isinstance(raw, dict):
+                setattr(snap, name, RateLimitWindow.from_dict(raw))
+        extra = data.get("extra_usage")
+        if isinstance(extra, dict):
+            snap.extra_usage = ExtraUsage.from_dict(extra)
+        polled_at = _parse_timestamp(data.get("polled_at"))
+        if polled_at is not None:
+            snap.polled_at = polled_at
         return snap
 
     def to_dict(self) -> dict[str, Any]:

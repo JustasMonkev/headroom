@@ -323,6 +323,42 @@ def test_health_reports_the_RESOLVED_default_database(monkeypatch, tmp_path):
     assert Path(reported) == tmp_path / ".headroom" / "memory.db"
 
 
+def test_health_resolves_an_explicit_RELATIVE_database(monkeypatch, tmp_path):
+    """`--memory-db-path state/memory.db` resolves against the PROXY's cwd.
+
+    Reporting the unresolved string sends an attaching wrap off to anchor the
+    same relative path against its own directory, so MCP/wrap-side memory ends
+    up on a different file than API-side retrieval — the same divergence the
+    default-path fix closed, one branch over.
+    """
+    monkeypatch.chdir(tmp_path)
+    app, _proxy = _health_app(monkeypatch, memory_enabled=True, memory_db_path="state/memory.db")
+
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    reported = payload["config"]["memory_db_path"]
+    assert Path(reported).is_absolute(), f"still relative: {reported!r}"
+    assert Path(reported) == tmp_path / "state" / "memory.db"
+
+
+def test_health_leaves_an_absolute_database_alone(monkeypatch, tmp_path):
+    """Anchoring must not rewrite a path the operator already made absolute."""
+    db = tmp_path / "explicit" / "memory.db"
+    app, _proxy = _health_app(monkeypatch, memory_enabled=True, memory_db_path=str(db))
+
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    assert payload["config"]["memory_db_path"] == str(db)
+
+
 def test_health_memory_db_path_is_present_even_when_unset(monkeypatch):
     """The key must always exist, so a caller can tell "this proxy does not
     report it" (older build) from "it reports no path"."""

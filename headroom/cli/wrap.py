@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -1591,6 +1591,33 @@ def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
     _write_wrap_marker_owners(settings_path, remaining)
 
 
+def _owner_handover_url(owner: dict[str, Any], *, key: str) -> str | None:
+    """The URL routing should be handed back to for ``owner``.
+
+    Prefers the exact value the owner recorded. Markers written before that
+    field existed carry only ``port`` and ``key``, and treating that as "no
+    target" is worse than it looks: the handover leaves ``settings.local.json``
+    naming the EXITING run's proxy, which is about to be terminated, while the
+    marker now names the older live owner — so SessionStart self-heal probes
+    that owner's live port, finds it answering, and never repairs the dead URL.
+
+    ``key`` encodes the mode, which is all the reconstruction needs: Foundry's
+    base URL carries the ``/anthropic`` suffix the Anthropic SDK appends
+    ``/v1/messages`` to, while Vertex and standard mode both take the bare
+    ``http://127.0.0.1:<port>``. Returns None only when there is genuinely
+    nothing to point at.
+    """
+
+    recorded = owner.get("url")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    port = owner.get("port")
+    if not isinstance(port, int):
+        return None
+    base = _claude_proxy_base_url(port)
+    return _foundry_proxy_url(base) if key == "ANTHROPIC_FOUNDRY_BASE_URL" else base
+
+
 def _handover_to_live_owner(
     settings_path: Path, *, key: str, require_live_port: bool = False
 ) -> str | None:
@@ -1643,13 +1670,13 @@ def _handover_to_live_owner_locked(
             _write_wrap_marker_owners(settings_path, others)
         return None
 
-    handover = owners[-1].get("url")
+    handover = _owner_handover_url(owners[-1], key=key)
     # Preserve relative order: `_write_wrap_marker_owners` mirrors owners[-1]
     # at the top level, and the handover target must be the newest entry.
     _write_wrap_marker_owners(settings_path, [*others, *owners])
-    if not isinstance(handover, str) or not handover:
-        # Legacy owner with no recorded URL: leave the file as-is rather than
-        # guess and strand the live session.
+    if not handover:
+        # Nothing recorded and no port to rebuild from: leave the file as-is
+        # rather than guess and strand the live session.
         return None
     click.echo(
         f"headroom: {key} handed back to the still-live wrap session "
@@ -2123,16 +2150,16 @@ def _restore_claude_wrap_base_url_locked(
             # value — otherwise ITS daemon workers would bypass Headroom
             # entirely. This covers BOTH exit orders: the newer run leaving
             # first restores the older run's URL, and vice versa.
-            handover = survivors[-1].get("url")
+            handover = _owner_handover_url(survivors[-1], key=key)
             _write_wrap_marker_owners(path, remaining)
             # The stack now correctly names the surviving owner(s); the
             # marker-clearing tail below must not wipe it.
             handed_over = True
-            if isinstance(handover, str) and handover:
+            if handover:
                 previous = handover
             else:
-                # No recorded URL (legacy marker): leave the file untouched
-                # rather than guess and strand the live peer.
+                # Nothing recorded and no port to rebuild from: leave the file
+                # untouched rather than guess and strand the live peer.
                 return
         else:
             # We were the last live owner OF THIS KEY — fall through and
@@ -2187,8 +2214,20 @@ def _setup_headroom_mcp(
 
     Generic across registrars: ``ClaudeRegistrar``, ``CodexRegistrar``, and
     any future agent registrar all flow through the same setup path.
+
+    Isolated runs deliberately register a PORT-AGNOSTIC entry. Every registrar
+    writes into user-scoped configuration (``~/.claude.json``,
+    ``$CODEX_HOME/config.toml``) that all runs share, and it holds one slot per
+    server name — so baking this run's dedicated port into it means a
+    concurrent launch overwrites it, and whichever agent reads the file next
+    gets the other run's port: hashes emitted by its own proxy then cannot be
+    retrieved, and once that run exits the entry names a dead port for everyone.
+    The server is stdio, spawned as a child of the agent, and
+    ``headroom mcp serve --proxy-url`` reads ``HEADROOM_PROXY_URL`` from its
+    environment — so the launcher exports the real port there and every
+    concurrent run writes the SAME entry instead of fighting over one slot.
     """
-    from headroom.mcp_registry import build_headroom_spec, format_result
+    from headroom.mcp_registry import DEFAULT_PROXY_URL, build_headroom_spec, format_result
 
     if not registrar.detect():
         if verbose:
@@ -2196,7 +2235,7 @@ def _setup_headroom_mcp(
         return
 
     proxy_url = f"http://127.0.0.1:{port}"
-    spec = build_headroom_spec(proxy_url)
+    spec = build_headroom_spec(DEFAULT_PROXY_URL if _isolation_requested() else proxy_url)
     result = registrar.register_server(spec, force=force)
 
     line = format_result(
@@ -4018,7 +4057,28 @@ def _query_proxy_health(port: int) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _repoint_own_endpoints(env: dict[str, str], port: int, actual_port: int) -> None:
+def _wrapper_written_keys(env_vars_display: Iterable[str], env: Mapping[str, str]) -> set[str]:
+    """The env keys this wrapper set, as declared by its own launch banner.
+
+    Every launch path builds ``env_vars_display`` as ``KEY=value`` lines for
+    exactly the variables it wrote — that is what gets printed under
+    "Launching ...". It is therefore a direct record of authorship, unlike a
+    value comparison, which cannot tell "we wrote this" from "we inherited it".
+    Entries are only trusted when the name is actually present in ``env``.
+    """
+
+    written: set[str] = set()
+    for entry in env_vars_display:
+        name, sep, _ = entry.partition("=")
+        name = name.strip()
+        if sep and name and name in env:
+            written.add(name)
+    return written
+
+
+def _repoint_own_endpoints(
+    env: dict[str, str], port: int, actual_port: int, *, written: Iterable[str] = ()
+) -> None:
     """Rewrite ``127.0.0.1:port`` -> ``127.0.0.1:actual_port``, ours only.
 
     ``env`` starts as a copy of ``os.environ``, so replacing across all of it
@@ -4028,9 +4088,20 @@ def _repoint_own_endpoints(env: dict[str, str], port: int, actual_port: int) -> 
     the Headroom proxy. An isolated run binds a shifted port on every launch,
     so this runs on essentially every wrap rather than as a rare fallback.
 
-    "Ours" = the value DIFFERS from what we inherited, i.e. this wrapper wrote
-    it. Nothing else qualifies — not even a ``HEADROOM_*`` prefix, which covers
-    plenty of non-routing endpoints (``HEADROOM_KOMPRESS_ENDPOINT``,
+    "Ours" is the union of two independent authorship signals, because neither
+    alone is complete:
+
+    * ``written`` — the keys the launch path says it set. Authoritative when a
+      wrapper writes a value IDENTICAL to the inherited one: with an inherited
+      ``ANTHROPIC_BASE_URL=http://127.0.0.1:8787``, ``wrap goose`` writes that
+      same string, binds its dedicated proxy on 8788, and a value comparison
+      would call the variable untouched and leave the agent on the shared (or
+      dead) port instead of its own proxy.
+    * value inequality — catches anything a launch path writes without
+      announcing, so an unlisted routing variable still gets re-pointed.
+
+    Nothing else qualifies — in particular not a ``HEADROOM_*`` prefix, which
+    covers plenty of non-routing endpoints (``HEADROOM_KOMPRESS_ENDPOINT``,
     ``HEADROOM_REDIS_URL``, ``HEADROOM_QDRANT_URL``,
     ``HEADROOM_OTEL_METRICS_ENDPOINT``): an inherited one of those pointing at
     the requested port would be re-pointed at the proxy, sending the agent and
@@ -4038,8 +4109,9 @@ def _repoint_own_endpoints(env: dict[str, str], port: int, actual_port: int) -> 
     """
 
     inherited = os.environ
+    ours = set(written)
     for key, value in dict(env).items():
-        if inherited.get(key) == value:
+        if key not in ours and inherited.get(key) == value:
             continue
         env[key] = value.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
 
@@ -4585,6 +4657,60 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
+def _align_memory_with_reused_proxy(port: int, *, memory: bool, no_proxy: bool) -> None:
+    """Point this run's memory at the database the reused proxy actually uses.
+
+    A `--no-proxy` run attaches to a proxy it did not start. That proxy serves
+    API-side retrieval from ITS database, so leaving the run pinned to an
+    isolated one gives the session two conflicting memory views: wrap-side sync
+    and the agent's memory MCP on the run DB, retrieval on the proxy's.
+
+    MUST run before any memory setup, not just before the proxy is contacted.
+    Both the Claude and Codex flows sync native memories into
+    ``_wrap_memory_db_path()`` while preparing the session — the Claude flow
+    before `_ensure_proxy` is reached at all, the Codex flow before it calls
+    `_launch_tool`. Reconciling later would mean the import had already
+    populated the throwaway run database, and the proxy (and the MCP server
+    started after it) would never see those memories.
+
+    Idempotent: once the pin no longer names the isolated database, the
+    underlying reconciliation is a no-op, so the later call from `_ensure_proxy`
+    covers the flows that do no early memory work without repeating itself.
+    """
+
+    if not (memory and no_proxy):
+        return
+    helpers = _live_wrap_module()
+    if not helpers._isolation_requested():
+        return
+
+    # A persistent deployment records the database it was started with;
+    # otherwise drop the pin so every consumer falls back to the same default
+    # the proxy resolved ({cwd}/.headroom/memory.db) rather than a path we
+    # invented. Ask the proxy itself first: /health reports the database it is
+    # actually using. Falling back to "the same default rule" is not enough,
+    # because that rule resolves against each process's own cwd — a proxy
+    # started from another directory resolves a different file. A manifest is
+    # the next-best source, and an older proxy that reports neither leaves us
+    # with the plain fallback.
+    from headroom import isolation as _isolation
+
+    _effective_db = helpers._proxy_memory_db_path(port)
+    if not _effective_db:
+        _reused = helpers._find_persistent_manifest(port)
+        _effective_db = getattr(_reused, "memory_db_path", None) if _reused else None
+    if _isolation.align_memory_db_with_reused_proxy(_effective_db):
+        _now = os.environ.get(_isolation.HEADROOM_MEMORY_DB_PATH_ENV)
+        click.echo(
+            f"  Memory follows the reused proxy: {_now}"
+            if _now
+            else "  Memory: dropped this run's isolated database. The reused proxy "
+            "did not report its own, so both sides fall back to the default "
+            "(./.headroom/memory.db) — they may still differ if it was started "
+            "from another directory."
+        )
+
+
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
@@ -4626,37 +4752,7 @@ def _ensure_proxy(
             "  Warning: --no-proxy reuses the existing proxy, so this isolated run "
             "gets no dedicated proxy instance (pass --shared for fully shared state)."
         )
-        if memory:
-            # The reused proxy serves API-side retrieval from ITS database, so
-            # leaving this run pinned to an isolated one would give the session
-            # two conflicting memory views: wrap-side sync and the agent's
-            # memory MCP on the run DB, retrieval on the proxy's. Reconcile
-            # rather than warn about it. A persistent deployment records the
-            # database it was started with; otherwise drop the pin so every
-            # consumer falls back to the same default the proxy resolved
-            # ({cwd}/.headroom/memory.db) rather than a path we invented.
-            from headroom import isolation as _isolation
-
-            # Ask the proxy itself first: /health reports the database it is
-            # actually using. Falling back to "the same default rule" is not
-            # enough, because that rule resolves against each process's own
-            # cwd — a proxy started from another directory resolves a
-            # different file. A manifest is the next-best source, and an older
-            # proxy that reports neither leaves us with the plain fallback.
-            _effective_db = helpers._proxy_memory_db_path(port)
-            if not _effective_db:
-                _reused = helpers._find_persistent_manifest(port)
-                _effective_db = getattr(_reused, "memory_db_path", None) if _reused else None
-            if _isolation.align_memory_db_with_reused_proxy(_effective_db):
-                _now = os.environ.get(_isolation.HEADROOM_MEMORY_DB_PATH_ENV)
-                click.echo(
-                    f"  Memory follows the reused proxy: {_now}"
-                    if _now
-                    else "  Memory: dropped this run's isolated database. The reused proxy "
-                    "did not report its own, so both sides fall back to the default "
-                    "(./.headroom/memory.db) — they may still differ if it was started "
-                    "from another directory."
-                )
+        _align_memory_with_reused_proxy(port, memory=memory, no_proxy=no_proxy)
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
@@ -5337,7 +5433,20 @@ def _launch_tool(
 
         # Point our own endpoint variables at the port actually bound.
         if actual_port != port:
-            _repoint_own_endpoints(env, port, actual_port)
+            _repoint_own_endpoints(
+                env,
+                port,
+                actual_port,
+                written=_wrapper_written_keys(env_vars_display, env),
+            )
+
+        # The headroom MCP server is stdio, spawned as a child of the agent, so
+        # it inherits this. An isolated run's registry entry is deliberately
+        # port-agnostic (see `_setup_headroom_mcp`) — a shared user-scoped
+        # config has one slot per server name, and baking a per-run port into it
+        # lets concurrent runs capture each other. This is how the real port
+        # reaches the server instead.
+        env["HEADROOM_PROXY_URL"] = f"http://127.0.0.1:{actual_port}"
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -6043,7 +6152,11 @@ def claude(
 
         signal.signal(signal.SIGHUP, _claude_hangup)
 
-    # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
+    # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files.
+    # Which database that is has to be settled first: a `--no-proxy` isolated
+    # run must follow the reused proxy's DB, and `_ensure_proxy` (where that
+    # reconciliation also runs) is reached only AFTER this import.
+    _align_memory_with_reused_proxy(port, memory=memory, no_proxy=no_proxy)
     if memory:
         try:
             _mem_db = _wrap_memory_db_path()
@@ -6258,6 +6371,13 @@ def claude(
             env["ANTHROPIC_FOUNDRY_BASE_URL"] = _foundry_proxy_url(proxy_url)
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
+        # The headroom MCP server is stdio, spawned as a child of Claude Code,
+        # so it inherits this. An isolated run's `~/.claude.json` entry is
+        # deliberately port-agnostic (see `_setup_headroom_mcp`) — that file has
+        # one slot per server name and every run shares it, so a per-run port
+        # baked in there lets a concurrent launch capture this session's
+        # retrieval. This is how the real port reaches the server instead.
+        env["HEADROOM_PROXY_URL"] = f"http://127.0.0.1:{actual_port}"
         # A nested wrap sees only our proxy URL above; hand it the upstream we
         # actually resolved so it can keep routing through the user's gateway.
         # `vertex_upstream` counts too: it travels to the proxy on its own
@@ -6849,6 +6969,7 @@ def _prepare_codex_wrap_state(
     no_serena: bool,
     memory: bool,
     verbose: bool,
+    no_proxy: bool = False,
     rtk_home: Path | None = None,
     persistent_routing: bool = True,
 ) -> None:
@@ -6902,7 +7023,11 @@ def _prepare_codex_wrap_state(
         force=True,
     )
 
-    # Setup memory MCP server for Codex (native tool integration)
+    # Setup memory MCP server for Codex (native tool integration). Settle which
+    # database this run uses first — `_launch_tool`/`_ensure_proxy` reconcile a
+    # `--no-proxy` isolated run onto the reused proxy's DB, but that happens
+    # after the import below, which would otherwise land in the throwaway one.
+    _align_memory_with_reused_proxy(port, memory=memory, no_proxy=no_proxy)
     if memory:
         click.echo("  Setting up memory for Codex...")
         _mem_db = _wrap_memory_db_path()
@@ -7004,6 +7129,7 @@ def _run_codex_wrap(
         no_serena=no_serena,
         memory=memory,
         verbose=verbose,
+        no_proxy=no_proxy,
         rtk_home=active_codex_home,
         persistent_routing=False,
     )
@@ -8347,6 +8473,7 @@ def goose(
     env["ANTHROPIC_BASE_URL"] = anthropic_base
     env_vars_display = [
         f"OPENAI_BASE_URL={openai_base}",
+        f"OPENAI_API_BASE={openai_base}",
         f"ANTHROPIC_BASE_URL={anthropic_base}",
     ]
 
@@ -8488,6 +8615,7 @@ def openhands(
 
     env_vars_display = [
         f"OPENAI_BASE_URL={openai_base}",
+        f"OPENAI_API_BASE={openai_base}",
         f"ANTHROPIC_BASE_URL={anthropic_base}",
         f"LLM_BASE_URL={openai_base}",
     ]

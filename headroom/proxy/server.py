@@ -1230,6 +1230,16 @@ class HeadroomProxy(
                 _mem_dir.mkdir(parents=True, exist_ok=True)
                 _mem_db_path = str(_mem_dir / "memory.db")
                 logger.info(f"Memory: Project-scoped DB at {_mem_db_path}")
+            else:
+                # An explicit override can be RELATIVE (`--memory-db-path
+                # state/memory.db`), which resolves against THIS process's cwd.
+                # A `wrap --memory --no-proxy` attaching to us cannot reproduce
+                # that directory: it would anchor the same string to its own
+                # cwd and open a different file, leaving MCP/wrap-side memory
+                # divergent from what the proxy retrieves. Anchor it here,
+                # before the database is opened or published. Symlinks are left
+                # alone so the path still reads as what the operator asked for.
+                _mem_db_path = str(Path(_mem_db_path).expanduser().absolute())
             # Publish the RESOLVED path. `config.memory_db_path` is still ""
             # in the default case, and a `wrap --memory --no-proxy` attaching
             # to us reads /health to learn which database to use — the default

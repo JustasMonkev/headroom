@@ -2632,7 +2632,9 @@ class TestPortRewriteOnlyTouchesOurOwnVariables:
         import inspect
 
         source = inspect.getsource(wrap_mod._launch_tool)
-        assert "_repoint_own_endpoints(env, port, actual_port)" in source
+        assert "_repoint_own_endpoints(" in source
+        # ...and hands it the authorship record, not just the env.
+        assert "written=_wrapper_written_keys(env_vars_display, env)" in source
 
 
 class TestVertexUpstreamSurvivesNesting:
@@ -2808,3 +2810,301 @@ class TestReusedPortNeedsProxyIdentity:
         wrap_mod._wrap_marker_proxy_is_dead(marker)
 
         assert seen == [marker], "identity was not handed to the liveness probe"
+
+
+class TestLegacyOwnerHandoverRebuildsTheURL:
+    """A marker written before owners recorded their exact `url` has only
+    `port` + `key`. Treating that as "nothing to hand back to" leaves
+    settings.local.json naming the EXITING run's proxy — which is about to
+    die — while the marker names the live owner, so SessionStart self-heal
+    probes that owner's live port and never repairs the dead URL
+    (round 20, P2)."""
+
+    @staticmethod
+    def _legacy(pid: int, port: int, key: str) -> dict[str, Any]:
+        return {"pid": pid, "port": port, "key": key, "previous": "https://user-gateway"}
+
+    def test_a_legacy_owner_rebuilds_the_standard_url(self) -> None:
+        owner = self._legacy(1234, 8788, "ANTHROPIC_BASE_URL")
+
+        assert (
+            wrap_mod._owner_handover_url(owner, key="ANTHROPIC_BASE_URL")
+            == "http://127.0.0.1:8788"
+        )
+
+    def test_a_legacy_foundry_owner_keeps_the_anthropic_suffix(self) -> None:
+        """The Anthropic SDK appends /v1/messages to this value; dropping
+        /anthropic points Foundry mode at the wrong path."""
+        owner = self._legacy(1234, 8788, "ANTHROPIC_FOUNDRY_BASE_URL")
+
+        assert (
+            wrap_mod._owner_handover_url(owner, key="ANTHROPIC_FOUNDRY_BASE_URL")
+            == "http://127.0.0.1:8788/anthropic"
+        )
+
+    def test_a_recorded_url_still_wins(self) -> None:
+        """Reconstruction is the fallback, never an override — a Foundry run
+        that recorded its exact URL must not be second-guessed."""
+        owner = {**self._legacy(1234, 8788, "ANTHROPIC_BASE_URL"), "url": "http://gateway:9/x"}
+
+        assert wrap_mod._owner_handover_url(owner, key="ANTHROPIC_BASE_URL") == "http://gateway:9/x"
+
+    def test_no_port_and_no_url_stays_inconclusive(self) -> None:
+        assert wrap_mod._owner_handover_url({"pid": 1234}, key="ANTHROPIC_BASE_URL") is None
+
+    def test_exit_hands_a_legacy_live_peer_its_reconstructed_url(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End-to-end on the reported path: we exit, a legacy-marker peer is
+        still live, and settings must end up on the PEER's port, not ours."""
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8789"}})
+        )
+        marker = wrap_mod._wrap_marker_path(settings)
+        peer = self._legacy(424242, 8788, "ANTHROPIC_BASE_URL")  # live, legacy: no "url"
+        mine = {
+            "pid": os.getpid(),
+            "port": 8789,
+            "key": "ANTHROPIC_BASE_URL",
+            "previous": "https://user-gateway",
+            "url": "http://127.0.0.1:8789",
+        }
+        marker.write_text(json.dumps({"owners": [peer, mine], **mine}))
+        # The peer is live and its proxy answers; liveness itself is covered
+        # by its own tests, so pin it here rather than spawn a real process.
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_owners", lambda _p: [peer, mine])
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda *_a, **_k: True)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        wrap_mod._restore_claude_wrap_base_url(
+            "https://user-gateway", settings_path=settings, _key_override="ANTHROPIC_BASE_URL"
+        )
+
+        assert json.loads(settings.read_text())["env"]["ANTHROPIC_BASE_URL"] == (
+            "http://127.0.0.1:8788"
+        ), "routing must follow the surviving peer, not stay on our dying proxy"
+
+    def test_crash_handover_also_rebuilds(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The same gap existed on the crash-cleanup path."""
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8789"}}))
+        marker = wrap_mod._wrap_marker_path(settings)
+        live = self._legacy(424242, 8788, "ANTHROPIC_BASE_URL")
+        marker.write_text(json.dumps({"owners": [live], **live}))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_owners", lambda _p: [live])
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda *_a, **_k: True)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        handover = wrap_mod._handover_to_live_owner(settings, key="ANTHROPIC_BASE_URL")
+
+        assert handover == "http://127.0.0.1:8788"
+
+
+class TestWrapperAuthorshipBeatsValueComparison:
+    """Value inequality cannot tell "we wrote it" from "we inherited it": with
+    an inherited ANTHROPIC_BASE_URL already on the requested port, the wrapper
+    writes the SAME string, binds its dedicated proxy elsewhere, and the
+    variable reads as untouched — leaving the agent on the shared or dead port
+    (round 20, P2)."""
+
+    def test_an_identical_value_we_wrote_is_still_repointed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}
+
+        wrap_mod._repoint_own_endpoints(env, 8787, 8788, written={"ANTHROPIC_BASE_URL"})
+
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8788"
+
+    def test_an_identical_value_we_did_not_write_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the rule — authorship, not the port, decides."""
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:8787")
+        env = {"HTTP_PROXY": "http://127.0.0.1:8787"}
+
+        wrap_mod._repoint_own_endpoints(env, 8787, 8788, written={"ANTHROPIC_BASE_URL"})
+
+        assert env["HTTP_PROXY"] == "http://127.0.0.1:8787"
+
+    def test_value_inequality_still_covers_unannounced_writes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        env = {"OPENAI_BASE_URL": "http://127.0.0.1:8787/v1"}
+
+        wrap_mod._repoint_own_endpoints(env, 8787, 8788, written=())
+
+        assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:8788/v1"
+
+    def test_authorship_comes_from_the_launch_banner(self) -> None:
+        env = {"ANTHROPIC_BASE_URL": "x", "HTTP_PROXY": "y"}
+
+        written = wrap_mod._wrapper_written_keys(
+            ["ANTHROPIC_BASE_URL=http://127.0.0.1:8787", "OPENAI_BASE_URL=gone"], env
+        )
+
+        assert written == {"ANTHROPIC_BASE_URL"}, "only names actually present in env count"
+
+    def test_the_banner_lists_every_endpoint_the_launcher_writes(self) -> None:
+        """The banner is load-bearing now, so a var set but not listed would
+        silently lose its authorship signal. Goose and OpenHands both write
+        OPENAI_API_BASE."""
+        import inspect
+
+        for cmd in (wrap_mod.goose, wrap_mod.openhands):
+            fn = getattr(cmd, "callback", cmd)
+            source = inspect.getsource(fn)
+            written = {
+                line.split('env["', 1)[1].split('"]', 1)[0]
+                for line in source.splitlines()
+                if 'env["' in line and "] = " in line and "BASE" in line
+            }
+            listed = {
+                part.split("=", 1)[0].strip().strip('f"')
+                for part in source.split("env_vars_display = [", 1)[1].split("]", 1)[0].split(",")
+                if "=" in part
+            }
+            assert written <= listed, f"{fn.__name__} sets endpoints it does not announce"
+
+
+class TestMemoryIsAlignedBeforeAnyMemorySetup:
+    """`--memory --no-proxy` reconciles onto the reused proxy's database, but
+    the reconciliation lived inside `_ensure_proxy` — which both the Claude and
+    Codex flows reach only AFTER importing native memories into the throwaway
+    run database. The proxy (and the MCP server started after it) never saw
+    those memories (round 20, P2)."""
+
+    def test_the_claude_flow_aligns_before_it_syncs(self) -> None:
+        import inspect
+
+        source = inspect.getsource(wrap_mod.claude.callback)
+        align = source.index("_align_memory_with_reused_proxy(")
+        sync = source.index("_wrap_memory_db_path()")
+
+        assert align < sync, "the database must be settled before the import runs"
+
+    def test_the_codex_flow_aligns_before_it_imports(self) -> None:
+        import inspect
+
+        source = inspect.getsource(wrap_mod._prepare_codex_wrap_state)
+        align = source.index("_align_memory_with_reused_proxy(")
+        setup = source.index("_wrap_memory_db_path()")
+
+        assert align < setup
+
+    def test_alignment_is_a_no_op_outside_memory_no_proxy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("must not probe the proxy")
+
+        monkeypatch.setattr(wrap_mod, "_proxy_memory_db_path", unexpected)
+
+        wrap_mod._align_memory_with_reused_proxy(8787, memory=False, no_proxy=True)
+        wrap_mod._align_memory_with_reused_proxy(8787, memory=True, no_proxy=False)
+
+    def test_alignment_adopts_the_database_the_proxy_reports(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+        assert run_dir is not None
+        theirs = tmp_path / "theirs" / "memory.db"
+        monkeypatch.setattr(wrap_mod, "_proxy_memory_db_path", lambda _p: str(theirs))
+
+        wrap_mod._align_memory_with_reused_proxy(8787, memory=True, no_proxy=True)
+
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(theirs)
+
+    def test_alignment_is_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """It runs twice on every flow now (early, then from `_ensure_proxy`);
+        the second call must not re-report or re-decide."""
+        isolation.activate_isolated_workspace()
+        theirs = tmp_path / "theirs" / "memory.db"
+        monkeypatch.setattr(wrap_mod, "_proxy_memory_db_path", lambda _p: str(theirs))
+
+        wrap_mod._align_memory_with_reused_proxy(8787, memory=True, no_proxy=True)
+        monkeypatch.setattr(wrap_mod, "_proxy_memory_db_path", lambda _p: str(tmp_path / "other"))
+        wrap_mod._align_memory_with_reused_proxy(8787, memory=True, no_proxy=True)
+
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(theirs)
+
+
+class TestIsolatedMCPRegistrationIsPortAgnostic:
+    """Every registrar writes into user-scoped config that all runs share, with
+    one slot per server name. Baking a per-run port in there lets a concurrent
+    launch overwrite it — run A's agent then starts its retrieval MCP against
+    run B's workspace, and once B exits the entry names a dead port for
+    everyone (round 20, P2)."""
+
+    class _Registrar:
+        name = "claude"
+        display_name = "Claude Code"
+
+        def __init__(self) -> None:
+            self.spec: Any = None
+
+        def detect(self) -> bool:
+            return True
+
+        def register_server(self, spec: Any, *, force: bool = False) -> Any:
+            from headroom.mcp_registry import RegisterResult, RegisterStatus
+
+            self.spec = spec
+            return RegisterResult(RegisterStatus.ALREADY, "ok")
+
+    def test_an_isolated_run_pins_no_port_in_the_shared_config(self) -> None:
+        isolation.activate_isolated_workspace()
+        registrar = self._Registrar()
+
+        wrap_mod._setup_headroom_mcp(registrar, 8788, force=True)
+
+        assert "HEADROOM_PROXY_URL" not in registrar.spec.env, (
+            "a per-run port in shared config is what concurrent runs fight over"
+        )
+
+    def test_a_shared_run_still_pins_its_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_isolation_requested", lambda: False)
+        registrar = self._Registrar()
+
+        wrap_mod._setup_headroom_mcp(registrar, 8788, force=True)
+
+        assert registrar.spec.env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8788"
+
+    def test_two_isolated_runs_write_the_same_entry(self) -> None:
+        """The point of dropping the pin: nothing left to clobber."""
+        isolation.activate_isolated_workspace()
+        first, second = self._Registrar(), self._Registrar()
+
+        wrap_mod._setup_headroom_mcp(first, 8788, force=True)
+        wrap_mod._setup_headroom_mcp(second, 8791, force=True)
+
+        assert first.spec == second.spec
+
+    def test_the_launcher_exports_the_real_port_instead(self) -> None:
+        """The server is stdio, spawned as a child of the agent, and
+        `headroom mcp serve --proxy-url` reads this from its environment — so
+        this export is the only thing carrying the per-run port now."""
+        import inspect
+
+        for fn in (wrap_mod._launch_tool, wrap_mod.claude.callback):
+            source = inspect.getsource(fn)
+            assert 'env["HEADROOM_PROXY_URL"] = f"http://127.0.0.1:{actual_port}"' in source
+
+    def test_headroom_mcp_serve_reads_that_variable(self) -> None:
+        """Guard the other end of the contract: if the CLI stops honouring the
+        env var, the isolated entry silently points every run at 8787."""
+        from headroom.cli.mcp import mcp as mcp_group
+
+        serve = mcp_group.commands["serve"]
+        proxy_url = next(p for p in serve.params if p.name == "proxy_url")
+
+        assert proxy_url.envvar == "HEADROOM_PROXY_URL"

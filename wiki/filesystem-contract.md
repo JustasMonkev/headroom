@@ -92,7 +92,7 @@ Examples:
 |---|---|---|
 | Proxy savings ledger | `${WORKSPACE_DIR}/proxy_savings.json` | `HEADROOM_SAVINGS_PATH` |
 | TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.json` | `HEADROOM_TOIN_PATH` |
-| Subscription tracker state | `${WORKSPACE_DIR}/subscription_state.json` | `HEADROOM_SUBSCRIPTION_STATE_PATH` |
+| Subscription contribution state | `${WORKSPACE_DIR}/subscription_state.json` | `HEADROOM_SUBSCRIPTION_STATE_PATH` |
 | Memory SQLite | `${WORKSPACE_DIR}/memory.db` | CLI `--memory-db-path`, env `HEADROOM_MEMORY_DB_PATH` |
 | Native memory directory | `${WORKSPACE_DIR}/memories/` | `MemoryConfig.native_memory_dir` |
 | Session stats JSONL | `${WORKSPACE_DIR}/session_stats.jsonl` | — |
@@ -119,6 +119,16 @@ real `~/.headroom` while the workspace bucket above moves into the run dir.
 | Dashboard settings | `${SHARED_WORKSPACE_DIR}/settings.json` | `HEADROOM_SETTINGS_PATH` |
 | Update-check cache | `${SHARED_WORKSPACE_DIR}/update_check.json` | — |
 | Legacy models catalog (fallback) | `${SHARED_WORKSPACE_DIR}/models.json` | — |
+| Account usage snapshot | `${SHARED_WORKSPACE_DIR}/subscription_snapshot.json` | — |
+| Account poll lock | `${SHARED_WORKSPACE_DIR}/subscription_poll.lock` | — |
+
+The subscription split follows the same rule as the savings baseline: the
+usage windows describe an **account**, so one proxy polls
+`/api/oauth/usage` under the shared lock and publishes the snapshot for the
+others to adopt — otherwise a fan-out of N isolated agents on one OAuth
+account makes N account-usage requests per interval. Each run's own
+contribution counters stay in its private `subscription_state.json`, where
+concurrent runs cannot overwrite each other's totals.
 
 Proxy client markers reference-count a proxy instance identified by
 `127.0.0.1:<port>`, which is machine-wide — every client of a given proxy
