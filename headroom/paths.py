@@ -416,9 +416,18 @@ def lean_ctx_path() -> Path:
 
 
 def deploy_root() -> Path:
-    """Return the root directory for persistent deployment profiles."""
+    """Return the root directory for persistent deployment profiles.
 
-    return workspace_dir() / _DEPLOY_DIR
+    Resolved against the shared workspace: deployment manifests and the runner
+    scripts that systemd / cron / launchd reference by absolute path outlive
+    any single run. A wrapped agent that shells out to ``headroom install
+    apply`` inherits the per-run workspace, so deriving this from
+    :func:`workspace_dir` would write a supervised deployment into an
+    ephemeral directory that top-level ``install`` commands cannot see and
+    that run pruning would later delete out from under the supervisor.
+    """
+
+    return shared_workspace_dir() / _DEPLOY_DIR
 
 
 def beacon_lock_path(port: int) -> Path:

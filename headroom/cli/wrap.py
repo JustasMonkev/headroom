@@ -1290,6 +1290,42 @@ def _wrap_marker_path(settings_path: Path) -> Path:
     return settings_path.parent / ".headroom_wrap_marker.json"
 
 
+def _wrap_marker_owners(settings_path: Path) -> list[dict[str, Any]]:
+    """Live owner stack for ``settings_path``, oldest first.
+
+    Concurrent isolated wraps in one project each own the base_url entry for a
+    while, so the marker records a STACK rather than a single writer. Entries
+    whose process is gone are dropped here, so callers only ever see live
+    owners. A legacy single-dict marker reads as a one-entry stack.
+    """
+
+    raw = _read_wrap_marker(settings_path)
+    if raw is None:
+        return []
+    recorded = raw.get("owners")
+    owners: list[Any] = recorded if isinstance(recorded, list) else [raw]
+    return [
+        owner for owner in owners if isinstance(owner, dict) and not _wrap_marker_is_stale(owner)
+    ]
+
+
+def _write_wrap_marker_owners(settings_path: Path, owners: list[dict[str, Any]]) -> None:
+    """Persist the owner stack, or remove the marker when it is empty."""
+
+    try:
+        path = _wrap_marker_path(settings_path)
+        if not owners:
+            path.unlink(missing_ok=True)
+            return
+        # Keep the newest owner's fields at the top level too, so an older
+        # Headroom (or `doctor`) reading the legacy single-dict shape still
+        # sees a valid, current record instead of failing to parse.
+        payload = {**owners[-1], "owners": owners}
+        _write_text(path, json.dumps(payload))
+    except OSError:
+        pass
+
+
 def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1306,8 +1342,15 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             "port": port,
             "key": key,
             "previous": previous,
+            # This session's own URL, so a peer exiting later can hand routing
+            # BACK to us instead of restoring the pre-Headroom value while we
+            # are still live (reverse exit order).
+            "url": _claude_proxy_base_url(port),
         }
-        _write_text(_wrap_marker_path(settings_path), json.dumps(payload))
+        # Push onto the live owner stack rather than replacing it.
+        owners = [o for o in _wrap_marker_owners(settings_path) if o.get("pid") != os.getpid()]
+        owners.append(payload)
+        _write_wrap_marker_owners(settings_path, owners)
     except OSError:
         pass
 
@@ -1694,17 +1737,37 @@ def _restore_claude_wrap_base_url(
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
+    handed_over = False
     if not _force:
-        owner = _read_wrap_marker(path)
-        if (
-            owner is not None
-            and owner.get("key") == key
-            and owner.get("pid") != os.getpid()
-            and not _wrap_marker_is_stale(owner)
-        ):
-            return
+        # Pop ourselves off the owner stack; whoever is still live decides what
+        # the file should say now.
+        owners = _wrap_marker_owners(path)
+        mine = os.getpid()
+        survivors = [o for o in owners if o.get("key") == key and o.get("pid") != mine]
+        if survivors:
+            # A peer wrap session is still running. Hand routing back to the
+            # most recent live owner rather than restoring the pre-Headroom
+            # value — otherwise ITS daemon workers would bypass Headroom
+            # entirely. This covers BOTH exit orders: the newer run leaving
+            # first restores the older run's URL, and vice versa.
+            handover = survivors[-1].get("url")
+            _write_wrap_marker_owners(path, [o for o in owners if o.get("pid") != mine])
+            # The stack now correctly names the surviving owner(s); the
+            # marker-clearing tail below must not wipe it.
+            handed_over = True
+            if isinstance(handover, str) and handover:
+                previous = handover
+            else:
+                # No recorded URL (legacy marker): leave the file untouched
+                # rather than guess and strand the live peer.
+                return
+        else:
+            # We were the last live owner — fall through and restore the
+            # original value, clearing the marker below.
+            _write_wrap_marker_owners(path, [])
     if not path.exists():
-        _clear_wrap_marker(path, key=key)
+        if not handed_over:
+            _clear_wrap_marker(path, key=key)
         return
     try:
         payload = json.loads(_read_text(path))
@@ -1717,7 +1780,8 @@ def _restore_claude_wrap_base_url(
         return
     if previous is None:
         if key not in env_map:
-            _clear_wrap_marker(path, key=key)
+            if not handed_over:
+                _clear_wrap_marker(path, key=key)
             return
         del env_map[key]
         if env_map:
@@ -1731,7 +1795,8 @@ def _restore_claude_wrap_base_url(
         _write_text(path, json.dumps(payload, indent=2) + "\n")
     else:
         path.unlink(missing_ok=True)
-    _clear_wrap_marker(path, key=key)
+    if not handed_over:
+        _clear_wrap_marker(path, key=key)
 
 
 def _setup_headroom_mcp(
@@ -4696,16 +4761,33 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     return None
 
 
-def _reject_misplaced_isolated_flag(args: tuple, tool: str) -> None:
+def _reject_misplaced_isolated_flag(args: tuple, tool: str, argv: list[str] | None = None) -> None:
     """Fail loudly when ``--isolated``/``--shared`` lands after the tool name.
 
     They are group-level flags. The wrap subcommands run with
-    ``ignore_unknown_options``, so a trailing occurrence would be silently
-    forwarded to the wrapped CLI instead of steering isolation.
+    ``ignore_unknown_options``, so a bare trailing occurrence would be
+    silently forwarded to the wrapped CLI instead of steering isolation.
+
+    Deliberately NOT driven by ``args``: Click strips the ``--`` delimiter
+    before populating the subcommand's argument tuple, so a flag the caller
+    intentionally forwarded to the child (``wrap claude -- --shared``) is
+    indistinguishable there from a misplaced one — rejecting it would break
+    the verbatim passthrough contract. The raw argv preserves the delimiter,
+    so a token is misplaced only when it sits AFTER the tool name and BEFORE
+    ``--``. A flag before the tool name is the correct group-level position
+    (already consumed by Click) and is never flagged.
     """
 
+    del args  # kept for call-site compatibility; argv is authoritative
+    tokens = _wrapper_own_args(list(sys.argv if argv is None else argv))
+    try:
+        after_tool = tokens[tokens.index(tool) + 1 :]
+    except ValueError:
+        # Tool name not found in argv (aliased/embedded invocation): fail open
+        # rather than risk rejecting a legitimate launch.
+        return
     for flag in ("--isolated", "--shared"):
-        if flag in args:
+        if flag in after_tool:
             raise click.UsageError(
                 f"{flag} is a `wrap` group flag and goes before the tool name: "
                 f"headroom wrap {flag} {tool} ..."

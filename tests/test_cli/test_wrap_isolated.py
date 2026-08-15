@@ -236,11 +236,16 @@ class TestWrapGroupFlag:
         assert not (tmp_path / "ws" / "runs").exists()
 
     @pytest.mark.parametrize("flag", ["--isolated", "--shared"])
-    def test_misplaced_group_flag_is_rejected(self, flag: str) -> None:
+    def test_misplaced_group_flag_is_rejected(
+        self, flag: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """`headroom wrap claude --isolated/--shared` must fail loudly
         instead of forwarding the flag to the wrapped CLI
         (ignore_unknown_options)."""
 
+        # Detection reads the real argv so a flag forwarded after `--` can be
+        # told apart from a misplaced one; mirror the true invocation.
+        monkeypatch.setattr(wrap_mod.sys, "argv", ["headroom", "wrap", "claude", flag])
         runner = CliRunner()
         result = runner.invoke(main, ["wrap", "claude", flag])
 
@@ -560,7 +565,8 @@ class TestClaudeWrapMarkerConcurrency:
             "http://127.0.0.1:8788", settings_path=settings, port=8788
         )
         marker = self._marker(settings)
-        marker["pid"] = 424242  # pretend a different process owns it
+        # The marker is an owner STACK; re-own run A's entry to another pid.
+        marker["owners"][-1]["pid"] = 424242
         settings.parent.joinpath(".headroom_wrap_marker.json").write_text(json.dumps(marker))
         monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _m: False)
 
@@ -580,7 +586,7 @@ class TestClaudeWrapMarkerConcurrency:
             "http://127.0.0.1:8789", settings_path=settings, port=8789
         )
         marker = self._marker(settings)
-        marker["pid"] = 424242  # run B owns the marker now
+        marker["owners"][-1]["pid"] = 424242  # run B owns the stack entry now
         settings.parent.joinpath(".headroom_wrap_marker.json").write_text(json.dumps(marker))
         monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _m: False)
 
@@ -798,3 +804,137 @@ class TestProxyOnlyWatcherSighup:
         assert "signal.signal(signal.SIGHUP" in src
         # Cleanup alone is not enough — it must not fall back into the loop.
         assert "SystemExit" in src
+
+
+class TestWrapMarkerOwnerStack:
+    """Concurrent Claude wraps in one project form an owner STACK. Whichever
+    run exits, routing must be handed to a surviving live owner rather than
+    reset to the pre-Headroom value (round 8, P1 — reverse exit order)."""
+
+    def _project(self, tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, settings.parent / ".headroom_wrap_marker.json"
+
+    def _url(self, settings: Path) -> str | None:
+        if not settings.exists():
+            return None
+        return json.loads(settings.read_text())["env"].get("ANTHROPIC_BASE_URL")
+
+    def _two_live_runs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[Path, Path, str | None, str | None]:
+        settings, marker = self._project(tmp_path)
+        prev_a = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        payload = json.loads(marker.read_text())
+        payload["owners"][-1]["pid"] = 111  # run A is a different live process
+        marker.write_text(json.dumps(payload))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        prev_b = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+        assert self._url(settings) == "http://127.0.0.1:8789"
+        return settings, marker, prev_a, prev_b
+
+    def test_newer_run_exiting_hands_back_to_live_older_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The case the single-marker design could not express."""
+        settings, marker, _prev_a, prev_b = self._two_live_runs(monkeypatch, tmp_path)
+
+        wrap_mod._restore_claude_wrap_base_url(prev_b, settings_path=settings)
+
+        # Routing returns to run A's proxy — NOT the user's original value,
+        # which would make A's daemon workers bypass Headroom entirely.
+        assert self._url(settings) == "http://127.0.0.1:8788"
+        assert marker.exists(), "run A must still own the marker"
+
+    def test_older_run_exiting_leaves_newer_owner_untouched(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker, prev_a, _prev_b = self._two_live_runs(monkeypatch, tmp_path)
+        # Make THIS process look like run A so its exit is the one under test.
+        payload = json.loads(marker.read_text())
+        for owner in payload["owners"]:
+            owner["pid"] = 222 if owner["pid"] == os.getpid() else os.getpid()
+        marker.write_text(json.dumps(payload))
+
+        wrap_mod._restore_claude_wrap_base_url(prev_a, settings_path=settings)
+
+        assert self._url(settings) == "http://127.0.0.1:8789"
+        assert marker.exists()
+
+    def test_last_owner_restores_the_original(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert self._url(settings) == "https://user-gateway"
+        assert not marker.exists()
+
+    def test_legacy_single_dict_marker_still_reads(self, tmp_path: Path) -> None:
+        """A marker written by an older Headroom has no `owners` list."""
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {"pid": os.getpid(), "port": 8788, "key": "ANTHROPIC_BASE_URL", "previous": None}
+            )
+        )
+
+        owners = wrap_mod._wrap_marker_owners(settings)
+
+        assert len(owners) == 1
+        assert owners[0]["port"] == 8788
+
+    def test_dead_owners_are_dropped(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {"pid": 2147480000, "port": 8788, "key": "ANTHROPIC_BASE_URL"},
+                        {"pid": os.getpid(), "port": 8789, "key": "ANTHROPIC_BASE_URL"},
+                    ]
+                }
+            )
+        )
+
+        owners = wrap_mod._wrap_marker_owners(settings)
+
+        assert [o["port"] for o in owners] == [8789]
+
+
+class TestMisplacedFlagRespectsDelimiter:
+    """`--isolated`/`--shared` after `--` belong to the wrapped CLI and must
+    pass through verbatim, not raise a usage error (round 8, P2)."""
+
+    @pytest.mark.parametrize(
+        "argv,should_raise,why",
+        [
+            (["headroom", "wrap", "claude", "--isolated"], True, "misplaced after tool"),
+            (["headroom", "wrap", "claude", "--shared"], True, "misplaced after tool"),
+            (["headroom", "wrap", "--isolated", "claude"], False, "correct group position"),
+            (["headroom", "wrap", "--shared", "claude"], False, "correct group position"),
+            (["headroom", "wrap", "claude", "--", "--shared"], False, "forwarded to child"),
+            (
+                ["headroom", "wrap", "claude", "--", "-p", "--isolated"],
+                False,
+                "deep in child args",
+            ),
+            (["headroom", "wrap", "claude"], False, "absent"),
+        ],
+    )
+    def test_only_pre_delimiter_flags_are_rejected(
+        self, argv: list[str], should_raise: bool, why: str
+    ) -> None:
+        if should_raise:
+            with pytest.raises(click.UsageError):
+                wrap_mod._reject_misplaced_isolated_flag((), "claude", argv=argv)
+        else:
+            wrap_mod._reject_misplaced_isolated_flag((), "claude", argv=argv)
