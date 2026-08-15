@@ -28,6 +28,7 @@ run gets its own ``memory.db``.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -61,6 +62,13 @@ HEADROOM_PREISOLATION_WORKSPACE_ENV = "HEADROOM_PREISOLATION_WORKSPACE"
 
 _RUNS_DIR = "runs"
 _MEMORY_DB_FILE = "memory.db"
+
+# Sidecar recording the dedicated proxy this run started. `_start_proxy`
+# launches the proxy DETACHED (``start_new_session`` / CREATE_BREAKAWAY), so it
+# can outlive the wrapper whose PID is baked into the run directory name — and
+# a proxy that has simply been idle is otherwise indistinguishable from an
+# abandoned run. GC reads this file so a live proxy pins its own workspace.
+_PROXY_STATE_FILE = ".proxy.json"
 
 # Per-run workspaces are ephemeral; anything older than this is garbage
 # collected on the next activation. Generous enough that a week-long
@@ -178,6 +186,57 @@ def _run_dir_owner_pid(run_dir: Path) -> int | None:
         return None
 
 
+def record_run_proxy(pid: int, port: int, *, run_dir: Path | None = None) -> None:
+    """Record the dedicated proxy this isolated run started.
+
+    Without this, GC's only liveness signal is the wrapper PID in the run
+    directory's name. The proxy is spawned detached and keeps serving after the
+    wrapper exits (``wrap ... --proxy-only``, a wrapper killed while its proxy
+    survives), so a quiet-but-live proxy's workspace — its databases, caches
+    and logs — could be deleted out from under it once the age cutoff passed.
+
+    No-op outside isolated mode, and best-effort: never break a launch.
+    """
+
+    target = run_dir if run_dir is not None else active_isolated_workspace()
+    if target is None:
+        return
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / _PROXY_STATE_FILE).write_text(
+            json.dumps({"pid": int(pid), "port": int(port)}), encoding="utf-8"
+        )
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _run_dir_proxy_pid(run_dir: Path) -> int | None:
+    """PID of the dedicated proxy recorded for ``run_dir``, if any."""
+
+    try:
+        record = json.loads((run_dir / _PROXY_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    pid = record.get("pid")
+    return pid if isinstance(pid, int) else None
+
+
+def _run_dir_has_live_owner(run_dir: Path) -> bool:
+    """True while any process still holds ``run_dir``.
+
+    Two owners keep a run alive: the wrapper that created it (PID embedded in
+    the directory name) and the dedicated proxy it started (recorded in
+    ``.proxy.json``). Either one being alive is enough.
+    """
+
+    for pid in (_run_dir_owner_pid(run_dir), _run_dir_proxy_pid(run_dir)):
+        if pid is not None and pid_alive(pid):
+            return True
+    return False
+
+
 def _run_dir_last_activity(run_dir: Path) -> float:
     """Best-effort recency for a run dir: newest mtime seen while walking the
     tree (file writes don't bump ancestor directory mtimes, so a long-lived
@@ -199,10 +258,12 @@ def prune_stale_runs(runs_root: Path, *, max_age_seconds: float = _RUN_DIR_MAX_A
 
     Isolation is the default, so every wrap creates a run dir; without
     pruning, ``runs/`` grows without bound. A ``run-*`` directory is removed
-    only when BOTH its last activity predates the cutoff AND the process that
-    created it (the PID embedded in its name) is no longer alive — a paused
-    but still-running long session must never have its proxy databases, logs,
-    and MCP state deleted out from under it. Every failure is swallowed; GC
+    only when BOTH its last activity predates the cutoff AND no owner is still
+    alive — neither the wrapper that created it (the PID embedded in its name)
+    nor the detached proxy it started (recorded in ``.proxy.json``). A paused
+    but still-running long session, or a wrapper-less proxy still serving
+    requests, must never have its databases, logs, and MCP state deleted out
+    from under it. Every failure is swallowed; GC
     must never break a launch.
     """
 
@@ -215,10 +276,10 @@ def prune_stale_runs(runs_root: Path, *, max_age_seconds: float = _RUN_DIR_MAX_A
         try:
             if not (entry.is_dir() and entry.name.startswith("run-")):
                 continue
-            owner_pid = _run_dir_owner_pid(entry)
-            if owner_pid is not None and pid_alive(owner_pid):
-                # A live owner still holds this run — never GC it, regardless
-                # of how quiet its files have been.
+            if _run_dir_has_live_owner(entry):
+                # A live owner — the wrapper OR its detached proxy — still
+                # holds this run; never GC it, regardless of how quiet its
+                # files have been.
                 continue
             if _run_dir_last_activity(entry) < cutoff:
                 shutil.rmtree(entry, ignore_errors=True)
@@ -290,4 +351,5 @@ __all__ = [
     "active_isolated_workspace",
     "activate_isolated_workspace",
     "prune_stale_runs",
+    "record_run_proxy",
 ]

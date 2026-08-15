@@ -21,6 +21,14 @@ original `~/.headroom`, so a handful of persistent resources keep resolving
 there while run-specific state moves into the run directory. See
 [cli.md](cli.md) for the isolation model.
 
+A run directory is garbage collected only when it has been quiet for more
+than 7 days **and** none of its owners are alive. There are two owners: the
+wrapper process (its PID is the second-to-last field of the
+`run-<ts>-<pid>-<rand>` name) and the dedicated proxy that run started, whose
+PID and port are recorded in `<run-dir>/.proxy.json`. The proxy is spawned
+detached, so it routinely outlives its wrapper — without that record a live
+but idle proxy could have its own workspace deleted underneath it.
+
 All three variables are recognized by the Python proxy / CLI and the npm SDK.
 They are **additive** — every pre-existing per-resource env var
 (`HEADROOM_SAVINGS_PATH`, `HEADROOM_TOIN_PATH`,

@@ -810,8 +810,24 @@ isolated `wrap claude` sessions **from the same directory**, both write
 conversation. Headroom keeps this safe rather than silent — the second
 launch prints a notice, never records the first run's URL as the project's
 "original" value, and an exiting run leaves a still-live peer's routing
-untouched. For genuinely independent Claude routing, run each agent from
-its own working directory. (`headroom unwrap claude` still always wins.)
+untouched. The marker holds a *stack* of live owners, and every
+read-modify-write on it is serialized through an interprocess lock
+(`.headroom_wrap_marker.lock`) — without it, two sessions starting at the
+same instant read the same stack, each append themselves, and the later
+write drops the other live owner, whose exit would then reset routing out
+from under a peer that is still running. The lock is best-effort: if it
+cannot be taken, the update still proceeds rather than blocking a launch.
+For genuinely independent Claude routing, run each agent from its own
+working directory. (`headroom unwrap claude` still always wins.)
+
+**Nested wraps do not chain proxies.** Running `headroom wrap claude` from
+inside an already-wrapped session inherits the parent's
+`ANTHROPIC_BASE_URL`, which points at the parent run's port — isolation
+gives every run its own port, so it is never equal to the nested run's own
+port. Headroom probes such loopback URLs and ignores any listener that
+self-identifies as `headroom-proxy` on `/health`, so requests pass through
+one pipeline rather than two. A genuine local gateway (LiteLLM and friends)
+is still adopted as the upstream, per issue #1353.
 
 With `--no-proxy` an isolated run deliberately attaches to the shared
 proxy; its client marker is registered in the shared workspace so the

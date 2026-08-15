@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import importlib.util
 import io
@@ -1290,6 +1291,102 @@ def _wrap_marker_path(settings_path: Path) -> Path:
     return settings_path.parent / ".headroom_wrap_marker.json"
 
 
+def _wrap_marker_lock_path(settings_path: Path) -> Path:
+    return settings_path.parent / ".headroom_wrap_marker.lock"
+
+
+# flock is held per open file description, so a second acquisition from THIS
+# process (on a fresh handle) would block against our own outer frame forever.
+# `_handover_to_live_owner` calls back into `_restore_claude_wrap_base_url`,
+# which locks too, so the guard has to be re-entrant within the process.
+_wrap_marker_lock_depth = 0
+
+
+def _lock_handle_exclusive(handle: Any, *, timeout: float) -> bool:
+    """Take an exclusive advisory lock on ``handle``, or give up after
+    ``timeout`` seconds. Returns whether the lock was acquired."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                cast(Any, msvcrt).locking(handle.fileno(), cast(Any, msvcrt).LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                cast(Any, fcntl).flock(
+                    handle.fileno(), cast(Any, fcntl).LOCK_EX | cast(Any, fcntl).LOCK_NB
+                )
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+
+def _unlock_handle(handle: Any) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            cast(Any, msvcrt).locking(handle.fileno(), cast(Any, msvcrt).LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            cast(Any, fcntl).flock(handle.fileno(), cast(Any, fcntl).LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _wrap_marker_lock(settings_path: Path, *, timeout: float = 5.0) -> Any:
+    """Serialize read-modify-write cycles on the owner stack.
+
+    Concurrent isolated wraps in one project all push onto (and pop off of) the
+    same ``.headroom_wrap_marker.json``. Without a lock, two sessions can read
+    the same stack, each append itself, and the later write silently drops the
+    other LIVE owner — after which that owner's exit restores the pre-Headroom
+    URL out from under a still-running peer. The whole read-append-write cycle
+    therefore runs under an interprocess advisory lock on a sidecar
+    ``.headroom_wrap_marker.lock``.
+
+    Best-effort by design: if the lock file cannot be created or a holder is
+    wedged past ``timeout``, the body still runs unserialized. Marker
+    bookkeeping must never be the reason a wrap fails to launch.
+    """
+
+    global _wrap_marker_lock_depth
+    if _wrap_marker_lock_depth > 0:
+        yield
+        return
+
+    handle = None
+    try:
+        path = _wrap_marker_lock_path(settings_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 — released in finally
+    except OSError:
+        yield
+        return
+
+    acquired = _lock_handle_exclusive(handle, timeout=timeout)
+    _wrap_marker_lock_depth += 1
+    try:
+        yield
+    finally:
+        _wrap_marker_lock_depth -= 1
+        if acquired:
+            _unlock_handle(handle)
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
 def _wrap_marker_owners(settings_path: Path) -> list[dict[str, Any]]:
     """Live owner stack for ``settings_path``, oldest first.
 
@@ -1347,10 +1444,13 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             # are still live (reverse exit order).
             "url": _claude_proxy_base_url(port),
         }
-        # Push onto the live owner stack rather than replacing it.
-        owners = [o for o in _wrap_marker_owners(settings_path) if o.get("pid") != os.getpid()]
-        owners.append(payload)
-        _write_wrap_marker_owners(settings_path, owners)
+        # Push onto the live owner stack rather than replacing it. The whole
+        # read-append-write cycle is serialized so a concurrent push cannot
+        # read the same pre-image and drop us (or its own peer) on write.
+        with _wrap_marker_lock(settings_path):
+            owners = [o for o in _wrap_marker_owners(settings_path) if o.get("pid") != os.getpid()]
+            owners.append(payload)
+            _write_wrap_marker_owners(settings_path, owners)
     except OSError:
         pass
 
@@ -1437,8 +1537,21 @@ def _handover_to_live_owner(
     ``require_live_port`` additionally drops owners whose recorded proxy port
     no longer answers — the authoritative signal for the reboot/SIGKILL case
     (#2221), where a recycled PID can make a dead session look alive.
+
+    Callers hold ``_wrap_marker_lock`` around this (it is a read-modify-write
+    on the shared stack); the lock is re-entrant within a process, so the
+    nested ``_restore_claude_wrap_base_url`` below does not deadlock.
     """
 
+    with _wrap_marker_lock(settings_path):
+        return _handover_to_live_owner_locked(
+            settings_path, key=key, require_live_port=require_live_port
+        )
+
+
+def _handover_to_live_owner_locked(
+    settings_path: Path, *, key: str, require_live_port: bool = False
+) -> str | None:
     owners = [o for o in _wrap_marker_owners(settings_path) if o.get("key") == key]
     if require_live_port:
         owners = [
@@ -1478,6 +1591,11 @@ def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str 
     Called before writing a fresh base_url entry so a crashed wrap session's
     leftover doesn't get treated as this session's own state to restore later.
     """
+    with _wrap_marker_lock(settings_path):
+        return _check_and_clear_stale_wrap_marker_locked(settings_path, key=key)
+
+
+def _check_and_clear_stale_wrap_marker_locked(settings_path: Path, *, key: str) -> str | None:
     marker = _read_wrap_marker(settings_path)
     if marker is None or marker.get("key") != key:
         return None
@@ -1523,6 +1641,11 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
     is never cleared. Returns the restored prior value, or None when there was
     nothing dead to clean up.
     """
+    with _wrap_marker_lock(settings_path):
+        return _check_and_clear_dead_wrap_marker_locked(settings_path, key=key)
+
+
+def _check_and_clear_dead_wrap_marker_locked(settings_path: Path, *, key: str) -> str | None:
     marker = _read_wrap_marker(settings_path)
     if marker is None or marker.get("key") != key:
         return None
@@ -1722,8 +1845,30 @@ def _write_claude_wrap_base_url(
     When ``port`` is given, also stamps a sidecar marker recording this
     process's identity and the previous value, so a later crash can be
     detected and self-healed (issue #1768).
+
+    Runs under ``_wrap_marker_lock``: reading the peer marker, rewriting the
+    settings file, and pushing onto the owner stack must be one atomic step
+    with respect to other wrap sessions in the same project.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    with _wrap_marker_lock(path):
+        return _write_claude_wrap_base_url_locked(
+            proxy_url,
+            path=path,
+            foundry_mode=foundry_mode,
+            vertex_mode=vertex_mode,
+            port=port,
+        )
+
+
+def _write_claude_wrap_base_url_locked(
+    proxy_url: str,
+    *,
+    path: Path,
+    foundry_mode: bool = False,
+    vertex_mode: bool = False,
+    port: int | None = None,
+) -> str | None:
     payload: dict[str, Any] = {}
     if path.exists():
         try:
@@ -1798,8 +1943,34 @@ def _restore_claude_wrap_base_url(
     and the marker alone. ``_force`` bypasses this for the stale-marker
     cleanup path, which is explicitly restoring another (dead) session's
     leftover.
+
+    The owner-stack pop and the settings-file rewrite happen under
+    ``_wrap_marker_lock`` so a peer's concurrent push cannot interleave between
+    them and lose an owner.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    with _wrap_marker_lock(path):
+        _restore_claude_wrap_base_url_locked(
+            previous,
+            path=path,
+            foundry_mode=foundry_mode,
+            vertex_mode=vertex_mode,
+            _key_override=_key_override,
+            _force=_force,
+            _keep_marker=_keep_marker,
+        )
+
+
+def _restore_claude_wrap_base_url_locked(
+    previous: str | None,
+    *,
+    path: Path,
+    foundry_mode: bool = False,
+    vertex_mode: bool = False,
+    _key_override: str | None = None,
+    _force: bool = False,
+    _keep_marker: bool = False,
+) -> None:
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
@@ -4638,6 +4809,15 @@ def _ensure_proxy(
                 click.echo(f"  Error: {e}")
                 raise SystemExit(1) from e
 
+            # Pin this run's workspace to the proxy we just started. The proxy
+            # is detached, so it can outlive this wrapper; without the record,
+            # run-dir GC would only see the (by then dead) wrapper PID in the
+            # directory name and could delete a live proxy's state.
+            from headroom import isolation as _isolation
+
+            if proc is not None:
+                _isolation.record_run_proxy(proc.pid, actual_port)
+
             click.echo(f"  Proxy ready on http://127.0.0.1:{actual_port}")
             click.echo(f"  Dashboard:    http://127.0.0.1:{actual_port}/dashboard")
             return proc, actual_port
@@ -5329,6 +5509,18 @@ def wrap_selfheal(marker: str | None) -> None:
 _LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _is_local_headroom_proxy(port: int) -> bool:
+    """True when the loopback listener on ``port`` is itself a Headroom proxy.
+
+    ``/health`` self-identifies with ``service: headroom-proxy``, which is what
+    distinguishes a parent wrap session's proxy from a genuine user gateway
+    (LiteLLM and friends) that happens to be listening on localhost.
+    """
+
+    payload = _query_proxy_health(port)
+    return payload is not None and payload.get("service") == "headroom-proxy"
+
+
 def _detect_inbound_anthropic_upstream(port: int) -> str | None:
     """Return a pre-set ANTHROPIC_BASE_URL that is NOT this proxy, else None.
 
@@ -5340,6 +5532,13 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
     the pre-existing value as the proxy's upstream so compression layers on
     top of the user's gateway instead of replacing it. URLs pointing at this
     proxy instance are ignored to avoid a self-referential forwarding loop.
+
+    So are URLs pointing at ANOTHER local Headroom proxy: isolation gives every
+    run its own port, so a nested ``headroom wrap claude`` inherits the parent
+    wrap's ``ANTHROPIC_BASE_URL`` on the parent's port — which is not equal to
+    this run's ``port`` and would therefore read as a user gateway. Chaining
+    onto it would send every request through two Headroom pipelines
+    (double compression, doubled latency, corrupted savings accounting).
     """
 
     base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
@@ -5356,6 +5555,8 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
         except ValueError:
             return None
         if parsed_port == port:
+            return None
+        if parsed_port is not None and _is_local_headroom_proxy(parsed_port):
             return None
     return base_url
 

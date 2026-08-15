@@ -60,6 +60,10 @@ def _run_in_click_context(fn) -> str:  # type: ignore[no-untyped-def]
 
 
 class _FakeProc:
+    # `_ensure_proxy` records the started proxy's PID into the run dir so GC
+    # never deletes a live detached proxy's workspace, so the stub needs one.
+    pid = 4242
+
     def poll(self) -> None:
         return None
 
@@ -1062,3 +1066,330 @@ class TestMemoryCliHonoursIsolatedDb:
         monkeypatch.delenv("HEADROOM_MEMORY_DB_PATH", raising=False)
 
         assert memory_cli._default_db_path() == str(project / ".headroom" / "memory.db")
+
+
+class TestWrapMarkerLocking:
+    """The owner stack is a read-modify-write on a file shared by every
+    concurrent wrap in a project (round 10, P1).
+
+    Unserialized, two sessions read the same pre-image, each append
+    themselves, and the later write drops the other LIVE owner — whose exit
+    then restores the pre-Headroom URL out from under a running peer. The
+    whole cycle must run inside `_wrap_marker_lock`.
+    """
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    @staticmethod
+    def _peer_can_lock(settings: Path) -> bool:
+        """Whether an *independent* handle can take the lock right now.
+
+        flock is held per open file description, so a fresh handle conflicts
+        with a held lock even inside this same process — which makes the
+        critical section observable without spawning anything.
+        """
+        path = wrap_mod._wrap_marker_lock_path(settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as handle:
+            if not wrap_mod._lock_handle_exclusive(handle, timeout=0):
+                return False
+            wrap_mod._unlock_handle(handle)
+            return True
+
+    def test_lock_is_observable_when_held(self, tmp_path: Path) -> None:
+        settings, _marker = self._project(tmp_path)
+
+        assert self._peer_can_lock(settings) is True
+        with wrap_mod._wrap_marker_lock(settings):
+            assert self._peer_can_lock(settings) is False
+        assert self._peer_can_lock(settings) is True
+
+    def test_push_holds_the_lock_across_read_and_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, _marker = self._project(tmp_path)
+        observed: list[bool] = []
+        real = wrap_mod._wrap_marker_owners
+
+        def probing_owners(path: Path) -> Any:
+            observed.append(self._peer_can_lock(path))
+            return real(path)
+
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_owners", probing_owners)
+        wrap_mod._write_wrap_marker(settings, port=8788, key="ANTHROPIC_BASE_URL", previous=None)
+
+        assert observed == [False], "the stack read must already be inside the lock"
+
+    def test_restore_holds_the_lock_across_read_and_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, _marker = self._project(tmp_path)
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        observed: list[bool] = []
+        real = wrap_mod._wrap_marker_owners
+
+        def probing_owners(path: Path) -> Any:
+            observed.append(self._peer_can_lock(path))
+            return real(path)
+
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_owners", probing_owners)
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert observed and not any(observed)
+
+    def test_write_base_url_holds_the_lock(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The peer-marker read, the settings rewrite and the stack push are
+        one atomic step — a peer must not observe the file mid-update."""
+        settings, _marker = self._project(tmp_path)
+        observed: list[bool] = []
+        real = wrap_mod._read_wrap_marker
+
+        def probing_read(path: Path) -> Any:
+            observed.append(self._peer_can_lock(path))
+            return real(path)
+
+        monkeypatch.setattr(wrap_mod, "_read_wrap_marker", probing_read)
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        assert observed and not any(observed)
+
+    def test_lock_is_reentrant_within_one_process(self, tmp_path: Path) -> None:
+        """`_handover_to_live_owner` calls back into the restorer, which locks
+        again. flock would deadlock on a second handle, so the guard must
+        short-circuit a nested acquisition."""
+        settings, _marker = self._project(tmp_path)
+
+        with wrap_mod._wrap_marker_lock(settings):
+            with wrap_mod._wrap_marker_lock(settings, timeout=0):
+                assert wrap_mod._wrap_marker_lock_depth == 1
+
+        assert wrap_mod._wrap_marker_lock_depth == 0
+
+    def test_handover_through_the_restorer_does_not_deadlock(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The real nested path: stale cleanup -> handover -> forced restore.
+        Each frame locks; a non-reentrant lock would hang here."""
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {
+                            "pid": os.getpid(),
+                            "port": 8788,
+                            "key": "ANTHROPIC_BASE_URL",
+                            "previous": "https://user-gateway",
+                            "url": "http://127.0.0.1:8788",
+                        },
+                        {
+                            "pid": 2147480000,  # crashed peer
+                            "port": 8789,
+                            "key": "ANTHROPIC_BASE_URL",
+                            "previous": "https://user-gateway",
+                            "url": "http://127.0.0.1:8789",
+                        },
+                    ],
+                    "pid": 2147480000,
+                    "port": 8789,
+                    "key": "ANTHROPIC_BASE_URL",
+                    "previous": "https://user-gateway",
+                }
+            )
+        )
+
+        handover = wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert handover == "http://127.0.0.1:8788"
+        assert wrap_mod._wrap_marker_lock_depth == 0
+
+    def test_body_still_runs_when_the_lock_cannot_be_taken(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Marker bookkeeping is best-effort: a wedged holder (or an
+        unwritable lock path) must never stop a wrap from launching."""
+        settings, marker = self._project(tmp_path)
+        monkeypatch.setattr(wrap_mod, "_lock_handle_exclusive", lambda *a, **k: False)
+
+        wrap_mod._write_wrap_marker(settings, port=8788, key="ANTHROPIC_BASE_URL", previous=None)
+
+        assert json.loads(marker.read_text())["owners"][-1]["port"] == 8788
+        assert wrap_mod._wrap_marker_lock_depth == 0
+
+    def test_lock_open_failure_is_survivable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+
+        def boom(*_a: Any, **_k: Any) -> Any:
+            raise OSError("no lock file for you")
+
+        monkeypatch.setattr("builtins.open", boom)
+        with wrap_mod._wrap_marker_lock(settings):
+            pass
+
+        assert wrap_mod._wrap_marker_lock_depth == 0
+
+    def test_concurrent_pushes_keep_every_live_owner(self, tmp_path: Path) -> None:
+        """End-to-end proof across real processes: two wraps racing to push
+        must both end up on the stack. Without the lock the later writer's
+        pre-image is empty and it silently drops the first owner."""
+        import subprocess
+        import sys
+        import time
+
+        settings, marker = self._project(tmp_path)
+        child = tmp_path / "push.py"
+        child.write_text(
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from headroom.cli import wrap\n"
+            "settings, port, start_at = Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])\n"
+            "real = wrap._wrap_marker_owners\n"
+            "def slow(path):\n"
+            "    owners = real(path)\n"
+            "    time.sleep(0.5)  # widen the read->write window\n"
+            "    return owners\n"
+            "wrap._wrap_marker_owners = slow\n"
+            "while time.time() < start_at:\n"
+            "    time.sleep(0.005)\n"
+            "wrap._write_wrap_marker("
+            "settings, port=port, key='ANTHROPIC_BASE_URL', previous=None)\n"
+            # Stay alive: a peer drops owners whose PID is gone, so exiting
+            # here would make the drop legitimate rather than a lost write.
+            "time.sleep(2.5)\n"
+        )
+        # Absolute start times absorb interpreter/import startup cost, so the
+        # interleaving is decided by the delays above, not by process spawn
+        # latency.
+        base = time.time() + 6.0
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(child), str(settings), str(port), str(base + offset)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for port, offset in ((8788, 0.0), (8789, 0.1))
+        ]
+        for proc in procs:
+            _out, err = proc.communicate(timeout=120)
+            assert proc.returncode == 0, err.decode()
+
+        recorded = json.loads(marker.read_text())["owners"]
+        assert sorted(o["port"] for o in recorded) == [8788, 8789]
+
+
+class TestNestedWrapDoesNotChainProxies:
+    """Isolation puts every run on its own port, so a nested `wrap claude`
+    inherits the PARENT wrap's ANTHROPIC_BASE_URL on a DIFFERENT port. The
+    equal-port guard alone misses that, and the inherited URL reads as a user
+    gateway — chaining two Headroom pipelines (round 10, P2).
+    """
+
+    def test_inherited_parent_proxy_is_not_treated_as_a_gateway(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) is None
+
+    def test_own_port_is_still_ignored_without_probing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8788")
+
+        def unexpected(_port: int) -> Any:
+            raise AssertionError("self-referential URL must short-circuit before probing")
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", unexpected)
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) is None
+
+    def test_local_user_gateway_is_still_inherited(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A LiteLLM on localhost is NOT a Headroom proxy — issue #1353 must
+        keep working."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:4000")
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {"service": "litellm"})
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) == "http://localhost:4000"
+
+    def test_unreachable_local_port_is_still_inherited(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing listening yet (gateway starts later) must not silently drop
+        the user's configured upstream."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:4000")
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: None)
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) == "http://127.0.0.1:4000"
+
+    def test_remote_gateway_is_never_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example.com")
+
+        def unexpected(_port: int) -> Any:
+            raise AssertionError("remote hosts must not be probed")
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", unexpected)
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) == "https://gateway.example.com"
+
+    def test_portless_local_url_is_not_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No explicit port means a default 80/443 listener — never a Headroom
+        proxy, and probing it would be a surprise connection."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost/v1")
+
+        def unexpected(_port: int) -> Any:
+            raise AssertionError("portless URLs must not be probed")
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", unexpected)
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) == "http://localhost/v1"
+
+    def test_is_local_headroom_proxy_signature(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+        assert wrap_mod._is_local_headroom_proxy(8787) is True
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {})
+        assert wrap_mod._is_local_headroom_proxy(8787) is False
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: None)
+        assert wrap_mod._is_local_headroom_proxy(8787) is False
+
+
+class TestDedicatedProxyPidIsRecorded:
+    """`_ensure_proxy` must pin the run dir to the proxy it starts, so GC
+    cannot delete a live detached proxy's workspace (round 10, P2)."""
+
+    def test_ensure_proxy_records_the_started_proxy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+
+        class _Proc:
+            pid = 4242
+
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda *a, **k: 8788)
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
+        monkeypatch.setattr(wrap_mod, "_start_proxy", lambda *a, **k: _Proc())
+
+        proc, port = wrap_mod._ensure_proxy(8787, False)
+
+        assert port == 8788 and proc is not None
+        assert isolation._run_dir_proxy_pid(run_dir) == 4242

@@ -7,6 +7,7 @@ dedicated proxy; these tests pin the workspace half of that contract.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -339,6 +340,80 @@ class TestPrunePidLiveness:
         isolation.prune_stale_runs(runs)
 
         assert recent.exists()
+
+
+class TestPruneRespectsDetachedProxy:
+    """A dedicated proxy is spawned detached, so it outlives its wrapper.
+
+    GC keyed only on the wrapper PID baked into the run-dir name would delete
+    a still-serving proxy's workspace — its DBs, caches and logs — once the
+    age cutoff passed. ``record_run_proxy`` pins the dir to the proxy too.
+    """
+
+    @staticmethod
+    def _make_stale(path: Path) -> None:
+        stale = 1_000_000_000.0
+        for target in (path, *path.rglob("*")):
+            os.utime(target, (stale, stale))
+
+    def test_live_proxy_pins_a_dir_whose_wrapper_is_gone(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        # Wrapper PID is a dead sentinel; the recorded proxy PID is this
+        # process, i.e. provably alive.
+        run = runs / "run-20200101-000000-2147480000-abcdef"
+        run.mkdir(parents=True)
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert run.exists()
+
+    def test_dead_proxy_and_dead_wrapper_is_pruned(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        run = runs / "run-20200101-000000-2147480000-abcdef"
+        run.mkdir(parents=True)
+        isolation.record_run_proxy(2147480001, 8788, run_dir=run)
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not run.exists()
+
+    def test_record_writes_pid_and_port(self, tmp_path: Path) -> None:
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        isolation.record_run_proxy(4321, 8791, run_dir=run)
+
+        record = json.loads((run / isolation._PROXY_STATE_FILE).read_text())
+        assert record == {"pid": 4321, "port": 8791}
+        assert isolation._run_dir_proxy_pid(run) == 4321
+
+    def test_record_targets_the_active_run_when_not_given(self, tmp_path: Path) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+        isolation.record_run_proxy(4321, 8792)
+
+        assert isolation._run_dir_proxy_pid(run_dir) == 4321
+
+    def test_record_is_a_noop_outside_isolation(self, tmp_path: Path) -> None:
+        # No active isolated workspace → nothing to pin, and no crash.
+        isolation.record_run_proxy(4321, 8793)
+
+        assert isolation.active_isolated_workspace() is None
+
+    def test_missing_or_corrupt_record_reads_as_absent(self, tmp_path: Path) -> None:
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        assert isolation._run_dir_proxy_pid(run) is None
+
+        (run / isolation._PROXY_STATE_FILE).write_text("{not json")
+        assert isolation._run_dir_proxy_pid(run) is None
+
+        (run / isolation._PROXY_STATE_FILE).write_text('["not", "a", "dict"]')
+        assert isolation._run_dir_proxy_pid(run) is None
+
+        (run / isolation._PROXY_STATE_FILE).write_text('{"pid": "nope"}')
+        assert isolation._run_dir_proxy_pid(run) is None
 
 
 class TestProxyClientMarkersShared:
