@@ -37,6 +37,11 @@ _CACHE_FILE = "update_check.json"
 # Probe PyPI at most once per day.
 _CHECK_TTL_SECONDS = 86_400
 
+# How long to wait for a peer's in-flight refresh before giving up and doing
+# our own. Longer than `fetch_latest_version`'s own 4s timeout, so the common
+# case is that the waiter outlasts the winner's request and reuses its result.
+_REFRESH_LOCK_TIMEOUT_S = 6.0
+
 _OFF_VALUES = frozenset(("off", "false", "0", "no", "disable", "disabled"))
 _TRUE_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
 
@@ -146,7 +151,11 @@ def write_cache(latest_version: str, *, now: float | None = None) -> None:
             "latest_version": latest_version,
         }
         path = _cache_path()
-        tmp = path.with_suffix(".json.tmp")
+        # Unique per writer. A single shared `.json.tmp` lets concurrent
+        # refreshes scribble over each other's partial writes and can make one
+        # `replace` fail outright, leaving the cache absent — which sends the
+        # NEXT launch fan-out straight back to PyPI.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh)
         tmp.replace(path)
@@ -232,10 +241,31 @@ def run_check(*, allow_pre: bool = False, now: float | None = None) -> str | Non
     """
     if not is_update_check_enabled():
         return None
-    latest = fetch_latest_version(allow_pre=allow_pre)
-    if latest:
-        write_cache(latest, now=now)
-    return latest
+    # Serialize the whole refresh — staleness check, fetch, publish — across
+    # processes. Isolation makes every wrap its own process, so once the TTL
+    # expires a fan-out of launches all pass `should_check()` before any of
+    # them writes and each independently hits PyPI. Holding the lock across
+    # the fetch means the peers re-read the cache the winner just wrote and
+    # skip their own request.
+    #
+    # Best-effort by design (see `_filelock`): if the lock cannot be taken the
+    # refresh still runs, unserialized. A cached version number is never worth
+    # failing a launch over.
+    from headroom import _filelock
+
+    cache = _cache_path()
+    with _filelock.exclusive(_filelock.lock_path_for(cache), timeout=_REFRESH_LOCK_TIMEOUT_S):
+        if now is None and not should_check():
+            # A peer refreshed while we waited. An explicit `now` means a
+            # caller (or a test) asked for this check specifically, so it is
+            # not second-guessed.
+            cached = read_cache() or {}
+            latest_cached = cached.get("latest_version")
+            return latest_cached if isinstance(latest_cached, str) else None
+        latest = fetch_latest_version(allow_pre=allow_pre)
+        if latest:
+            write_cache(latest, now=now)
+        return latest
 
 
 def maybe_check_async() -> threading.Thread | None:

@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 import headroom.subscription.tracker as tracker_mod
-from headroom import paths
+from headroom import _filelock, paths
 from headroom.subscription.models import (
     ExtraUsage,
     RateLimitWindow,
@@ -37,6 +37,13 @@ def _isolated_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A shared root plus a per-run workspace, as an isolated proxy sees it."""
     monkeypatch.setenv(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(tmp_path / "shared"))
     monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(tmp_path / "run-a"))
+
+
+_TOKEN = "tok12345678"
+
+
+def _snapshot_path(token: str = _TOKEN):
+    return paths.subscription_snapshot_path(tracker_mod._account_key(token))
 
 
 def _snapshot(*, token_prefix: str = "tok12345", age_s: float = 0.0) -> SubscriptionSnapshot:
@@ -72,7 +79,7 @@ def _tracker(monkeypatch: pytest.MonkeyPatch, client: _Client, **kw: Any) -> Sub
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     monkeypatch.setattr(SubscriptionTracker, "_poll_rtk_delta", lambda self: 0)
     tracker = SubscriptionTracker(client=client, **kw)  # type: ignore[arg-type]
-    tracker.notify_active("Bearer tok12345678")
+    tracker.notify_active(f"Bearer {_TOKEN}")
     return tracker
 
 
@@ -87,11 +94,15 @@ def _poll(tracker: SubscriptionTracker, monkeypatch: pytest.MonkeyPatch) -> None
 
 class TestSharedStateLocation:
     def test_the_snapshot_is_account_global(self, tmp_path: Path) -> None:
-        assert paths.subscription_snapshot_path().parent == tmp_path / "shared"
+        assert _snapshot_path().parent == tmp_path / "shared"
 
     def test_the_poll_lock_is_account_global(self, tmp_path: Path) -> None:
         """A per-run lock hands every concurrent proxy its own file."""
         assert paths.subscription_poll_lock_path().parent == tmp_path / "shared"
+        assert (
+            paths.subscription_poll_lock_path(tracker_mod._account_key(_TOKEN)).parent
+            == tmp_path / "shared"
+        )
 
     def test_contribution_state_stays_per_run(self, tmp_path: Path) -> None:
         """This run's own measurements must NOT move to shared state, or
@@ -109,7 +120,7 @@ class TestOnlyOnePollerHitsTheAccountAPI:
         _poll(tracker, monkeypatch)
 
         assert client.calls == 1
-        published = json.loads(paths.subscription_snapshot_path().read_text())
+        published = json.loads(_snapshot_path().read_text())
         assert published["five_hour"]["used"] == 41
 
     def test_a_peer_adopts_instead_of_polling(
@@ -117,7 +128,7 @@ class TestOnlyOnePollerHitsTheAccountAPI:
     ) -> None:
         """The reported scenario: a second isolated proxy on the same account
         must not make its own account-usage request."""
-        path = paths.subscription_snapshot_path()
+        path = _snapshot_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_snapshot(age_s=5).to_dict()))
         client = _Client()
@@ -135,7 +146,7 @@ class TestOnlyOnePollerHitsTheAccountAPI:
     ) -> None:
         """Coordination must never leave a session reporting usage windows it
         should have refreshed by now."""
-        path = paths.subscription_snapshot_path()
+        path = _snapshot_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_snapshot(age_s=10_000).to_dict()))
         client = _Client()
@@ -148,7 +159,7 @@ class TestOnlyOnePollerHitsTheAccountAPI:
     def test_a_corrupt_published_snapshot_falls_back_to_polling(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        path = paths.subscription_snapshot_path()
+        path = _snapshot_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json")
         client = _Client()
@@ -173,7 +184,7 @@ class TestOnlyOnePollerHitsTheAccountAPI:
         _poll(tracker, monkeypatch)
 
         assert client.calls == 1
-        assert not paths.subscription_snapshot_path().exists(), (
+        assert not _snapshot_path().exists(), (
             "a non-owner must not publish over the owner's snapshot"
         )
 
@@ -188,7 +199,7 @@ class TestOnlyOnePollerHitsTheAccountAPI:
         client = _Client()
 
         def probing_fetch(_token: str) -> Any:
-            lock = paths.subscription_poll_lock_path()
+            lock = paths.subscription_poll_lock_path(tracker_mod._account_key(_TOKEN))
             lock.parent.mkdir(parents=True, exist_ok=True)
             with open(lock, "a+", encoding="utf-8") as handle:
                 free = filelock.acquire(handle, timeout=0)
@@ -229,7 +240,7 @@ class TestTheLoserWaitsForTheWinner:
             await real_sleep(0)
             state["waits"] += 1
             if state["waits"] == 2:  # the owner's request lands mid-wait
-                path = paths.subscription_snapshot_path()
+                path = _snapshot_path()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(published.to_dict()))
 
@@ -310,9 +321,7 @@ class TestASilentOwnerTriggersAReElection:
 
         assert rounds["n"] == 2, "the silent owner must trigger a re-election"
         assert client.calls == 1
-        assert paths.subscription_snapshot_path().exists(), (
-            "the re-elected poller must publish for its peers"
-        )
+        assert _snapshot_path().exists(), "the re-elected poller must publish for its peers"
 
     def test_a_perpetual_loser_still_gets_data(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Re-election is bounded: never winning must not mean never polling."""
@@ -331,7 +340,7 @@ class TestASilentOwnerTriggersAReElection:
 
         assert attempts["n"] == tracker_mod._POLL_ELECTION_ROUNDS
         assert client.calls == 1
-        assert not paths.subscription_snapshot_path().exists(), (
+        assert not _snapshot_path().exists(), (
             "a fallback fetch is not authoritative and must not be published"
         )
 
@@ -361,7 +370,7 @@ class TestSnapshotsAreAccountScoped:
     def test_a_snapshot_from_another_account_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        path = paths.subscription_snapshot_path()
+        path = _snapshot_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_snapshot(token_prefix="OTHERACC", age_s=5).to_dict()))
         client = _Client()
@@ -378,7 +387,7 @@ class TestSnapshotsAreAccountScoped:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The gate must not defeat the coordination it guards."""
-        path = paths.subscription_snapshot_path()
+        path = _snapshot_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_snapshot(token_prefix="tok12345", age_s=5).to_dict()))
         client = _Client()
@@ -392,7 +401,7 @@ class TestSnapshotsAreAccountScoped:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Written before the prefix existed: unknown account, so poll."""
-        path = paths.subscription_snapshot_path()
+        path = _snapshot_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = _snapshot(age_s=5).to_dict()
         payload["token_prefix"] = ""
@@ -414,8 +423,73 @@ class TestSnapshotsAreAccountScoped:
 
         _poll(tracker, monkeypatch)
 
-        published = json.loads(paths.subscription_snapshot_path().read_text())
+        published = json.loads(_snapshot_path().read_text())
         assert published["token_prefix"] == "tok12345"
+
+
+class TestCoordinationIsScopedToOneAccount:
+    """One machine-global lock and one snapshot file made unrelated accounts
+    contend: a loser rejected the winner's snapshot on the account check but
+    still waited the full handoff timeout first, which blows an on-demand
+    dashboard poll's 2s budget, and mixed-account publishes overwrote each
+    other (round 24, P2)."""
+
+    def test_different_accounts_use_different_snapshot_files(self) -> None:
+        mine = paths.subscription_snapshot_path(tracker_mod._account_key(_TOKEN))
+        theirs = paths.subscription_snapshot_path(tracker_mod._account_key("other-account"))
+
+        assert mine != theirs
+
+    def test_different_accounts_use_different_locks(self) -> None:
+        mine = paths.subscription_poll_lock_path(tracker_mod._account_key(_TOKEN))
+        theirs = paths.subscription_poll_lock_path(tracker_mod._account_key("other-account"))
+
+        assert mine != theirs
+
+    def test_the_key_is_not_the_token(self) -> None:
+        """These names sit in a shared directory; a filename is the wrong
+        place for credential material."""
+        key = tracker_mod._account_key(_TOKEN)
+
+        assert _TOKEN not in key
+        assert _TOKEN[:8] not in key
+        assert key == tracker_mod._account_key(_TOKEN), "must be stable"
+
+    def test_another_accounts_poll_does_not_block_ours(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported symptom: an unrelated account holding the lock used to
+        cost us the whole handoff timeout before we re-elected."""
+        theirs = paths.subscription_poll_lock_path(tracker_mod._account_key("other-account"))
+        theirs.parent.mkdir(parents=True, exist_ok=True)
+        held = open(theirs, "a+", encoding="utf-8")
+        assert _filelock.acquire(held, timeout=0)
+        try:
+
+            async def unexpected(delay: float) -> None:
+                raise AssertionError("waited on an unrelated account's poll")
+
+            monkeypatch.setattr("headroom.subscription.tracker.asyncio.sleep", unexpected)
+            client = _Client()
+            tracker = _tracker(monkeypatch, client)
+
+            _poll(tracker, monkeypatch)
+
+            assert client.calls == 1
+        finally:
+            _filelock.release(held)
+            held.close()
+
+    def test_a_publish_lands_in_our_accounts_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+
+        _poll(tracker, monkeypatch)
+
+        assert _snapshot_path().exists()
+        assert not paths.subscription_snapshot_path(
+            tracker_mod._account_key("other-account")
+        ).exists()
 
 
 class TestSnapshotRoundTrip:

@@ -119,8 +119,9 @@ real `~/.headroom` while the workspace bucket above moves into the run dir.
 | Dashboard settings | `${SHARED_WORKSPACE_DIR}/settings.json` | `HEADROOM_SETTINGS_PATH` |
 | Update-check cache | `${SHARED_WORKSPACE_DIR}/update_check.json` | — |
 | Legacy models catalog (fallback) | `${SHARED_WORKSPACE_DIR}/models.json` | — |
-| Account usage snapshot | `${SHARED_WORKSPACE_DIR}/subscription_snapshot.json` | — |
-| Account poll lock | `${SHARED_WORKSPACE_DIR}/subscription_poll.lock` | — |
+| Account usage snapshot | `${SHARED_WORKSPACE_DIR}/subscription_snapshot-<account>.json` | — |
+| Account poll lock | `${SHARED_WORKSPACE_DIR}/subscription_poll-<account>.lock` | — |
+| Update-check refresh lock | `${SHARED_WORKSPACE_DIR}/update_check.json.lock` | — |
 | Dashboard settings lock | `${SHARED_WORKSPACE_DIR}/settings.json.lock` | — |
 
 Anything on the shared bucket is a multi-process path by definition, so a
@@ -131,7 +132,10 @@ a lost update. The account snapshot is only adopted when its recorded
 `token_prefix` matches the polling token, so two proxies on different Claude
 accounts never read each other's quota out of it. A proxy that loses the
 election waits for the winner's snapshot rather than issuing its own request,
-falling back to polling only if nothing is published — otherwise a cold start,
+falling back to polling only if nothing is published. Both files are keyed by
+account (`<account>` is an opaque digest of the OAuth token, never the token
+itself), so proxies on unrelated accounts neither block nor overwrite each
+other — otherwise a cold start,
 where every proxy finds the snapshot empty at the same moment, would make the
 election decide nothing.
 

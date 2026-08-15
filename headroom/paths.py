@@ -295,7 +295,7 @@ def subscription_state_path(explicit: str | os.PathLike[str] | None = None) -> P
     )
 
 
-def subscription_snapshot_path() -> Path:
+def subscription_snapshot_path(account: str | None = None) -> Path:
     """Return the path for the ACCOUNT-GLOBAL subscription usage snapshot.
 
     The usage windows this holds describe an Anthropic account, not a run, and
@@ -310,19 +310,31 @@ def subscription_snapshot_path() -> Path:
     ``subscription_state.json`` (see :func:`subscription_state_path`) — those
     are per-session measurements, and sharing them would let concurrent runs
     overwrite each other's totals.
+
+    ``account`` scopes the file to one OAuth account. Unscoped, proxies signed
+    in to different accounts publish over each other and each rejects what the
+    other wrote, so the coordination degrades into pure contention. It is an
+    opaque digest rather than the token prefix — a filename is the wrong place
+    for credential material.
     """
 
+    if account:
+        return shared_workspace_dir() / f"subscription_snapshot-{account}.json"
     return shared_workspace_dir() / _SUBSCRIPTION_SNAPSHOT_FILE
 
 
-def subscription_poll_lock_path() -> Path:
+def subscription_poll_lock_path(account: str | None = None) -> Path:
     """Return the lock deciding which proxy polls account usage.
 
     Shared-rooted for the same reason as :func:`subscription_snapshot_path`:
     a per-run lock hands every concurrent proxy its own file and serializes
-    nothing.
+    nothing. Scoped by ``account`` for the same reason too — proxies on
+    unrelated accounts have nothing to serialize against each other, and
+    sharing one lock only makes them wait.
     """
 
+    if account:
+        return shared_workspace_dir() / f"subscription_poll-{account}.lock"
     return shared_workspace_dir() / _SUBSCRIPTION_POLL_LOCK_FILE
 
 

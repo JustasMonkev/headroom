@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -161,6 +162,20 @@ _CACHE_MISS_RATIO_THRESHOLD = 0.10
 
 def _get_persist_path() -> Path:
     return _paths.subscription_state_path()
+
+
+def _account_key(token: str | None) -> str:
+    """Opaque, stable per-OAuth-account key for the shared coordination files.
+
+    A digest rather than the token prefix: these names sit in a shared
+    directory, and a filename is the wrong place for credential material.
+    ``""`` when there is no token — such a poll coordinates with nothing, which
+    is right, since it cannot say which account it is about.
+    """
+
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 class SubscriptionTracker(QuotaTracker):
@@ -564,7 +579,7 @@ class SubscriptionTracker(QuotaTracker):
             pass
 
     @contextlib.contextmanager
-    def _poll_ownership(self) -> Iterator[bool]:
+    def _poll_ownership(self, account: str) -> Iterator[bool]:
         """Hold the account-poll lock for the duration of one usage request.
 
         Non-blocking and NOT cached, unlike the RTK lock: a wrap session is
@@ -574,7 +589,7 @@ class SubscriptionTracker(QuotaTracker):
         only an owner publishes.
         """
 
-        path = _paths.subscription_poll_lock_path()
+        path = _paths.subscription_poll_lock_path(account)
         handle = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -610,12 +625,13 @@ class SubscriptionTracker(QuotaTracker):
         if snapshot is not None:
             return snapshot
 
+        account = _account_key(token)
         for round_no in range(_POLL_ELECTION_ROUNDS):
-            with self._poll_ownership() as owns_poll:
+            with self._poll_ownership(account) as owns_poll:
                 if owns_poll:
                     snapshot = await self._client.fetch(token)
                     if snapshot is not None:
-                        self._publish_shared_snapshot(snapshot)
+                        self._publish_shared_snapshot(snapshot, account)
                     return snapshot
                 snapshot = await self._await_published_snapshot(token)
                 if snapshot is not None:
@@ -661,7 +677,9 @@ class SubscriptionTracker(QuotaTracker):
         """
 
         try:
-            raw = json.loads(_paths.subscription_snapshot_path().read_text(encoding="utf-8"))
+            raw = json.loads(
+                _paths.subscription_snapshot_path(_account_key(token)).read_text(encoding="utf-8")
+            )
         except (OSError, ValueError):
             return None
         if not isinstance(raw, dict):
@@ -679,14 +697,14 @@ class SubscriptionTracker(QuotaTracker):
         logger.debug("event=subscription_snapshot_adopted age_s=%.1f", age)
         return snapshot
 
-    def _publish_shared_snapshot(self, snapshot: SubscriptionSnapshot) -> None:
+    def _publish_shared_snapshot(self, snapshot: SubscriptionSnapshot, account: str) -> None:
         """Publish an account snapshot for the other proxies on this machine.
 
         Best-effort and atomic: a peer must never read a half-written file, but
         a failure here only costs the peers one extra poll of their own.
         """
 
-        path = _paths.subscription_snapshot_path()
+        path = _paths.subscription_snapshot_path(account)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
