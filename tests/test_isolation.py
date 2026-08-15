@@ -862,3 +862,60 @@ class TestPersistentInstallMemoryDb:
         assert manifest.memory_db_path == str(shared / "memory.db")
         assert str(run_dir) not in " ".join(manifest.proxy_args)
         assert str(shared / "memory.db") in manifest.proxy_args
+
+
+class TestLearnedVerbosityProfileIsShared:
+    """`learn --verbosity --apply` promises the saved profile applies to FUTURE
+    proxies, but the shaper resolved it from workspace_dir() — which isolation
+    relocates to a fresh, empty run dir (round 15, P2)."""
+
+    def test_profile_path_follows_the_shared_root(self, tmp_path: Path) -> None:
+        shared = paths.workspace_dir()
+        run_dir = isolation.activate_isolated_workspace()
+
+        assert paths.verbosity_profile_path() == shared / "verbosity.json"
+        assert paths.verbosity_profile_path().parent != run_dir
+
+    def test_shaper_finds_a_profile_saved_before_isolation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End-to-end: write the profile where `learn --apply` puts it, then
+        activate isolation and resolve the level the way the proxy does."""
+        from headroom.proxy.output_shaper import resolve_verbosity_level
+
+        shared = paths.ensure_workspace_dir()
+        (shared / "verbosity.json").write_text(json.dumps({"verbosity_level": 1}))
+        isolation.activate_isolated_workspace()
+
+        settings = type("S", (), {"verbosity_level": 3})()
+        level, source = resolve_verbosity_level(settings)  # type: ignore[arg-type]
+
+        assert (level, source) == (1, "learned"), "the learned profile was not found"
+
+    def test_no_profile_still_falls_back_to_the_default(self, tmp_path: Path) -> None:
+        from headroom.proxy.output_shaper import resolve_verbosity_level
+
+        isolation.activate_isolated_workspace()
+
+        settings = type("S", (), {"verbosity_level": 3})()
+        assert resolve_verbosity_level(settings) == (3, "default")  # type: ignore[arg-type]
+
+    def test_controller_state_stays_per_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The AIMD controller is live per-proxy tuning state, NOT a persisted
+        preference — each isolated proxy must tune itself independently."""
+        from headroom.proxy.output_shaper import resolve_verbosity_level
+
+        shared = paths.ensure_workspace_dir()
+        (shared / "verbosity_controller.json").write_text(json.dumps({"level": 0}))
+        run_dir = isolation.activate_isolated_workspace()
+        monkeypatch.setenv("HEADROOM_VERBOSITY_AUTOTUNE", "1")
+
+        settings = type("S", (), {"verbosity_level": 3})()
+        # The shared controller file is invisible to this run...
+        assert resolve_verbosity_level(settings)[1] != "controller"  # type: ignore[arg-type]
+
+        # ...but its own is used.
+        (run_dir / "verbosity_controller.json").write_text(json.dumps({"level": 4}))
+        assert resolve_verbosity_level(settings) == (4, "controller")  # type: ignore[arg-type]

@@ -159,9 +159,14 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
         return settings.verbosity_level, "env"
 
     try:
-        from ..paths import workspace_dir
+        from ..paths import verbosity_profile_path, workspace_dir
 
         ws = workspace_dir()
+        # The learned profile resolves against the SHARED root, not `ws`:
+        # `learn --apply` saves it once and promises it applies to future
+        # proxies, but an isolated run relocates the workspace to a fresh
+        # empty run dir, where the profile would never be found.
+        prof_path = verbosity_profile_path()
     except Exception:
         return settings.verbosity_level, "default"
 
@@ -179,7 +184,6 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
             except (OSError, ValueError):
                 pass
 
-    prof_path = ws / "verbosity.json"
     if prof_path.exists():
         try:
             import json as _json
@@ -381,11 +385,7 @@ def shape_openai_responses_request(
     # never appended for those requests — which also keeps ``instructions``
     # byte-stable across the whole conversation.
     level = settings.verbosity_level if level_override is None else level_override
-    if (
-        level > 0
-        and not native_controls
-        and apply_openai_responses_verbosity_steering(body, level)
-    ):
+    if level > 0 and not native_controls and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
 

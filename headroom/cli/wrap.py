@@ -1822,7 +1822,20 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
     SessionStart ONLY (never PreToolUse): the self-heal must not run per Bash
     call mid-session, where a transient probe blip could clear a live session.
     Idempotent — an existing entry carrying the marker is not duplicated.
+
+    Runs under ``_wrap_marker_lock``. This is a read-modify-write of the SAME
+    project-local file ``_write_claude_wrap_base_url`` guards, and it rewrites
+    the whole payload: unlocked, a peer's base_url write landing between our
+    read and our write would be clobbered by our stale snapshot, leaving the
+    owner marker naming the peer while the settings file points at us — so the
+    peer's daemon-spawned conversations route through our workspace, and at a
+    dead proxy once we exit.
     """
+    with _wrap_marker_lock(settings_path):
+        _ensure_claude_wrap_selfheal_hook_locked(settings_path)
+
+
+def _ensure_claude_wrap_selfheal_hook_locked(settings_path: Path) -> None:
     payload: dict[str, Any] = {}
     if settings_path.exists():
         try:

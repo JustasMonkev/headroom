@@ -438,6 +438,7 @@ def _run_verbosity(
     """Learn preferred output verbosity from session transcripts."""
     from ..learn.registry import auto_detect_plugins, get_plugin
     from ..learn.verbosity import analyze
+    from ..paths import ensure_shared_workspace_dir as _ensure_shared_workspace_dir
     from ..paths import ensure_workspace_dir
     from ..proxy.output_savings import BaselineModel, SavingsLedger
 
@@ -530,17 +531,21 @@ def _run_verbosity(
 
     if apply:
         ws = ensure_workspace_dir()
+        # The learned profile is a persisted preference for FUTURE proxies, so
+        # it must not land in an ephemeral per-run workspace when `learn` is
+        # invoked from inside an isolated wrap (see paths.verbosity_profile_path).
+        profile_path = _ensure_shared_workspace_dir() / "verbosity.json"
         from datetime import datetime, timezone
 
         best_profile.learned_at = datetime.now(timezone.utc).isoformat()
-        best_profile.save(ws / "verbosity.json")
+        best_profile.save(profile_path)
         # Seed the savings baseline: replace baseline, preserve any live
         # treatment/control already accumulated.
         ledger_path = ws / "output_savings.json"
         ledger = SavingsLedger.load(ledger_path)
         ledger.baseline = aggregated
         ledger.save(ledger_path)
-        click.echo(f"\n  [WROTE] {ws / 'verbosity.json'} (level {best_profile.level})")
+        click.echo(f"\n  [WROTE] {profile_path} (level {best_profile.level})")
         click.echo(
             f"  [WROTE] {ledger_path} (baseline: {aggregated.total_samples} samples, "
             f"{len(aggregated.strata)} strata across {analyzed_count} project(s))"

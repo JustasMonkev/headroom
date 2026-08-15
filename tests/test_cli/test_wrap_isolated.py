@@ -2189,3 +2189,87 @@ class TestHandoverRequiresALiveProxy:
         wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
 
         assert self._url(settings) == "http://127.0.0.1:8788"
+
+
+class TestSelfhealHookWriteIsSerialized:
+    """The hook installer rewrites the WHOLE settings payload it read, and it
+    touches the same project-local file the base_url write guards. Unlocked, a
+    peer's write landing between our read and our write is clobbered by our
+    stale snapshot (round 15, P1)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> Path:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings
+
+    @staticmethod
+    def _peer_can_lock(settings: Path) -> bool:
+        path = wrap_mod._wrap_marker_lock_path(settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as handle:
+            if not wrap_mod._lock_handle_exclusive(handle, timeout=0):
+                return False
+            wrap_mod._unlock_handle(handle)
+            return True
+
+    def test_hook_install_holds_the_lock_across_read_and_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings = self._project(tmp_path)
+        observed: list[bool] = []
+        real = wrap_mod._read_text
+
+        def probing_read(path: Path) -> Any:
+            if Path(path) == settings:
+                observed.append(self._peer_can_lock(settings))
+            return real(path)
+
+        monkeypatch.setattr(wrap_mod, "_read_text", probing_read)
+        wrap_mod._ensure_claude_wrap_selfheal_hook(settings)
+
+        assert observed and not any(observed), "the settings read must be inside the lock"
+
+    def test_hook_install_preserves_a_concurrently_written_base_url(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Companion to the lock-coverage test above: because the installer
+        rewrites the WHOLE payload, it must read the file as it stands at
+        install time. Here a peer's base_url is already committed before we
+        run — our write must carry it forward, not an older snapshot."""
+        settings = self._project(tmp_path)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8790", settings_path=settings, port=8790
+        )
+
+        wrap_mod._ensure_claude_wrap_selfheal_hook(settings)
+
+        payload = json.loads(settings.read_text())
+        assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8790"
+        assert "hooks" in payload
+
+    def test_the_hook_is_still_installed_and_idempotent(self, tmp_path: Path) -> None:
+        settings = self._project(tmp_path)
+
+        wrap_mod._ensure_claude_wrap_selfheal_hook(settings)
+        wrap_mod._ensure_claude_wrap_selfheal_hook(settings)
+
+        entries = json.loads(settings.read_text())["hooks"]["SessionStart"]
+        assert len(entries) == 1
+        assert wrap_mod._WRAP_SELFHEAL_HOOK_MARKER in entries[0]["hooks"][0]["command"]
+        # ...and the env block it shares the file with is untouched.
+        assert json.loads(settings.read_text())["env"]["ANTHROPIC_BASE_URL"] == (
+            "https://user-gateway"
+        )
+
+    def test_nested_under_the_base_url_write_does_not_deadlock(self, tmp_path: Path) -> None:
+        """Both take the same lock; the real call order is write-then-hook."""
+        settings = self._project(tmp_path)
+
+        with wrap_mod._wrap_marker_lock(settings):
+            wrap_mod._ensure_claude_wrap_selfheal_hook(settings)
+
+        assert wrap_mod._wrap_marker_lock_depth == 0
+        assert "hooks" in json.loads(settings.read_text())

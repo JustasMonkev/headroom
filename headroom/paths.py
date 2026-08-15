@@ -75,6 +75,7 @@ _SUBSCRIPTION_FILE = "subscription_state.json"
 _MEMORY_DB_FILE = "memory.db"
 _MEMORIES_DIR = "memories"
 _LICENSE_CACHE_FILE = "license_cache.json"
+_VERBOSITY_PROFILE_FILE = "verbosity.json"
 _SESSION_STATS_FILE = "session_stats.jsonl"
 _SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
@@ -303,6 +304,23 @@ def native_memory_dir() -> Path:
     return workspace_dir() / _MEMORIES_DIR
 
 
+def verbosity_profile_path() -> Path:
+    """Return the path for the learned output-verbosity profile.
+
+    Written by ``headroom learn --verbosity --apply`` and read by the proxy's
+    output shaper. It is a persisted user preference that ``--apply`` promises
+    to apply to FUTURE proxies, so it resolves against the shared workspace: an
+    isolated run would otherwise look for it in a fresh, empty run directory
+    and silently fall back to the default verbosity level.
+
+    The AIMD controller state (``verbosity_controller.json``) deliberately does
+    NOT live here — that is live per-proxy tuning state, and each isolated
+    proxy should tune itself independently.
+    """
+
+    return shared_workspace_dir() / _VERBOSITY_PROFILE_FILE
+
+
 def license_cache_path() -> Path:
     """Return the path for the cached license envelope.
 
@@ -516,6 +534,7 @@ __all__ = [
     "memory_db_path",
     "native_memory_dir",
     "license_cache_path",
+    "verbosity_profile_path",
     "session_stats_path",
     "savings_events_path",
     "settings_path",
