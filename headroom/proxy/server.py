@@ -2884,6 +2884,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "disable_kompress_anthropic": config.disable_kompress_anthropic,
                 "disable_kompress_openai": config.disable_kompress_openai,
                 "memory": config.memory_enabled,
+                # Loopback-only (this whole block is), and the one thing a
+                # wrap attaching with --no-proxy cannot otherwise determine:
+                # the fallback default resolves against each process's OWN
+                # cwd, so "same rule" does not mean "same file" when the proxy
+                # was started from a different directory.
+                "memory_db_path": str(config.memory_db_path or ""),
                 "learn": config.traffic_learning_enabled,
                 "code_graph": config.code_graph_watcher,
                 "anthropic_api_url": config.anthropic_api_url,

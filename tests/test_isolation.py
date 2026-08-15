@@ -386,7 +386,11 @@ class TestPruneRespectsDetachedProxy:
         isolation.record_run_proxy(4321, 8791, run_dir=run)
 
         record = json.loads((run / isolation._PROXY_STATE_FILE).read_text())
-        assert record == {"pid": 4321, "port": 8791}
+        # Newest entry mirrored at the top level for older readers, with the
+        # full list alongside (a nested wrap adds a second proxy).
+        assert record["pid"] == 4321
+        assert record["port"] == 8791
+        assert record["proxies"] == [{"pid": 4321, "port": 8791}]
         assert isolation._run_dir_proxy_pid(run) == 4321
 
     def test_record_targets_the_active_run_when_not_given(self, tmp_path: Path) -> None:
@@ -1133,3 +1137,143 @@ class TestLearnedBaselineIsShared:
         recorder = SavingsRecorder(paths.workspace_dir() / "output_savings.json")
 
         assert recorder._baseline_path == recorder._path
+
+
+class TestEveryProxySharingARunDirIsTracked:
+    """Re-entrant activation deliberately reuses the parent's run directory, so
+    a nested wrap starts a SECOND dedicated proxy against it. Overwriting the
+    single record would let GC delete a still-serving proxy's workspace once
+    the newer one exits (round 18, P2)."""
+
+    @staticmethod
+    def _make_stale(path: Path) -> None:
+        stale = 1_000_000_000.0
+        for target in (path, *path.rglob("*")):
+            os.utime(target, (stale, stale))
+
+    def test_a_second_proxy_does_not_evict_the_first(self, tmp_path: Path) -> None:
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        # Two distinct live processes stand in for the two dedicated proxies.
+        isolation.record_run_proxy(os.getppid(), 8788, run_dir=run)
+        isolation.record_run_proxy(os.getpid(), 8789, run_dir=run)
+
+        ports = [rec["port"] for rec in isolation._recorded_run_proxies(run)]
+        assert sorted(ports) == [8788, 8789]
+
+    def test_re_recording_the_same_proxy_does_not_duplicate(self, tmp_path: Path) -> None:
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)
+
+        assert len(isolation._recorded_run_proxies(run)) == 1
+
+    def test_a_live_older_proxy_still_pins_the_dir(self, tmp_path: Path) -> None:
+        """The reported failure: nested proxy dead, wrapper dead, original
+        still serving — the workspace must survive."""
+        runs = tmp_path / "runs"
+        run = runs / "run-20200101-000000-2147480000-abcdef"  # wrapper is dead
+        run.mkdir(parents=True)
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)  # original, alive
+        # A nested proxy recorded afterwards, since exited.
+        record = json.loads((run / isolation._PROXY_STATE_FILE).read_text())
+        record["proxies"].append({"pid": 2147480001, "port": 8789})
+        record.update({"pid": 2147480001, "port": 8789})
+        (run / isolation._PROXY_STATE_FILE).write_text(json.dumps(record))
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert run.exists(), "a still-serving proxy's workspace was deleted"
+
+    def test_all_dead_proxies_still_prune(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        run = runs / "run-20200101-000000-2147480000-abcdef"
+        run.mkdir(parents=True)
+        (run / isolation._PROXY_STATE_FILE).write_text(
+            json.dumps(
+                {
+                    "pid": 2147480002,
+                    "proxies": [{"pid": 2147480001}, {"pid": 2147480002}],
+                }
+            )
+        )
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not run.exists()
+
+    def test_dead_entries_are_pruned_on_write(self, tmp_path: Path) -> None:
+        """The list must not grow without bound across a long-lived run."""
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        (run / isolation._PROXY_STATE_FILE).write_text(
+            json.dumps({"pid": 2147480001, "proxies": [{"pid": 2147480001, "port": 1}]})
+        )
+
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)
+
+        assert [r["pid"] for r in isolation._recorded_run_proxies(run)] == [os.getpid()]
+
+    def test_a_legacy_single_dict_record_still_reads(self, tmp_path: Path) -> None:
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        (run / isolation._PROXY_STATE_FILE).write_text(json.dumps({"pid": 4321, "port": 8788}))
+
+        assert [r["pid"] for r in isolation._recorded_run_proxies(run)] == [4321]
+        assert isolation._run_dir_proxy_pid(run) == 4321
+
+
+class TestPersistentInstallPathIsAbsolute:
+    """A top-level `install apply` never activates isolation, so nothing
+    normalized a relative override — and the planner embeds it in a manifest
+    that systemd/cron/Docker start from another cwd (round 18, P2)."""
+
+    def test_a_relative_override_is_absolutized(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, "state/memory.db")
+
+        resolved = isolation.persistent_memory_db_path()
+
+        assert resolved.is_absolute()
+        assert resolved == (tmp_path / "state" / "memory.db").resolve()
+
+    def test_the_default_is_absolute_too(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, "relative-ws")
+
+        assert isolation.persistent_memory_db_path().is_absolute()
+
+    def test_the_planner_never_embeds_a_relative_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from headroom.install import planner
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, "state/memory.db")
+
+        manifest = planner.build_manifest(
+            profile="default",
+            preset="persistent-docker",
+            runtime_kind="docker",
+            scope="user",
+            provider_mode="manual",
+            targets=["claude"],
+            port=8787,
+            backend="anthropic",
+            anyllm_provider=None,
+            region=None,
+            proxy_mode="token",
+            memory_enabled=True,
+            telemetry_enabled=False,
+            image="ghcr.io/headroomlabs-ai/headroom:latest",
+        )
+
+        assert Path(manifest.memory_db_path).is_absolute()
+        assert manifest.memory_db_path in manifest.proxy_args

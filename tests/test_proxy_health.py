@@ -277,3 +277,37 @@ def test_readyz_kompress_state_matrix(monkeypatch, slot_status, compressor, disa
     payload = TestClient(app).get("/readyz").json()["checks"]["kompress"]
 
     assert payload == expected
+
+
+def test_health_reports_the_effective_memory_db_path(monkeypatch, tmp_path):
+    """A `wrap --memory --no-proxy` attaching to this proxy needs the database
+    it is ACTUALLY using: the documented fallback resolves against each
+    process's own cwd, so "same default rule" does not mean "same file" when
+    the proxy was started from a different directory.
+    """
+    db = tmp_path / "srv" / ".headroom" / "memory.db"
+    app, _proxy = _health_app(monkeypatch, memory_enabled=True, memory_db_path=str(db))
+
+    # The config block is loopback-only, gated on BOTH the peer IP and the
+    # Host header, so present as a genuine local caller on both.
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    assert payload["config"]["memory_db_path"] == str(db)
+
+
+def test_health_memory_db_path_is_present_even_when_unset(monkeypatch):
+    """The key must always exist, so a caller can tell "this proxy does not
+    report it" (older build) from "it reports no path"."""
+    app, _proxy = _health_app(monkeypatch, memory_enabled=False)
+
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    assert "memory_db_path" in payload["config"]

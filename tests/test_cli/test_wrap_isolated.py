@@ -2513,3 +2513,143 @@ class TestExemptSubcommandsLeaveInheritedIsolation:
         inherited = os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV]
         assert "runs" not in Path(inherited).parts
         assert isolation.HEADROOM_MEMORY_DB_PATH_ENV not in os.environ
+
+
+class TestPortRewriteOnlyTouchesOurOwnVariables:
+    """An isolated run binds a shifted port on every launch, so the port-fixup
+    path is routine. A blanket replace across the inherited environment
+    silently redirects the child's unrelated traffic (round 18, P2)."""
+
+    @staticmethod
+    def _rewrite(env: dict[str, str], port: int, actual_port: int) -> dict[str, str]:
+        """The real implementation — not a mirror, which could drift."""
+        wrap_mod._repoint_own_endpoints(env, port, actual_port)
+        return env
+
+    def test_an_inherited_http_proxy_is_left_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:8787")
+        monkeypatch.setenv("DATABASE_URL", "postgres://127.0.0.1:8787/app")
+        env = os.environ.copy()
+        env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+
+        result = self._rewrite(env, 8787, 8788)
+
+        assert result["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8788"
+        assert result["HTTP_PROXY"] == "http://127.0.0.1:8787"
+        assert result["DATABASE_URL"] == "postgres://127.0.0.1:8787/app"
+
+    def test_headroom_knobs_are_rewritten_even_when_inherited(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A parent wrap's HEADROOM_* endpoint is ours to re-point."""
+        monkeypatch.setenv("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+        env = os.environ.copy()
+
+        result = self._rewrite(env, 8787, 8788)
+
+        assert result["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8788"
+
+    def test_a_wrapper_set_value_is_rewritten(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        env = os.environ.copy()
+        env["OPENAI_BASE_URL"] = "http://127.0.0.1:8787/v1"
+
+        result = self._rewrite(env, 8787, 8788)
+
+        assert result["OPENAI_BASE_URL"] == "http://127.0.0.1:8788/v1"
+
+    def test_the_launch_path_delegates_here(self) -> None:
+        """Guard against `_launch_tool` drifting back to a blanket replace."""
+        import inspect
+
+        source = inspect.getsource(wrap_mod._launch_tool)
+        assert "_repoint_own_endpoints(env, port, actual_port)" in source
+
+
+class TestVertexUpstreamSurvivesNesting:
+    """Vertex travels to the proxy on its own parameter, so it bypassed the
+    parent-upstream export entirely (round 18, P2)."""
+
+    def test_inherited_upstream_is_adopted_for_the_vertex_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "http://127.0.0.1:8788")
+        monkeypatch.setenv(wrap_mod._PARENT_UPSTREAM_ENV, "https://vertex-gw.example.com")
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert (
+            wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789")
+            == "https://vertex-gw.example.com"
+        )
+
+    def test_inherited_upstream_is_adopted_for_the_explicit_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VERTEX_TARGET_API_URL", "http://127.0.0.1:8788")
+        monkeypatch.setenv(wrap_mod._PARENT_UPSTREAM_ENV, "https://vertex-gw.example.com")
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert (
+            wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789")
+            == "https://vertex-gw.example.com"
+        )
+
+    def test_without_an_inherited_upstream_it_is_still_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "http://127.0.0.1:8788")
+        monkeypatch.delenv(wrap_mod._PARENT_UPSTREAM_ENV, raising=False)
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789") is None
+
+    def test_the_export_carries_the_vertex_upstream(self) -> None:
+        """Vertex resolves outside `upstream_for_proxy`, so the export must
+        fall back to it explicitly."""
+        import inspect
+
+        source = inspect.getsource(wrap_mod.claude.callback)
+        assert "_export_parent_upstream(env, upstream_for_proxy or vertex_upstream)" in source
+
+
+class TestReusedProxyMemoryDbIsQueried:
+    """ "Same default rule" is not "same file": both fallbacks resolve
+    `<cwd>/.headroom/memory.db` against their OWN cwd (round 18, P2)."""
+
+    def test_health_reported_path_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            wrap_mod,
+            "_query_proxy_health",
+            lambda _p: {"config": {"memory_db_path": "/srv/app/.headroom/memory.db"}},
+        )
+
+        assert wrap_mod._proxy_memory_db_path(8787) == "/srv/app/.headroom/memory.db"
+
+    def test_an_older_proxy_reports_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {"config": {}})
+        assert wrap_mod._proxy_memory_db_path(8787) is None
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: None)
+        assert wrap_mod._proxy_memory_db_path(8787) is None
+
+    def test_a_blank_reported_path_reads_as_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"config": {"memory_db_path": "  "}}
+        )
+        assert wrap_mod._proxy_memory_db_path(8787) is None
+
+    def test_the_reported_path_is_adopted_by_alignment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        isolation.activate_isolated_workspace()
+        reported = tmp_path / "elsewhere" / ".headroom" / "memory.db"
+
+        assert isolation.align_memory_db_with_reused_proxy(str(reported)) is True
+
+        assert Path(os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV]) == reported.resolve()

@@ -249,13 +249,41 @@ def record_run_proxy(pid: int, port: int, *, run_dir: Path | None = None) -> Non
     if target is None:
         return
     try:
+        record = {"pid": int(pid), "port": int(port), **_identity_fields(int(pid))}
+        # APPEND, don't replace. Re-entrant activation deliberately reuses the
+        # parent's run directory, so a nested `headroom wrap` starts a second
+        # dedicated proxy against the SAME workspace. Overwriting would leave
+        # GC seeing only the newest — and once that one exits alongside the
+        # wrapper, the still-serving original looks like a dead run and its
+        # workspace gets deleted underneath it. Dead entries are dropped here
+        # so the list cannot grow without bound.
+        kept = [
+            existing
+            for existing in _recorded_run_proxies(target)
+            if existing.get("pid") != record["pid"]
+            and _owner_is_live(existing.get("pid"), existing)
+        ]
         target.mkdir(parents=True, exist_ok=True)
         (target / _PROXY_STATE_FILE).write_text(
-            json.dumps({"pid": int(pid), "port": int(port), **_identity_fields(int(pid))}),
-            encoding="utf-8",
+            json.dumps({**record, "proxies": [*kept, record]}), encoding="utf-8"
         )
     except (OSError, ValueError, TypeError):
         pass
+
+
+def _recorded_run_proxies(run_dir: Path) -> list[dict[str, Any]]:
+    """Every proxy recorded for ``run_dir``, newest last.
+
+    A legacy single-dict record (written before one workspace could hold more
+    than one proxy) reads as a one-entry list.
+    """
+
+    record = _read_run_state(run_dir, _PROXY_STATE_FILE)
+    if record is None:
+        return []
+    listed = record.get("proxies")
+    entries = listed if isinstance(listed, list) else [record]
+    return [e for e in entries if isinstance(e, dict) and isinstance(e.get("pid"), int)]
 
 
 def _identity_fields(pid: int) -> dict[str, Any]:
@@ -308,10 +336,15 @@ def persistent_memory_db_path() -> Path:
     configured = _trimmed_env(HEADROOM_MEMORY_DB_PATH_ENV)
     isolated_ws = active_isolated_workspace()
     if isolated_ws is not None and configured == str(isolated_ws / _MEMORY_DB_FILE):
-        return paths.shared_workspace_dir() / _MEMORY_DB_FILE
+        return Path(_abs(paths.shared_workspace_dir() / _MEMORY_DB_FILE))
     if configured:
-        return Path(configured).expanduser()
-    return paths.shared_workspace_dir() / _MEMORY_DB_FILE
+        # ABSOLUTE, always. A top-level `install apply` never activates
+        # isolation, so nothing normalized a relative override — and the
+        # planner embeds this string in the manifest and the supervised
+        # proxy's `--memory-db-path`, where systemd/cron/a Windows service/
+        # Docker start from a different working directory entirely.
+        return Path(_abs(Path(configured).expanduser()))
+    return Path(_abs(paths.shared_workspace_dir() / _MEMORY_DB_FILE))
 
 
 def align_memory_db_with_reused_proxy(explicit: str | None = None) -> bool:
@@ -365,13 +398,10 @@ def record_run_owner(run_dir: Path) -> None:
 
 
 def _run_dir_proxy_pid(run_dir: Path) -> int | None:
-    """PID of the dedicated proxy recorded for ``run_dir``, if any."""
+    """PID of the newest dedicated proxy recorded for ``run_dir``, if any."""
 
-    record = _read_run_state(run_dir, _PROXY_STATE_FILE)
-    if record is None:
-        return None
-    pid = record.get("pid")
-    return pid if isinstance(pid, int) else None
+    recorded = _recorded_run_proxies(run_dir)
+    return recorded[-1]["pid"] if recorded else None
 
 
 def _run_dir_has_live_owner(run_dir: Path) -> bool:
@@ -379,7 +409,8 @@ def _run_dir_has_live_owner(run_dir: Path) -> bool:
 
     Two owners keep a run alive: the wrapper that created it (PID embedded in
     the directory name, start identity in ``.owner.json``) and the dedicated
-    proxy it started (``.proxy.json``). Either one being alive is enough — but
+    proxies it started (``.proxy.json``, which holds every one of them since a
+    nested wrap shares the directory). Any one being alive is enough — but
     "alive" means the recorded process, not merely the recorded PID number, so
     an unrelated process that inherits a recycled PID cannot pin the directory
     forever.
@@ -387,7 +418,9 @@ def _run_dir_has_live_owner(run_dir: Path) -> bool:
 
     if _owner_is_live(_run_dir_owner_pid(run_dir), _read_run_state(run_dir, _OWNER_STATE_FILE)):
         return True
-    return _owner_is_live(_run_dir_proxy_pid(run_dir), _read_run_state(run_dir, _PROXY_STATE_FILE))
+    # ANY recorded proxy still serving pins the workspace — a nested wrap can
+    # add a second one against the same run directory.
+    return any(_owner_is_live(rec.get("pid"), rec) for rec in _recorded_run_proxies(run_dir))
 
 
 def _run_dir_last_activity(run_dir: Path) -> float:

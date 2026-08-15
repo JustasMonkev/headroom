@@ -1271,8 +1271,12 @@ def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
             return None
         # A nested wrap inherits the parent's port here, which is never equal
         # to ours — without this it reads as a real Vertex target and the child
-        # proxy forwards through the parent (Headroom applied twice).
-        return None if _url_is_local_headroom_proxy(explicit_target) else explicit_target
+        # proxy forwards through the parent (Headroom applied twice). Adopt the
+        # upstream the PARENT resolved so a custom Vertex gateway survives the
+        # nesting instead of silently reverting to the default target.
+        if _url_is_local_headroom_proxy(explicit_target):
+            return _inherited_parent_upstream()
+        return explicit_target
 
     vertex_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL", "").strip()
     if not vertex_url:
@@ -1286,7 +1290,7 @@ def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
     if normalized_vertex_url == _normalize_proxy_api_url(proxy_url):
         return None
     if _url_is_local_headroom_proxy(vertex_url):
-        return None
+        return _inherited_parent_upstream()
     return vertex_url
 
 
@@ -4031,6 +4035,42 @@ def _query_proxy_health(port: int) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _repoint_own_endpoints(env: dict[str, str], port: int, actual_port: int) -> None:
+    """Rewrite ``127.0.0.1:port`` -> ``127.0.0.1:actual_port``, ours only.
+
+    ``env`` starts as a copy of ``os.environ``, so replacing across all of it
+    also rewrites unrelated INHERITED values that merely mention the requested
+    port — ``HTTP_PROXY=http://127.0.0.1:8787``, a local database URL, an
+    unrelated dev server — silently redirecting the child's other traffic into
+    the Headroom proxy. An isolated run binds a shifted port on every launch,
+    so this runs on essentially every wrap rather than as a rare fallback.
+
+    "Ours" = the value differs from what we inherited (this wrapper set it), or
+    the key is a ``HEADROOM_*`` knob. Everything else belongs to the user.
+    """
+
+    inherited = os.environ
+    for key, value in dict(env).items():
+        if inherited.get(key) == value and not key.startswith("HEADROOM_"):
+            continue
+        env[key] = value.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+
+
+def _proxy_memory_db_path(port: int) -> str | None:
+    """The memory database a running proxy reports it is using, if it says.
+
+    Exposed on ``/health``'s loopback-only config block. Absent from older
+    proxies, in which case the caller falls back to a manifest or to the
+    plain default.
+    """
+
+    config = _proxy_health_config(_query_proxy_health(port))
+    if not config:
+        return None
+    value = config.get("memory_db_path")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _proxy_health_config(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     """Extract the config block from a Headroom /health payload."""
     if payload is None:
@@ -4609,15 +4649,25 @@ def _ensure_proxy(
             # ({cwd}/.headroom/memory.db) rather than a path we invented.
             from headroom import isolation as _isolation
 
-            _reused = helpers._find_persistent_manifest(port)
-            _manifest_db = getattr(_reused, "memory_db_path", None) if _reused else None
-            if _isolation.align_memory_db_with_reused_proxy(_manifest_db):
+            # Ask the proxy itself first: /health reports the database it is
+            # actually using. Falling back to "the same default rule" is not
+            # enough, because that rule resolves against each process's own
+            # cwd — a proxy started from another directory resolves a
+            # different file. A manifest is the next-best source, and an older
+            # proxy that reports neither leaves us with the plain fallback.
+            _effective_db = helpers._proxy_memory_db_path(port)
+            if not _effective_db:
+                _reused = helpers._find_persistent_manifest(port)
+                _effective_db = getattr(_reused, "memory_db_path", None) if _reused else None
+            if _isolation.align_memory_db_with_reused_proxy(_effective_db):
                 _now = os.environ.get(_isolation.HEADROOM_MEMORY_DB_PATH_ENV)
                 click.echo(
                     f"  Memory follows the reused proxy: {_now}"
                     if _now
-                    else "  Memory follows the reused proxy: using its own default database "
-                    "instead of a per-run one."
+                    else "  Memory: dropped this run's isolated database. The reused proxy "
+                    "did not report its own, so both sides fall back to the default "
+                    "(./.headroom/memory.db) — they may still differ if it was started "
+                    "from another directory."
                 )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
@@ -5286,10 +5336,9 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # Point our own endpoint variables at the port actually bound.
         if actual_port != port:
-            for k, v in dict(env).items():
-                env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+            _repoint_own_endpoints(env, port, actual_port)
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -6203,7 +6252,11 @@ def claude(
             env["ANTHROPIC_BASE_URL"] = proxy_url
         # A nested wrap sees only our proxy URL above; hand it the upstream we
         # actually resolved so it can keep routing through the user's gateway.
-        _export_parent_upstream(env, upstream_for_proxy)
+        # `vertex_upstream` counts too: it travels to the proxy on its own
+        # parameter rather than through `upstream_for_proxy`, but a Vertex-mode
+        # child inherits only our local ANTHROPIC_VERTEX_BASE_URL and would
+        # otherwise fall back to the default Vertex target.
+        _export_parent_upstream(env, upstream_for_proxy or vertex_upstream)
 
         # Issue #951: write to settings.json so daemon-spawned conversation
         # workers (which read settings.json fresh rather than inheriting the
