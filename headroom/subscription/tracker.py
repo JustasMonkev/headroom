@@ -96,6 +96,12 @@ _RTK_POLL_LOCK_ENV = "HEADROOM_RTK_POLL_LOCK"
 _POLL_HANDOFF_TIMEOUT_S = 10.0
 _POLL_HANDOFF_INTERVAL_S = 0.25
 
+# How many times a waiter re-elects a poller before giving up and fetching for
+# itself. One round covers the ordinary case (the winner publishes); the second
+# covers a winner that died or failed mid-fetch. Beyond that, retrying is less
+# useful than admitting the account is unreachable right now.
+_POLL_ELECTION_ROUNDS = 2
+
 
 def _rtk_wiring_mode() -> str:
     """Return ``enabled`` or ``disabled``. Raises on unknown values.
@@ -585,6 +591,42 @@ class SubscriptionTracker(QuotaTracker):
             with contextlib.suppress(OSError):
                 handle.close()
 
+    async def _account_snapshot(self, token: str | None) -> SubscriptionSnapshot | None:
+        """One account-usage reading, shared across every proxy on this machine.
+
+        Elect a poller through the shared lock: the winner fetches and
+        publishes, everyone else waits and adopts. If the winner publishes
+        nothing — its request failed, or it exited mid-fetch — the waiters
+        RE-ELECT rather than each falling back to their own request, which
+        would put the fan-out straight back to one request per proxy and
+        publish none of the results, leaving the next interval to repeat it.
+
+        Bounded at ``_POLL_ELECTION_ROUNDS``: after that a plain fetch is the
+        honest failure, since a session with no usage data is worse than a
+        duplicate request.
+        """
+
+        snapshot = self._adopt_shared_snapshot(token)
+        if snapshot is not None:
+            return snapshot
+
+        for round_no in range(_POLL_ELECTION_ROUNDS):
+            with self._poll_ownership() as owns_poll:
+                if owns_poll:
+                    snapshot = await self._client.fetch(token)
+                    if snapshot is not None:
+                        self._publish_shared_snapshot(snapshot)
+                    return snapshot
+                snapshot = await self._await_published_snapshot(token)
+                if snapshot is not None:
+                    return snapshot
+            # The lock is released here, so the next pass can elect a
+            # replacement for the owner that went silent.
+            logger.debug("event=subscription_poll_owner_silent round=%d", round_no)
+
+        logger.debug("event=subscription_poll_election_exhausted falling_back=fetch")
+        return await self._client.fetch(token)
+
     async def _await_published_snapshot(self, token: str | None) -> SubscriptionSnapshot | None:
         """Wait for the elected poller to publish, up to its request timeout.
 
@@ -862,26 +904,7 @@ class SubscriptionTracker(QuotaTracker):
         # what the tracker's own rate-limit and token-flagging safeguards exist
         # to prevent. Elect one poller through a SHARED lock; everyone else
         # adopts what it published.
-        snapshot = self._adopt_shared_snapshot(token)
-        if snapshot is None:
-            with self._poll_ownership() as owns_poll:
-                if owns_poll:
-                    snapshot = await self._client.fetch(token)
-                    if snapshot is not None:
-                        self._publish_shared_snapshot(snapshot)
-                else:
-                    # The owner is mid-fetch. WAIT for what it publishes rather
-                    # than racing it: on a cold start every proxy reaches this
-                    # point at once with nothing published yet, so fetching here
-                    # would put the whole fan-out back on one request per proxy
-                    # and leave the lock deciding only whose response gets
-                    # stored. Fetching is the fallback for an owner that never
-                    # publishes (died mid-fetch, or its request failed), where a
-                    # duplicate request still beats a session with no usage data.
-                    snapshot = await self._await_published_snapshot(token)
-                    if snapshot is None:
-                        logger.debug("event=subscription_poll_owner_silent falling_back=fetch")
-                        snapshot = await self._client.fetch(token)
+        snapshot = await self._account_snapshot(token)
         if snapshot is None:
             with self._lock:
                 self._state.mark_error("fetch returned None")

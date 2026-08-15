@@ -284,6 +284,74 @@ class TestTheLoserWaitsForTheWinner:
         assert client.calls == 1
 
 
+class TestASilentOwnerTriggersAReElection:
+    """If the winner's request fails or it exits without publishing, every
+    waiter times out at roughly the same moment. Each falling back to its own
+    unlocked fetch puts the fan-out back to one request per proxy AND publishes
+    none of the results, so the next interval repeats it (round 23, P2)."""
+
+    def test_a_second_election_is_held_before_giving_up(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """We lose round 1, the owner goes silent, and we WIN round 2 — so we
+        fetch under the lock and publish for the remaining peers."""
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+        monkeypatch.setattr(tracker_mod, "_POLL_HANDOFF_TIMEOUT_S", 0.05)
+        rounds = {"n": 0}
+
+        def lose_then_win(*_a: Any, **_k: Any) -> bool:
+            rounds["n"] += 1
+            return rounds["n"] > 1
+
+        monkeypatch.setattr("headroom._filelock.acquire", lose_then_win)
+
+        _poll(tracker, monkeypatch)
+
+        assert rounds["n"] == 2, "the silent owner must trigger a re-election"
+        assert client.calls == 1
+        assert paths.subscription_snapshot_path().exists(), (
+            "the re-elected poller must publish for its peers"
+        )
+
+    def test_a_perpetual_loser_still_gets_data(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Re-election is bounded: never winning must not mean never polling."""
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+        monkeypatch.setattr(tracker_mod, "_POLL_HANDOFF_TIMEOUT_S", 0.05)
+        attempts = {"n": 0}
+
+        def always_lose(*_a: Any, **_k: Any) -> bool:
+            attempts["n"] += 1
+            return False
+
+        monkeypatch.setattr("headroom._filelock.acquire", always_lose)
+
+        _poll(tracker, monkeypatch)
+
+        assert attempts["n"] == tracker_mod._POLL_ELECTION_ROUNDS
+        assert client.calls == 1
+        assert not paths.subscription_snapshot_path().exists(), (
+            "a fallback fetch is not authoritative and must not be published"
+        )
+
+    def test_the_winner_of_round_one_never_re_elects(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rounds = {"n": 0}
+
+        def count(*_a: Any, **_k: Any) -> bool:
+            rounds["n"] += 1
+            return True
+
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+        monkeypatch.setattr("headroom._filelock.acquire", count)
+
+        _poll(tracker, monkeypatch)
+
+        assert rounds["n"] == 1
+        assert client.calls == 1
+
+
 class TestSnapshotsAreAccountScoped:
     """The snapshot file is machine-global. Two proxies signed in to different
     Claude accounts — or one user switching accounts mid-window — must not

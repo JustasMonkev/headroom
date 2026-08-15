@@ -800,7 +800,12 @@ since there is only one proxy to name.
 
 What remains: config that records the port for **model routing** rather than
 for MCP — OMP's `~/.omp/agent/models.yml` — still holds a single value, so
-the later launch wins there. Codex is unaffected (its endpoint is passed
+during overlapping runs the later launch wins there. An isolated `wrap omp`
+does at least clean up after itself: it holds the override for the session and
+releases it on exit, handing it to a still-live peer when one remains and
+otherwise restoring the pre-wrap file, so a per-run port never outlives the run
+that owned it (a `--shared` run's port is durable, so it keeps the original
+write-and-leave contract). Codex is unaffected (its endpoint is passed
 per-process via `--config` overrides). To make two same-agent runs fully
 independent including that, give them separate config homes yourself
 (`CODEX_HOME=... headroom wrap codex`). `wrap claude` records the actual

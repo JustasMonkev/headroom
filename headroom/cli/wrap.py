@@ -144,8 +144,10 @@ from headroom.providers.grok_build.config import (
 from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.omp import build_launch_env as _build_omp_launch_env
+from headroom.providers.omp import hold_models_override as _hold_omp_models_override
 from headroom.providers.omp import inject_models_override as _inject_omp_models_override
 from headroom.providers.omp import models_yml_path as _omp_models_yml_path
+from headroom.providers.omp import release_models_override as _release_omp_models_override
 from headroom.providers.omp import restore_models_override as _restore_omp_models_override
 from headroom.providers.openclaw import (
     OPENCLAW_NPM_PACKAGE,
@@ -1449,7 +1451,13 @@ def _write_wrap_marker_owners(settings_path: Path, owners: list[dict[str, Any]])
 
 
 def _write_wrap_marker(
-    settings_path: Path, *, port: int, key: str, previous: str | None, url: str | None = None
+    settings_path: Path,
+    *,
+    port: int,
+    key: str,
+    previous: str | None,
+    url: str | None = None,
+    proxy_pid: int | None = None,
 ) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1474,6 +1482,15 @@ def _write_wrap_marker(
             # handing back the bare URL would drop the `/anthropic` prefix the
             # Anthropic SDK appends `/v1/messages` to.
             "url": url or _claude_proxy_base_url(port),
+            # The PID of the process LISTENING on `port`, which is not `pid`:
+            # the proxy is a detached child (or, under --no-proxy, someone
+            # else's process entirely). Recorded separately so a later liveness
+            # check can ask "is the same proxy still there?" — comparing
+            # /health's pid against the WRAPPER's would never match, and would
+            # therefore condemn every live session as a foreign listener.
+            # None when it cannot be determined; readers treat that as
+            # inconclusive rather than as proof of anything.
+            "proxy_pid": proxy_pid,
         }
         # Push onto the live owner stack rather than replacing it. The whole
         # read-append-write cycle is serialized so a concurrent push cannot
@@ -1575,15 +1592,20 @@ def _listener_is_recorded_proxy(port: int, owner: dict[str, Any] | None) -> bool
 
     if not owner:
         return True
-    recorded = owner.get("pid")
-    if not isinstance(recorded, int):
+    if not isinstance(owner.get("pid"), int):
         return True
     if not _is_local_headroom_proxy(port):
         return not _wrap_marker_is_stale(owner)
+    # The PROXY's pid, never the wrapper's: the proxy is a separate (detached)
+    # process, so comparing /health against `owner["pid"]` could not match even
+    # for our own live proxy.
+    recorded_proxy = owner.get("proxy_pid")
+    if not isinstance(recorded_proxy, int):
+        return True  # legacy marker, or a proxy that never reported one
     reported = _proxy_reported_pid(port)
     if reported is None:
         return True
-    return reported == recorded
+    return reported == recorded_proxy
 
 
 def _wrap_marker_proxy_is_dead(marker: dict[str, Any]) -> bool:
@@ -1999,6 +2021,7 @@ def _write_claude_wrap_base_url(
     vertex_mode: bool = False,
     settings_path: Path | None = None,
     port: int | None = None,
+    proxy_pid: int | None = None,
 ) -> str | None:
     """Persist proxy URL into project-local settings env key for daemon child inheritance.
 
@@ -2027,6 +2050,7 @@ def _write_claude_wrap_base_url(
             foundry_mode=foundry_mode,
             vertex_mode=vertex_mode,
             port=port,
+            proxy_pid=proxy_pid,
         )
 
 
@@ -2037,6 +2061,7 @@ def _write_claude_wrap_base_url_locked(
     foundry_mode: bool = False,
     vertex_mode: bool = False,
     port: int | None = None,
+    proxy_pid: int | None = None,
 ) -> str | None:
     payload: dict[str, Any] = {}
     if path.exists():
@@ -2085,7 +2110,9 @@ def _write_claude_wrap_base_url_locked(
         # `proxy_url` is the mode-specific value just written into settings
         # (Foundry appends /anthropic), which is exactly what a handover must
         # restore for a surviving owner.
-        _write_wrap_marker(path, port=port, key=key, previous=previous, url=proxy_url)
+        _write_wrap_marker(
+            path, port=port, key=key, previous=previous, url=proxy_url, proxy_pid=proxy_pid
+        )
     return previous
 
 
@@ -6446,6 +6473,12 @@ def claude(
             # would make self-heal clear a LIVE session's base URL and stop its
             # daemon-spawned workers from routing through Headroom.
             port=actual_port,
+            # Identity of the process actually listening there, so a later
+            # check can tell OUR proxy from another project's run that took the
+            # port after ours died. Asked of the listener rather than taken
+            # from our own Popen because `--no-proxy` attaches to a proxy this
+            # wrapper did not start.
+            proxy_pid=_proxy_reported_pid(actual_port),
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -9566,7 +9599,16 @@ def omp(
     # Durable endpoint redirect (survives omp-spawned child sessions, which
     # re-read models.yml rather than inheriting a parent env) — same durable
     # wrap + backup + unwrap contract as the Codex config.toml injection.
-    models_file, _ = _inject_omp_models_override(port, _project_name_from_cwd())
+    # An isolated run's proxy port dies with the run, so the durable
+    # write-and-leave contract would strand every later omp process (and any
+    # concurrent run) on a dead endpoint. Such a run HOLDS the override and
+    # releases it on exit; `--shared` keeps the original contract, since the
+    # shared port outlives the session and the persisted override stays true.
+    _omp_isolated = _isolation_requested()
+    _write_omp_override = (
+        _hold_omp_models_override if _omp_isolated else _inject_omp_models_override
+    )
+    models_file, _ = _write_omp_override(port, _project_name_from_cwd())
     click.echo(f"  models.yml override written: {models_file}")
 
     def reconcile_omp_port(actual_port: int) -> None:
@@ -9574,23 +9616,34 @@ def omp(
         # only affects its web-search helper). It was written with the requested
         # port; a dedicated proxy binds a different one, so rewrite it — otherwise
         # omp would route inference to the reserved shared port, not its proxy.
-        rewritten, _ = _inject_omp_models_override(actual_port, _project_name_from_cwd())
+        rewritten, _ = _write_omp_override(actual_port, _project_name_from_cwd())
         click.echo(f"  models.yml override updated for port {actual_port}: {rewritten}")
 
-    _launch_tool(
-        binary=omp_bin,
-        args=omp_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OMP",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="omp",
-        code_graph=code_graph,
-        reconcile_port=reconcile_omp_port,
-    )
+    try:
+        _launch_tool(
+            binary=omp_bin,
+            args=omp_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label="OMP",
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type="omp",
+            code_graph=code_graph,
+            reconcile_port=reconcile_omp_port,
+        )
+    finally:
+        if _omp_isolated:
+            # Hand the override to a still-live peer, or restore the pre-wrap
+            # file. Doing nothing here is what leaves a dead per-run port in a
+            # file every future omp process reads.
+            _omp_release = _release_omp_models_override()
+            if _omp_release == "handover":
+                click.echo("  models.yml override handed to a still-live wrap session.")
+            elif _omp_release != "noop":
+                click.echo(f"  models.yml override {_omp_release} ({models_file}).")
 
 
 @unwrap.command("omp")

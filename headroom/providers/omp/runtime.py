@@ -18,10 +18,13 @@ Codex wrap uses for ``config.toml``.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from headroom import _filelock
+from headroom._subprocess import identity_mismatch, pid_alive, proc_identity
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.proxy.project_context import with_project_prefix
 
@@ -32,6 +35,17 @@ _MANAGED_HEADER = (
     "# if it did not exist). The original is kept at <models.yml.headroom-backup>.\n"
 )
 BACKUP_SUFFIX = ".headroom-backup"
+
+# Sidecar listing the wrap sessions currently holding the override.
+#
+# `models.yml` carries ONE endpoint and every omp process on the machine reads
+# it, but an isolated run's proxy is on a per-run port. Two consequences the
+# owner list exists to handle: a concurrent run must not have its port stripped
+# when a peer exits, and — more damaging because it outlives everything — an
+# isolated run that simply ends must not leave a durable file pointing at the
+# dead port its proxy had. A `--shared` run's port IS durable, so it keeps the
+# original write-and-leave contract and never registers here.
+OWNERS_SUFFIX = ".headroom-owners.json"
 
 
 def models_yml_path() -> Path:
@@ -48,6 +62,51 @@ def models_yml_path() -> Path:
 def backup_path(models_file: Path) -> Path:
     """Backup location for the pre-wrap ``models.yml`` snapshot."""
     return models_file.with_name(models_file.name + BACKUP_SUFFIX)
+
+
+def owners_path(models_file: Path) -> Path:
+    """Sidecar listing the wrap sessions holding the override."""
+    return models_file.with_name(models_file.name + OWNERS_SUFFIX)
+
+
+def _read_owners(models_file: Path) -> list[dict]:
+    try:
+        raw = json.loads(owners_path(models_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [o for o in raw if isinstance(o, dict) and isinstance(o.get("pid"), int)]
+
+
+def _owner_is_live(owner: dict) -> bool:
+    """Alive AND not a recycled PID now belonging to something else."""
+    pid = owner.get("pid")
+    if not isinstance(pid, int) or not pid_alive(pid):
+        return False
+    return not identity_mismatch(owner.get("start_src"), owner.get("start_time"), pid)
+
+
+def _write_owners(models_file: Path, owners: list[dict]) -> None:
+    path = owners_path(models_file)
+    if not owners:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(owners), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _self_owner(port: int, project: str | None) -> dict:
+    ident = proc_identity(os.getpid())
+    return {
+        "pid": os.getpid(),
+        "port": port,
+        "project": project,
+        "start_src": ident[0] if ident else None,
+        "start_time": ident[1] if ident else None,
+    }
 
 
 def proxy_anthropic_base_url(port: int, project: str | None = None) -> str:
@@ -87,7 +146,18 @@ def inject_models_override(port: int, project: str | None = None) -> tuple[Path,
       different ``--port`` updates the override idempotently.
     * Any user-defined providers/models from the pre-wrap file are preserved:
       the override only deep-sets ``providers.anthropic.baseUrl``.
+
+    Serialized: concurrent wraps otherwise read the same pre-image and the
+    later write drops the other's edits (and can re-snapshot a managed file
+    over the pristine backup).
     """
+
+    models_file = models_yml_path()
+    with _filelock.exclusive(_filelock.lock_path_for(models_file)):
+        return _inject_locked(port, project)
+
+
+def _inject_locked(port: int, project: str | None = None) -> tuple[Path, str]:
     import yaml  # type: ignore[import-untyped]  # PyYAML ships no stubs; lint env installs no deps
 
     models_file = models_yml_path()
@@ -131,6 +201,46 @@ def inject_models_override(port: int, project: str | None = None) -> tuple[Path,
     return models_file, base_url
 
 
+def hold_models_override(port: int, project: str | None = None) -> tuple[Path, str]:
+    """Inject the override AND register this session as an owner.
+
+    For runs whose port is ephemeral (an isolated run's dedicated proxy). Pair
+    with :func:`release_models_override` in the session's cleanup, or the
+    durable file is left naming a port that dies with the run.
+    """
+
+    models_file = models_yml_path()
+    with _filelock.exclusive(_filelock.lock_path_for(models_file)):
+        result = _inject_locked(port, project)
+        owners = [o for o in _read_owners(models_file) if o.get("pid") != os.getpid()]
+        _write_owners(models_file, [*owners, _self_owner(port, project)])
+    return result
+
+
+def release_models_override() -> str:
+    """Drop this session's hold, handing the override to a live peer if any.
+
+    Returns ``"handover"`` when another live wrap session's port was written
+    back, otherwise the :func:`restore_models_override` status. Restoring
+    unconditionally would strip a concurrent run's routing; leaving the file
+    alone would strand every later omp process on a dead port.
+    """
+
+    models_file = models_yml_path()
+    with _filelock.exclusive(_filelock.lock_path_for(models_file)):
+        survivors = [
+            o
+            for o in _read_owners(models_file)
+            if o.get("pid") != os.getpid() and _owner_is_live(o)
+        ]
+        _write_owners(models_file, survivors)
+        if survivors:
+            newest = survivors[-1]
+            _inject_locked(int(newest["port"]), newest.get("project"))
+            return "handover"
+        return _restore_locked()
+
+
 def restore_models_override() -> str:
     """Undo :func:`inject_models_override`.
 
@@ -138,6 +248,13 @@ def restore_models_override() -> str:
     (wrap-created file deleted), or ``"noop"`` (nothing wrap-managed found).
     Never touches a ``models.yml`` the wrap does not manage.
     """
+
+    models_file = models_yml_path()
+    with _filelock.exclusive(_filelock.lock_path_for(models_file)):
+        return _restore_locked()
+
+
+def _restore_locked() -> str:
     models_file = models_yml_path()
     backup = backup_path(models_file)
 

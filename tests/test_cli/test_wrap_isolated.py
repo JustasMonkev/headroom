@@ -2732,8 +2732,19 @@ class TestReusedPortNeedsProxyIdentity:
     can take a dead session's port before self-heal runs (round 19, P2)."""
 
     @staticmethod
-    def _owner(pid: int) -> dict[str, Any]:
-        return {"pid": pid, "port": 8788, "key": "ANTHROPIC_BASE_URL"}
+    def _owner(pid: int, *, proxy_pid: int | None = None) -> dict[str, Any]:
+        """``pid`` is the WRAPPER; the listener's identity is ``proxy_pid``.
+
+        They are always different processes — the proxy is detached — which is
+        why the check compares against ``proxy_pid`` (round 23, P1). Defaults
+        to a distinct value so no test can pass by conflating the two.
+        """
+        return {
+            "pid": pid,
+            "proxy_pid": pid + 1 if proxy_pid is None else proxy_pid,
+            "port": 8788,
+            "key": "ANTHROPIC_BASE_URL",
+        }
 
     def test_another_headroom_proxy_on_the_port_reads_as_dead(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2747,9 +2758,9 @@ class TestReusedPortNeedsProxyIdentity:
     def test_our_own_proxy_reads_as_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
         monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
-        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 1234)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 4242)
 
-        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234)) is True
+        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234, proxy_pid=4242)) is True
 
     def test_an_older_proxy_reporting_no_pid_is_accepted(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3184,3 +3195,97 @@ class TestHighPortFallsBackBelowTheReservedBase:
 
         source = inspect.getsource(wrap_mod._ensure_proxy)
         assert "_find_dedicated_port(port, search_from)" in source
+
+
+class TestProxyIdentityComparesTheProxyNotTheWrapper:
+    """The marker's `pid` is the WRAPPER's; `/health` reports the PROXY's, and
+    the proxy is a separate detached process — so comparing them could never
+    match, and every live session's own proxy read as a foreign listener. The
+    SessionStart self-heal hook then cleared a working base URL and cut
+    daemon-spawned conversation workers off from the proxy (round 23, P1)."""
+
+    @staticmethod
+    def _marker(*, wrapper_pid: int, proxy_pid: Any) -> dict[str, Any]:
+        return {
+            "pid": wrapper_pid,
+            "proxy_pid": proxy_pid,
+            "port": 8788,
+            "key": "ANTHROPIC_BASE_URL",
+        }
+
+    def test_our_own_live_proxy_is_recognised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The regression itself: wrapper 111, proxy 222, /health says 222."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 222)
+
+        assert (
+            wrap_mod._wrap_proxy_alive(8788, owner=self._marker(wrapper_pid=111, proxy_pid=222))
+            is True
+        )
+
+    def test_another_projects_proxy_on_a_reused_port_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The behaviour the comparison exists for must still work."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 999)
+
+        assert (
+            wrap_mod._wrap_proxy_alive(8788, owner=self._marker(wrapper_pid=111, proxy_pid=222))
+            is False
+        )
+
+    def test_the_wrapper_pid_is_never_what_gets_compared(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the actual defect: a listener reporting the WRAPPER's pid is
+        not our proxy, however plausible the number looks."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 111)
+
+        assert (
+            wrap_mod._wrap_proxy_alive(8788, owner=self._marker(wrapper_pid=111, proxy_pid=222))
+            is False
+        )
+
+    def test_a_legacy_marker_without_a_proxy_pid_is_inconclusive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Markers written before this field existed must not be condemned —
+        clearing a live session's routing is the worse failure."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 222)
+
+        assert (
+            wrap_mod._wrap_proxy_alive(8788, owner=self._marker(wrapper_pid=111, proxy_pid=None))
+            is True
+        )
+
+    def test_the_marker_records_the_listeners_pid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End-to-end: what gets written must be the proxy's identity, not
+        this process's — otherwise the comparison above can never succeed."""
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {}}))
+
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788, proxy_pid=222
+        )
+
+        owner = json.loads(wrap_mod._wrap_marker_path(settings).read_text())["owners"][-1]
+        assert owner["proxy_pid"] == 222
+        assert owner["pid"] == os.getpid() != owner["proxy_pid"]
+
+    def test_the_claude_flow_asks_the_listener_for_it(self) -> None:
+        """It must come from the listener, not our own Popen: `--no-proxy`
+        attaches to a proxy this wrapper never started."""
+        import inspect
+
+        source = inspect.getsource(wrap_mod.claude.callback)
+        assert "proxy_pid=_proxy_reported_pid(actual_port)" in source
