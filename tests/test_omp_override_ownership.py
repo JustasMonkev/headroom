@@ -268,3 +268,46 @@ class TestHandoverRequiresALiveProxy:
         source = inspect.getsource(wrap_mod.omp.callback)
         assert "_release_omp_models_override(_omp_proxy_still_serving)" in source
         assert "_wrap_proxy_alive(" in source
+
+
+class TestASharedSessionIsAlsoAnOwner:
+    """A `--shared omp` session keeps the durable write-and-leave contract, but
+    it must still appear in the owner list: without a record, an isolated peer
+    exiting sees no survivors and restores the pre-wrap file out from under a
+    shared session that is still running (round 28, P2)."""
+
+    def test_the_launch_registers_in_both_modes(self) -> None:
+        import inspect
+
+        from headroom.cli import wrap as wrap_mod
+
+        source = inspect.getsource(wrap_mod.omp.callback)
+        assert "_inject_omp_models_override(target_port" not in source, (
+            "the shared path still writes without registering an owner"
+        )
+        assert "_hold_omp_models_override(" in source
+
+    def test_an_isolated_exit_hands_over_to_a_live_shared_session(self) -> None:
+        """The reported scenario: shared holds 8787, isolated holds 8788 and
+        exits first. models.yml must end up on 8787, not restored."""
+        import os as _os
+
+        from headroom._subprocess import proc_identity
+
+        _pre_wrap_file()
+        ident = proc_identity(_os.getppid())
+        shared = {
+            "pid": _os.getppid(),
+            "port": 8787,
+            "proxy_pid": 555,
+            "proxy_instance": "srv-shared",
+            "project": "proj",
+            "start_src": ident[0] if ident else None,
+            "start_time": ident[1] if ident else None,
+        }
+        omp.hold_models_override(8788, "proj", 1111, "srv-mine")
+        owners_file = omp.owners_path(omp.models_yml_path())
+        owners_file.write_text(json.dumps([shared, *json.loads(owners_file.read_text())]))
+
+        assert omp.release_models_override(lambda *_a: True) == "handover"
+        assert "127.0.0.1:8787" in _base_url(), "the live shared session lost its routing"

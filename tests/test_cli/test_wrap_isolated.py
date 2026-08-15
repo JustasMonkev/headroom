@@ -3460,3 +3460,77 @@ class TestADedicatedRunDoesNotClaimTheSharedPort:
             source = inspect.getsource(fn)
             assert "_register_launch_proxy_client(port, no_proxy)" in source
             assert "\n        _register_proxy_client(port)\n" not in source
+
+
+class TestAClaimedPortIsNotReused:
+    """Bindability is not enough to call a port free. When an isolated proxy
+    dies while its wrapper and wrapped tool keep running, the port becomes
+    bindable but the tool's endpoint is fixed — a later isolated launch taking
+    it would receive the older run's traffic into ITS workspace, which is the
+    guarantee isolation exists to make (round 28, P2)."""
+
+    def test_a_port_a_live_peer_still_claims_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            wrap_mod,
+            "_live_proxy_clients",
+            lambda port, exclude_self=False: [1] if port == 8788 else [],
+        )
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda start, max_attempts=100: start)
+
+        assert wrap_mod._find_dedicated_port(8787, 8788) == 8789
+
+    def test_an_unclaimed_port_is_taken_immediately(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda port, exclude_self=False: [])
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda start, max_attempts=100: start)
+
+        assert wrap_mod._find_dedicated_port(8787, 8788) == 8788
+
+    def test_our_own_marker_never_blocks_us(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`exclude_self=True` is what stops a run rejecting the port it just
+        registered itself on."""
+        seen: list[bool] = []
+
+        def record(port: int, exclude_self: bool = False) -> list:
+            seen.append(exclude_self)
+            return []
+
+        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", record)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda start, max_attempts=100: start)
+
+        wrap_mod._find_dedicated_port(8787, 8788)
+
+        assert seen == [True]
+
+    def test_exhausting_the_budget_on_claimed_ports_still_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Skipping must stay bounded: every candidate claimed is a failure,
+        not an infinite walk."""
+        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda port, exclude_self=False: [1])
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda start, max_attempts=100: start)
+
+        with pytest.raises(RuntimeError):
+            wrap_mod._find_dedicated_port(8787, 8788)
+
+    def test_the_budget_shrinks_as_claimed_ports_are_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each skip must consume budget, or the search could loop forever."""
+        budgets: list[int] = []
+
+        def record(start: int, max_attempts: int = 100) -> int:
+            budgets.append(max_attempts)
+            return start
+
+        monkeypatch.setattr(wrap_mod, "_find_available_port", record)
+        monkeypatch.setattr(
+            wrap_mod,
+            "_live_proxy_clients",
+            lambda port, exclude_self=False: [1] if port < 8790 else [],
+        )
+
+        wrap_mod._find_dedicated_port(8787, 8788)
+
+        assert budgets == sorted(budgets, reverse=True) and len(budgets) == 3

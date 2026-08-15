@@ -139,8 +139,14 @@ from headroom.providers.cursor import render_setup_lines as _render_cursor_setup
 from headroom.providers.grok import build_launch_env as _build_grok_launch_env
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.grok_build.config import (
+    hold_grok_provider_config as _hold_grok_provider_config,
+)
+from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
     restore_grok_provider_config,
+)
+from headroom.providers.grok_build.config import (
+    release_grok_provider_config as _release_grok_provider_config,
 )
 from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
@@ -587,6 +593,35 @@ def _dedicated_port_attempts(reserved_port: int, search_from: int) -> int:
     return max(1, min(_DEDICATED_PORT_WINDOW, _MAX_PORT - search_from + 1))
 
 
+def _port_is_claimed_by_a_live_peer(port: int) -> bool:
+    """Whether another live wrapper still holds ``port`` as its endpoint.
+
+    Bindability is not enough to call a port free. When an isolated proxy dies
+    while its wrapper and wrapped tool keep running, the port becomes bindable
+    but that tool's endpoint is fixed — so a later isolated launch taking it
+    would receive the older run's traffic into ITS proxy and workspace, which
+    is precisely the guarantee isolation exists to make. Client markers are the
+    record of who is still pointed there, and `_live_proxy_clients` already
+    prunes dead ones.
+    """
+
+    return bool(_live_proxy_clients(port, exclude_self=True))
+
+
+def _first_unclaimed_port(helpers: Any, reserved_port: int, start: int, attempts: int) -> int:
+    """First BINDABLE port from ``start`` that no live peer still claims."""
+
+    remaining = attempts
+    probe_from = start
+    while remaining > 0:
+        candidate = int(helpers._find_available_port(probe_from, max_attempts=remaining))
+        if not _port_is_claimed_by_a_live_peer(candidate):
+            return candidate
+        remaining -= candidate - probe_from + 1
+        probe_from = candidate + 1
+    raise RuntimeError(f"No unclaimed port found in range {start}-{start + attempts - 1}")
+
+
 def _find_dedicated_port(reserved_port: int, search_from: int) -> int:
     """First free port for a dedicated proxy, preferring the window above.
 
@@ -600,19 +635,18 @@ def _find_dedicated_port(reserved_port: int, search_from: int) -> int:
 
     helpers = _live_wrap_module()
     try:
-        return int(
-            helpers._find_available_port(
-                search_from, max_attempts=_dedicated_port_attempts(reserved_port, search_from)
-            )
+        return _first_unclaimed_port(
+            helpers,
+            reserved_port,
+            search_from,
+            _dedicated_port_attempts(reserved_port, search_from),
         )
     except RuntimeError:
         below = max(1, reserved_port - _DEDICATED_PORT_WINDOW)
         if search_from < reserved_port or below >= reserved_port:
             raise  # already searching below, or there is no room below either
-        return int(
-            helpers._find_available_port(
-                below, max_attempts=_dedicated_port_attempts(reserved_port, below)
-            )
+        return _first_unclaimed_port(
+            helpers, reserved_port, below, _dedicated_port_attempts(reserved_port, below)
         )
 
 
@@ -8194,9 +8228,31 @@ def grok_build(
             click.echo(f"  Warning: could not update Grok config: {e}")
         return
 
+    _grok_isolated = _isolation_requested()
+
+    def _grok_proxy_still_serving(
+        peer_port: int, peer_proxy_pid: int | None, peer_instance: str | None = None
+    ) -> bool:
+        return _wrap_proxy_alive(
+            peer_port,
+            owner={
+                "pid": peer_proxy_pid,
+                "proxy_pid": peer_proxy_pid,
+                "proxy_instance": peer_instance,
+            },
+        )
+
     def _print_grok_build_setup(actual_port: int) -> None:
         try:
-            config_file = inject_grok_provider_config(actual_port, project=project)
+            # Register as an owner either way: an isolated peer's exit needs an
+            # owner list to hand routing back to. Only an isolated run releases
+            # on exit — a shared run's port is durable, so its override stays.
+            config_file = _hold_grok_provider_config(
+                actual_port,
+                project,
+                _proxy_reported_pid(actual_port),
+                _proxy_reported_instance(actual_port),
+            )
             click.echo(f"  Grok config: injected Headroom proxy override into {config_file}")
             click.echo()
         except Exception as e:
@@ -8212,15 +8268,26 @@ def grok_build(
                 click.echo("  rtk instructions injected into AGENTS.md")
             click.echo("  Grok Build will use token-optimized commands automatically.")
 
-    _run_proxy_only_watcher(
-        agent_label="grok-build",
-        port=port,
-        no_proxy=no_proxy,
-        learn=learn,
-        memory=memory,
-        agent_type="grok_build",
-        print_setup_lines=_print_grok_build_setup,
-    )
+    try:
+        _run_proxy_only_watcher(
+            agent_label="grok-build",
+            port=port,
+            no_proxy=no_proxy,
+            learn=learn,
+            memory=memory,
+            agent_type="grok_build",
+            print_setup_lines=_print_grok_build_setup,
+        )
+    finally:
+        if _grok_isolated:
+            # The watcher kills this run's proxy on the way out, so leaving its
+            # port in the durable config would aim every later Grok Build launch
+            # at a dead endpoint.
+            _grok_release = _release_grok_provider_config(_grok_proxy_still_serving)
+            if _grok_release == "handover":
+                click.echo("  Grok config handed to a still-live wrap session.")
+            elif _grok_release != "noop":
+                click.echo(f"  Grok config {_grok_release}.")
 
 
 # =============================================================================
@@ -9726,10 +9793,11 @@ def omp(
     _omp_isolated = _isolation_requested()
 
     def _omp_write(target_port: int) -> tuple[Path, str]:
-        if not _omp_isolated:
-            return _inject_omp_models_override(target_port, _project_name_from_cwd())
-        # Record who is listening, so a peer's handover check can tell a live
-        # proxy from a wrapper that merely outlived its own.
+        # Register as an owner in BOTH modes. A shared session is a valid
+        # handover target, and without a record for it an isolated peer's exit
+        # sees no survivors and restores the pre-wrap file out from under a
+        # `--shared omp` that is still running. Only the isolated run releases
+        # on exit; the shared contract stays durable.
         return _hold_omp_models_override(
             target_port,
             _project_name_from_cwd(),

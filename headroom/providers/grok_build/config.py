@@ -6,7 +6,9 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import cast
 
+from headroom import _config_ownership as _ownership
 from headroom import fsutil
 
 from .runtime import build_proxy_targets
@@ -131,6 +133,59 @@ def inject_grok_provider_config(port: int, project: str | None = None) -> Path:
 
     fsutil.write_text(config_file, content)
     return config_file
+
+
+def hold_grok_provider_config(
+    port: int,
+    project: str | None = None,
+    proxy_pid: int | None = None,
+    proxy_instance: str | None = None,
+) -> Path:
+    """Inject the override AND register this session as an owner.
+
+    ``~/.grok/config.toml`` is user-scoped and single-slot: the Grok Build app
+    re-reads it, so two concurrent wraps writing their own dedicated ports mean
+    the later launch redirects the earlier user's app. Registering an owner is
+    what lets an exiting run hand routing to a still-live peer instead of
+    killing its proxy and leaving the config pointed at it.
+    """
+
+    def _apply(target_port: int, target_project: str | None) -> Path:
+        return inject_grok_provider_config(target_port, target_project)
+
+    config_file, _backup = grok_config_paths()
+    return cast(
+        Path,
+        _ownership.hold(
+            config_file,
+            apply=_apply,
+            port=port,
+            project=project,
+            proxy_pid=proxy_pid,
+            proxy_instance=proxy_instance,
+        ),
+    )
+
+
+def release_grok_provider_config(proxy_probe: _ownership.ProxyProbe | None = None) -> str:
+    """Drop this session's hold, handing the config to a live peer if any.
+
+    Returns ``"handover"``, or the :func:`restore_grok_provider_config` status.
+    An isolated run must not leave its per-run port in a durable file — the
+    watcher kills that proxy on exit, and every later Grok Build launch would
+    aim at it.
+    """
+
+    def _apply(target_port: int, target_project: str | None) -> Path:
+        return inject_grok_provider_config(target_port, target_project)
+
+    config_file, _backup = grok_config_paths()
+    return _ownership.release(
+        config_file,
+        apply=_apply,
+        restore=lambda: restore_grok_provider_config()[0],
+        proxy_probe=proxy_probe,
+    )
 
 
 def restore_grok_provider_config() -> tuple[str, Path]:
