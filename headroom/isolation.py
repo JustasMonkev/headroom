@@ -34,9 +34,10 @@ import shutil
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from headroom import paths
-from headroom._subprocess import pid_alive
+from headroom._subprocess import identity_mismatch, pid_alive, proc_identity
 
 HEADROOM_ISOLATED_ENV = "HEADROOM_ISOLATED"
 
@@ -69,6 +70,13 @@ _MEMORY_DB_FILE = "memory.db"
 # a proxy that has simply been idle is otherwise indistinguishable from an
 # abandoned run. GC reads this file so a live proxy pins its own workspace.
 _PROXY_STATE_FILE = ".proxy.json"
+
+# Start identity of the wrapper that created the run dir. The directory name
+# carries only its PID, and a PID is recycled freely long before the 7-day GC
+# cutoff — without an identity to compare against, an unrelated long-lived
+# process inheriting that number would pin the directory forever and let
+# ``runs/`` grow without bound.
+_OWNER_STATE_FILE = ".owner.json"
 
 # Per-run workspaces are ephemeral; anything older than this is garbage
 # collected on the next activation. Generous enough that a week-long
@@ -207,20 +215,67 @@ def record_run_proxy(pid: int, port: int, *, run_dir: Path | None = None) -> Non
     try:
         target.mkdir(parents=True, exist_ok=True)
         (target / _PROXY_STATE_FILE).write_text(
-            json.dumps({"pid": int(pid), "port": int(port)}), encoding="utf-8"
+            json.dumps({"pid": int(pid), "port": int(port), **_identity_fields(int(pid))}),
+            encoding="utf-8",
         )
     except (OSError, ValueError, TypeError):
+        pass
+
+
+def _identity_fields(pid: int) -> dict[str, Any]:
+    """``start_src``/``start_time`` fields for ``pid``, or ``{}`` when the
+    platform cannot report a start time (mirrors the wrap marker's shape)."""
+
+    ident = proc_identity(pid)
+    if ident is None:
+        return {}
+    return {"start_src": ident[0], "start_time": ident[1]}
+
+
+def _read_run_state(run_dir: Path, filename: str) -> dict[str, Any] | None:
+    try:
+        record = json.loads((run_dir / filename).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _owner_is_live(pid: int | None, record: dict[str, Any] | None) -> bool:
+    """True when ``pid`` is alive AND is not a provably different process.
+
+    ``identity_mismatch`` is conservative: a legacy record with no identity,
+    or a platform that cannot report start times, yields False and we fall
+    back to plain liveness — same behavior as before identities were recorded.
+    """
+
+    if pid is None or not pid_alive(pid):
+        return False
+    if record is None:
+        return True
+    return not identity_mismatch(record.get("start_src"), record.get("start_time"), pid)
+
+
+def record_run_owner(run_dir: Path) -> None:
+    """Stamp the creating wrapper's start identity into a fresh run dir.
+
+    The PID alone lives in the directory name; this pins WHICH process that
+    number referred to, so a recycled PID cannot keep the directory alive
+    forever. Best-effort — GC degrades to plain liveness without it.
+    """
+
+    try:
+        (run_dir / _OWNER_STATE_FILE).write_text(
+            json.dumps({"pid": os.getpid(), **_identity_fields(os.getpid())}), encoding="utf-8"
+        )
+    except OSError:
         pass
 
 
 def _run_dir_proxy_pid(run_dir: Path) -> int | None:
     """PID of the dedicated proxy recorded for ``run_dir``, if any."""
 
-    try:
-        record = json.loads((run_dir / _PROXY_STATE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(record, dict):
+    record = _read_run_state(run_dir, _PROXY_STATE_FILE)
+    if record is None:
         return None
     pid = record.get("pid")
     return pid if isinstance(pid, int) else None
@@ -230,14 +285,16 @@ def _run_dir_has_live_owner(run_dir: Path) -> bool:
     """True while any process still holds ``run_dir``.
 
     Two owners keep a run alive: the wrapper that created it (PID embedded in
-    the directory name) and the dedicated proxy it started (recorded in
-    ``.proxy.json``). Either one being alive is enough.
+    the directory name, start identity in ``.owner.json``) and the dedicated
+    proxy it started (``.proxy.json``). Either one being alive is enough — but
+    "alive" means the recorded process, not merely the recorded PID number, so
+    an unrelated process that inherits a recycled PID cannot pin the directory
+    forever.
     """
 
-    for pid in (_run_dir_owner_pid(run_dir), _run_dir_proxy_pid(run_dir)):
-        if pid is not None and pid_alive(pid):
-            return True
-    return False
+    if _owner_is_live(_run_dir_owner_pid(run_dir), _read_run_state(run_dir, _OWNER_STATE_FILE)):
+        return True
+    return _owner_is_live(_run_dir_proxy_pid(run_dir), _read_run_state(run_dir, _PROXY_STATE_FILE))
 
 
 def _run_dir_last_activity(run_dir: Path) -> float:
@@ -335,6 +392,7 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
     prune_stale_runs(runs_root)
     run_dir = runs_root / f"run-{run_id or _new_run_id()}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    record_run_owner(run_dir)
 
     os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(run_dir)
     # Route memory into the run dir unless the user pinned an explicit DB path.
@@ -354,5 +412,6 @@ __all__ = [
     "active_isolated_workspace",
     "activate_isolated_workspace",
     "prune_stale_runs",
+    "record_run_owner",
     "record_run_proxy",
 ]

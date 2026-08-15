@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import importlib.util
 import io
 import json
@@ -37,7 +38,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import pid_alive, run
+from headroom._subprocess import pid_alive, proc_identity, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -1292,7 +1293,29 @@ def _wrap_marker_path(settings_path: Path) -> Path:
 
 
 def _wrap_marker_lock_path(settings_path: Path) -> Path:
-    return settings_path.parent / ".headroom_wrap_marker.lock"
+    """Lock file guarding ``settings_path``'s owner stack.
+
+    Deliberately NOT next to the marker. Nothing ever deletes a lock file (it
+    must outlive the critical section it guards, and removing it would let a
+    peer take a lock on a different inode), so keeping it in the project would
+    leave a permanent untracked artifact in every wrapped repository. It lives
+    in Headroom's own state directory instead, keyed by a digest of the
+    resolved settings path so every process in the same project contends on
+    the same file.
+
+    The SHARED workspace root, not the per-run one: concurrent isolated runs
+    each have their own ``HEADROOM_WORKSPACE_DIR``, so a per-run lock would
+    give every racer a private file and serialize nothing.
+    """
+
+    from headroom import paths as _paths
+
+    try:
+        resolved = str(settings_path.resolve())
+    except OSError:
+        resolved = str(settings_path)
+    digest = hashlib.sha256(resolved.encode("utf-8", "replace")).hexdigest()[:16]
+    return _paths.shared_workspace_dir() / "locks" / f"wrap-marker-{digest}.lock"
 
 
 # flock is held per open file description, so a second acquisition from THIS
@@ -1981,6 +2004,14 @@ def _restore_claude_wrap_base_url_locked(
         owners = _wrap_marker_owners(path)
         mine = os.getpid()
         survivors = [o for o in owners if o.get("key") == key and o.get("pid") != mine]
+        # Pop ONLY our own (pid, key) entries. The stack is shared across
+        # endpoint keys: a concurrent run in the same project may own
+        # ANTHROPIC_VERTEX_BASE_URL (or the Foundry key) while we own
+        # ANTHROPIC_BASE_URL. Dropping the whole stack because no owner of
+        # OUR key survives would delete that run's crash/self-heal record,
+        # leaving its project-local URL pointing at a dead proxy if it later
+        # exits uncleanly.
+        remaining = [o for o in owners if not (o.get("pid") == mine and o.get("key") == key)]
         if survivors:
             # A peer wrap session is still running. Hand routing back to the
             # most recent live owner rather than restoring the pre-Headroom
@@ -1988,7 +2019,7 @@ def _restore_claude_wrap_base_url_locked(
             # entirely. This covers BOTH exit orders: the newer run leaving
             # first restores the older run's URL, and vice versa.
             handover = survivors[-1].get("url")
-            _write_wrap_marker_owners(path, [o for o in owners if o.get("pid") != mine])
+            _write_wrap_marker_owners(path, remaining)
             # The stack now correctly names the surviving owner(s); the
             # marker-clearing tail below must not wipe it.
             handed_over = True
@@ -1999,9 +2030,13 @@ def _restore_claude_wrap_base_url_locked(
                 # rather than guess and strand the live peer.
                 return
         else:
-            # We were the last live owner — fall through and restore the
-            # original value, clearing the marker below.
-            _write_wrap_marker_owners(path, [])
+            # We were the last live owner OF THIS KEY — fall through and
+            # restore the original value. Any other key's owners stay.
+            _write_wrap_marker_owners(path, remaining)
+            if remaining:
+                # The marker still belongs to another key's live owner, so the
+                # clearing tail below must leave the file alone.
+                handed_over = True
     if not path.exists():
         if not handed_over:
             _clear_wrap_marker(path, key=key)
@@ -4853,32 +4888,10 @@ def _client_marker_path(port: int) -> Path:
     return d / f"{os.getpid()}.json"
 
 
-def _proc_identity(pid: int) -> tuple[str, float] | None:
-    """Best-effort ``(source, start_time)`` identity for a PID.
-
-    Used to defeat PID reuse: a marker is only trusted while the live PID is
-    *the same process* that wrote it. Returns ``None`` when start time can't be
-    determined (e.g. macOS without psutil), in which case callers fall back to
-    existence-only liveness — no regression, just no reuse protection there.
-
-    The ``source`` tag ("psutil" vs "proc") guards against comparing values in
-    different units; we only compare like-for-like.
-    """
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dependency; portable when present
-
-        return ("psutil", psutil.Process(pid).create_time())
-    except Exception:
-        pass
-    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
-    # since boot — a stable per-process value. `comm` (field 2) may contain
-    # spaces/parens, so split after the final ')'.
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            fields = fh.read().rpartition(b")")[2].split()
-        return ("proc", float(fields[19]))
-    except (OSError, IndexError, ValueError):
-        return None
+# Shared with headroom.isolation (run-dir GC needs the same PID-reuse
+# protection). Aliased rather than re-implemented so tests that monkeypatch
+# `wrap._proc_identity` keep working.
+_proc_identity = proc_identity
 
 
 def _register_proxy_client(port: int) -> None:
@@ -4918,10 +4931,8 @@ def _identity_mismatch(src: Any, recorded: Any, pid: int) -> bool:
     """True only if ``pid``'s current identity *provably* differs from the
     recorded ``(src, recorded)`` identity (i.e. the PID was recycled).
 
-    Conservative by design: any uncertainty (unknown/legacy identity, unknown
-    start time, mismatched source) returns ``False`` — never claim a mismatch
-    without proof, since the caller uses this to decide whether to trust or
-    discard state tied to a live PID.
+    Delegates to the shared implementation but resolves ``_proc_identity``
+    through this module, so tests that patch it still steer the comparison.
     """
     if not isinstance(src, str) or not isinstance(recorded, int | float):
         return False  # legacy / identity-less record — can't tell

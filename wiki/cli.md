@@ -817,6 +817,11 @@ same instant read the same stack, each append themselves, and the later
 write drops the other live owner, whose exit would then reset routing out
 from under a peer that is still running. The lock is best-effort: if it
 cannot be taken, the update still proceeds rather than blocking a launch.
+The lock file itself lives under `<shared-workspace>/locks/`, keyed by a
+digest of the resolved settings path — never in your project, since nothing
+ever deletes a lock file. Exiting pops only that run's own `(pid, key)`
+entry, so a concurrent run owning a different endpoint key
+(`ANTHROPIC_VERTEX_BASE_URL`, the Foundry key) keeps its own record.
 For genuinely independent Claude routing, run each agent from its own
 working directory. (`headroom unwrap claude` still always wins.)
 

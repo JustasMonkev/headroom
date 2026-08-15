@@ -269,3 +269,8 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+
+# `wrap claude` bookkeeping written next to the project's Claude settings.
+# The marker is transient (removed when the last owner exits) but a crashed
+# session can leave one behind; it is never source.
+.claude/.headroom_wrap_marker.json

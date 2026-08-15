@@ -1393,3 +1393,145 @@ class TestDedicatedProxyPidIsRecorded:
 
         assert port == 8788 and proc is not None
         assert isolation._run_dir_proxy_pid(run_dir) == 4242
+
+
+class TestMarkerLockLivesOutsideTheProject:
+    """Nothing ever deletes a lock file, so keeping it beside the marker would
+    leave a permanent untracked artifact in every wrapped repo (round 11, P2).
+    """
+
+    def test_lock_is_not_written_into_the_project(self, tmp_path: Path) -> None:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {}}))
+
+        with wrap_mod._wrap_marker_lock(settings):
+            pass
+
+        assert wrap_mod._wrap_marker_lock_path(settings).exists()
+        assert list(settings.parent.iterdir()) == [settings]
+
+    def test_lock_resolves_under_the_shared_root(self, tmp_path: Path) -> None:
+        """Per-run roots differ between concurrent isolated wraps, so a per-run
+        lock would hand every racer a private file and serialize nothing."""
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        shared = paths.shared_workspace_dir()
+
+        before = wrap_mod._wrap_marker_lock_path(settings)
+        assert before.parent == shared / "locks"
+
+        isolation.activate_isolated_workspace()
+        assert paths.workspace_dir() != shared
+
+        assert wrap_mod._wrap_marker_lock_path(settings) == before
+
+    def test_distinct_projects_get_distinct_locks(self, tmp_path: Path) -> None:
+        a = tmp_path / "a" / ".claude" / "settings.local.json"
+        b = tmp_path / "b" / ".claude" / "settings.local.json"
+
+        assert wrap_mod._wrap_marker_lock_path(a) != wrap_mod._wrap_marker_lock_path(b)
+
+    def test_same_project_gets_the_same_lock_via_different_paths(self, tmp_path: Path) -> None:
+        """Two wraps naming one project differently (symlink, `..`) must still
+        contend on the same lock, or the serialization is vacuous."""
+        real = tmp_path / "proj" / ".claude"
+        real.mkdir(parents=True)
+        direct = real / "settings.local.json"
+        indirect = tmp_path / "proj" / "sub" / ".." / ".claude" / "settings.local.json"
+        (tmp_path / "proj" / "sub").mkdir()
+
+        assert wrap_mod._wrap_marker_lock_path(direct) == wrap_mod._wrap_marker_lock_path(indirect)
+
+
+class TestOwnerStackIsPerEndpointKey:
+    """One project-local file holds owners for every Claude endpoint key. A run
+    exiting must not delete another key's live owner (round 11, P2)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    def _seed_vertex_peer(self, marker: Path) -> None:
+        """A concurrent live run owning the Vertex key, not ours."""
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {
+                            "pid": 111,
+                            "port": 8790,
+                            "key": "ANTHROPIC_VERTEX_BASE_URL",
+                            "previous": None,
+                            "url": "http://127.0.0.1:8790",
+                        }
+                    ],
+                    "pid": 111,
+                    "port": 8790,
+                    "key": "ANTHROPIC_VERTEX_BASE_URL",
+                    "previous": None,
+                }
+            )
+        )
+
+    def test_exiting_run_keeps_another_keys_owner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        self._seed_vertex_peer(marker)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert marker.exists(), "the Vertex run's crash record must survive our exit"
+        owners = json.loads(marker.read_text())["owners"]
+        assert [o["key"] for o in owners] == ["ANTHROPIC_VERTEX_BASE_URL"]
+        # Our own key is restored to the user's original value regardless.
+        env = json.loads(settings.read_text())["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://user-gateway"
+
+    def test_last_owner_of_the_only_key_still_clears_the_marker(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert not marker.exists()
+
+    def test_only_our_pid_and_key_entry_is_popped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A same-key live peer AND another key's owner both survive."""
+        settings, marker = self._project(tmp_path)
+        self._seed_vertex_peer(marker)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        payload = json.loads(marker.read_text())
+        payload["owners"].append(
+            {
+                "pid": 222,
+                "port": 8789,
+                "key": "ANTHROPIC_BASE_URL",
+                "previous": "https://user-gateway",
+                "url": "http://127.0.0.1:8789",
+            }
+        )
+        marker.write_text(json.dumps(payload))
+
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        owners = json.loads(marker.read_text())["owners"]
+        assert sorted(o["pid"] for o in owners) == [111, 222]
+        # Handover went to the live same-key peer, not the Vertex owner.
+        env = json.loads(settings.read_text())["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8789"

@@ -607,3 +607,92 @@ class TestSettingsSaveCreatesItsParent:
 
         assert paths.settings_path() == tmp_path / "not-yet" / "settings.json"
         assert paths.settings_path().exists()
+
+
+class TestGcVerifiesProcessIdentity:
+    """PID liveness alone is not proof an owner survives (round 11, P2).
+
+    A PID is recycled freely long before the 7-day cutoff, so an unrelated
+    long-lived process inheriting a dead wrapper's or proxy's number would pin
+    its run dir forever and let ``runs/`` grow without bound.
+    """
+
+    @staticmethod
+    def _make_stale(path: Path) -> None:
+        stale = 1_000_000_000.0
+        for target in (path, *path.rglob("*")):
+            os.utime(target, (stale, stale))
+
+    def test_recycled_wrapper_pid_does_not_pin_the_dir(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        # Name carries OUR pid (alive), but the recorded identity is a start
+        # time no live process can have — i.e. the number was recycled.
+        run = runs / f"run-20200101-000000-{os.getpid()}-abcdef"
+        run.mkdir(parents=True)
+        (run / isolation._OWNER_STATE_FILE).write_text(
+            json.dumps({"pid": os.getpid(), "start_src": "proc", "start_time": 1.0})
+        )
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not run.exists()
+
+    def test_matching_wrapper_identity_still_pins_the_dir(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        run = runs / f"run-20200101-000000-{os.getpid()}-abcdef"
+        run.mkdir(parents=True)
+        isolation.record_run_owner(run)
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert run.exists()
+
+    def test_recycled_proxy_pid_does_not_pin_the_dir(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        run = runs / "run-20200101-000000-2147480000-abcdef"
+        run.mkdir(parents=True)
+        (run / isolation._PROXY_STATE_FILE).write_text(
+            json.dumps({"pid": os.getpid(), "port": 8788, "start_src": "proc", "start_time": 1.0})
+        )
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not run.exists()
+
+    def test_legacy_record_without_identity_falls_back_to_liveness(self, tmp_path: Path) -> None:
+        """A run dir written before identities were recorded (or on a platform
+        that cannot report start times) must keep the old behavior, not become
+        newly prunable while its owner is alive."""
+        runs = tmp_path / "runs"
+        run = runs / f"run-20200101-000000-{os.getpid()}-abcdef"
+        run.mkdir(parents=True)
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert run.exists()
+
+    def test_activation_stamps_the_owner_identity(self, tmp_path: Path) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+
+        record = json.loads((run_dir / isolation._OWNER_STATE_FILE).read_text())
+        assert record["pid"] == os.getpid()
+        # start_src/start_time are absent only where the platform cannot
+        # report them; on this runner they must round-trip as a live match.
+        assert isolation._owner_is_live(os.getpid(), record) is True
+
+    def test_identity_fields_are_omitted_when_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(isolation, "proc_identity", lambda _pid: None)
+
+        assert isolation._identity_fields(1234) == {}
+        # ...and a record without them still reads as live.
+        assert isolation._owner_is_live(os.getpid(), {"pid": os.getpid()}) is True
+
+    def test_dead_pid_is_never_live_regardless_of_identity(self) -> None:
+        assert isolation._owner_is_live(2147480000, None) is False
+        assert isolation._owner_is_live(None, None) is False

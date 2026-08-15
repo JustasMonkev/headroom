@@ -29,6 +29,18 @@ PID and port are recorded in `<run-dir>/.proxy.json`. The proxy is spawned
 detached, so it routinely outlives its wrapper — without that record a live
 but idle proxy could have its own workspace deleted underneath it.
 
+Both records also carry a process *start identity*, not just a PID, because a
+PID is recycled long before the 7-day cutoff and an unrelated long-lived
+process inheriting one would otherwise pin the directory forever. A directory
+written before identities were recorded (or on a platform that cannot report
+start times) falls back to plain PID liveness.
+
+`<shared-workspace>/locks/` holds the advisory lock files that serialize
+concurrent updates to a project's `.claude/.headroom_wrap_marker.json` owner
+stack, keyed by a digest of the resolved settings path. They live here rather
+than in the project because nothing ever deletes a lock file, and they resolve
+against the **shared** root so concurrent isolated runs contend on one file.
+
 All three variables are recognized by the Python proxy / CLI and the npm SDK.
 They are **additive** — every pre-existing per-resource env var
 (`HEADROOM_SAVINGS_PATH`, `HEADROOM_TOIN_PATH`,
