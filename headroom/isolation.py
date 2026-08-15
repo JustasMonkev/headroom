@@ -128,6 +128,24 @@ def _pin_env(name: str, value: str) -> None:
         os.environ[name] = value
 
 
+def _pin_path_env(name: str, value: str) -> None:
+    """:func:`_pin_env` for PATH variables, normalizing what it keeps.
+
+    Preserving a user's existing override verbatim is right, but keeping it
+    *relative* is not: the value is exported into a process tree whose members
+    run from other directories, so a nested Headroom or MCP process would
+    resolve `HEADROOM_CONFIG_DIR=config` (or shared root, settings, memory DB)
+    beneath ITS cwd and use different state than the proxy. An existing
+    override is therefore absolutized in place rather than left alone.
+    """
+
+    existing = _trimmed_env(name)
+    if not existing:
+        os.environ[name] = value
+        return
+    os.environ[name] = _abs(Path(existing).expanduser())
+
+
 def isolation_requested() -> bool:
     """True when this process should run with per-run isolation.
 
@@ -296,6 +314,31 @@ def persistent_memory_db_path() -> Path:
     return paths.shared_workspace_dir() / _MEMORY_DB_FILE
 
 
+def restore_shared_memory_db() -> Path | None:
+    """Undo the per-run memory pin, returning the shared DB it restored to.
+
+    For a run that attaches to a proxy it did not start (``--no-proxy``), the
+    isolated database is actively harmful: wrap-side sync and the agent's
+    memory MCP would read and mutate the run DB while the reused proxy serves
+    API-side retrieval from its own, presenting two conflicting memory views
+    inside one session. Dropping the pin puts both back on the same store.
+
+    Only the path ISOLATION chose is dropped — a user-supplied
+    ``HEADROOM_MEMORY_DB_PATH`` is left alone, same test as
+    :func:`disable_isolation`. Returns None when there was nothing to undo.
+    """
+
+    isolated_ws = active_isolated_workspace()
+    if isolated_ws is None:
+        return None
+    if _trimmed_env(HEADROOM_MEMORY_DB_PATH_ENV) != str(isolated_ws / _MEMORY_DB_FILE):
+        return None
+    os.environ.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
+    shared = paths.shared_workspace_dir() / _MEMORY_DB_FILE
+    os.environ[HEADROOM_MEMORY_DB_PATH_ENV] = _abs(shared)
+    return shared
+
+
 def record_run_owner(run_dir: Path) -> None:
     """Stamp the creating wrapper's start identity into a fresh run dir.
 
@@ -426,12 +469,12 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
     # the settings path beneath ITS cwd, quietly missing the intended model
     # config and redirecting managed binaries, the MCP ledger and marker locks
     # into a second tree.
-    _pin_env(paths.HEADROOM_CONFIG_DIR_ENV, _abs(paths.config_dir()))
-    _pin_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, _abs(paths.workspace_dir()))
+    _pin_path_env(paths.HEADROOM_CONFIG_DIR_ENV, _abs(paths.config_dir()))
+    _pin_path_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, _abs(paths.workspace_dir()))
     # The dashboard-managed settings file is a persistent user preference, not
     # run state: pin it to the shared root so an edit made from an isolated
     # run's dashboard is not written into a directory GC later deletes.
-    _pin_env(paths.HEADROOM_SETTINGS_PATH_ENV, _abs(paths.settings_path()))
+    _pin_path_env(paths.HEADROOM_SETTINGS_PATH_ENV, _abs(paths.settings_path()))
     # Record the exact workspace we are taking over, so `--shared` restores it
     # rather than assuming it equals the shared-resource root.
     os.environ[HEADROOM_PREISOLATION_WORKSPACE_ENV] = _abs(paths.workspace_dir())
@@ -447,7 +490,7 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
 
     os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(run_dir)
     # Route memory into the run dir unless the user pinned an explicit DB path.
-    _pin_env(HEADROOM_MEMORY_DB_PATH_ENV, str(run_dir / _MEMORY_DB_FILE))
+    _pin_path_env(HEADROOM_MEMORY_DB_PATH_ENV, str(run_dir / _MEMORY_DB_FILE))
     os.environ[HEADROOM_ISOLATED_ENV] = "1"
     os.environ[HEADROOM_ISOLATED_WORKSPACE_ENV] = str(run_dir)
     return run_dir
@@ -464,6 +507,7 @@ __all__ = [
     "activate_isolated_workspace",
     "prune_stale_runs",
     "persistent_memory_db_path",
+    "restore_shared_memory_db",
     "record_run_owner",
     "record_run_proxy",
 ]

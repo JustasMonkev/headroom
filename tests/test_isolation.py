@@ -919,3 +919,168 @@ class TestLearnedVerbosityProfileIsShared:
         # ...but its own is used.
         (run_dir / "verbosity_controller.json").write_text(json.dumps({"level": 4}))
         assert resolve_verbosity_level(settings) == (4, "controller")  # type: ignore[arg-type]
+
+
+class TestExistingOverridesAreNormalized:
+    """A nonblank existing override was kept verbatim, so a RELATIVE one
+    bypassed every `_abs` call and was re-resolved against each subprocess's
+    cwd (round 16, P2)."""
+
+    @pytest.mark.parametrize(
+        "var",
+        [
+            paths.HEADROOM_CONFIG_DIR_ENV,
+            paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
+            paths.HEADROOM_SETTINGS_PATH_ENV,
+            isolation.HEADROOM_MEMORY_DB_PATH_ENV,
+        ],
+    )
+    def test_a_relative_override_is_absolutized(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, var: str
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(var, "relative-value")
+
+        isolation.activate_isolated_workspace()
+
+        assert Path(os.environ[var]).is_absolute()
+        assert Path(os.environ[var]) == (tmp_path / "relative-value").resolve()
+
+    def test_an_absolute_override_is_preserved(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        pinned = tmp_path / "mine" / "config"
+        pinned.mkdir(parents=True)
+        monkeypatch.setenv(paths.HEADROOM_CONFIG_DIR_ENV, str(pinned))
+
+        isolation.activate_isolated_workspace()
+
+        assert paths.config_dir() == pinned
+
+    def test_a_tilde_override_is_expanded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv(paths.HEADROOM_CONFIG_DIR_ENV, "~/cfg")
+
+        isolation.activate_isolated_workspace()
+
+        assert Path(os.environ[paths.HEADROOM_CONFIG_DIR_ENV]).is_absolute()
+        assert "~" not in os.environ[paths.HEADROOM_CONFIG_DIR_ENV]
+
+
+class TestSharedMemoryForReusedProxy:
+    """`--memory --no-proxy` under isolation gave the session two conflicting
+    memory views: wrap-side sync + MCP on the run DB, API-side retrieval on the
+    reused proxy's own (round 16, P2)."""
+
+    def test_restore_drops_the_isolated_pin(self, tmp_path: Path) -> None:
+        shared = paths.workspace_dir()
+        run_dir = isolation.activate_isolated_workspace()
+        assert paths.memory_db_path() == run_dir / "memory.db"
+
+        restored = isolation.restore_shared_memory_db()
+
+        assert restored == shared / "memory.db"
+        # HEADROOM_MEMORY_DB_PATH is what memory consumers actually read (the
+        # proxy, the memory MCP's --db default, `headroom memory`), so that is
+        # the contract this must move — not the workspace-derived default.
+        exported = Path(os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV])
+        assert exported.is_absolute()
+        assert exported == (shared / "memory.db").resolve()
+        assert exported != run_dir / "memory.db"
+
+    def test_a_user_pinned_db_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        pinned = tmp_path / "mine" / "memory.db"
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, str(pinned))
+        isolation.activate_isolated_workspace()
+
+        assert isolation.restore_shared_memory_db() is None
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(pinned)
+
+    def test_outside_isolation_it_is_a_noop(self) -> None:
+        assert isolation.restore_shared_memory_db() is None
+
+
+class TestLearnedBaselineIsShared:
+    """`learn --apply` seeds a synthetic-control baseline for future proxies,
+    but an isolated proxy read output_savings.json from its own run dir and
+    never saw it (round 16, P2)."""
+
+    def test_baseline_path_follows_the_shared_root(self, tmp_path: Path) -> None:
+        shared = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        assert paths.output_savings_baseline_path() == shared / "output_savings.json"
+
+    def test_recorder_reads_the_shared_baseline_and_writes_run_local(self, tmp_path: Path) -> None:
+        from headroom.proxy.output_savings import SavingsLedger, SavingsRecorder
+        from headroom.proxy.output_savings_policy import stratum_label
+
+        shared = paths.ensure_workspace_dir()
+        seeded = SavingsLedger()
+        for _ in range(5):
+            seeded.baseline.observe("s", 100)
+        seeded.save(shared / "output_savings.json")
+        run_dir = isolation.activate_isolated_workspace()
+
+        recorder = SavingsRecorder(
+            run_dir / "output_savings.json",
+            baseline_path=paths.output_savings_baseline_path(),
+        )
+        # Visible IMMEDIATELY, before any record/flush: a proxy that never
+        # reaches a flush must still estimate against the seeded baseline.
+        assert recorder._ledger.baseline.total_samples == 5
+
+        recorder.record_from_labels([stratum_label("treatment", "s")], 42)
+        recorder.flush()
+
+        # ...and still after the flush cycle re-reads it.
+        assert recorder._ledger.baseline.total_samples == 5
+        # ...observations land in the RUN's file...
+        assert (run_dir / "output_savings.json").exists()
+        # ...and the shared baseline file is never rewritten by the proxy.
+        reloaded = SavingsLedger.load(shared / "output_savings.json")
+        assert reloaded.baseline.total_samples == 5
+        assert reloaded.treatment == {}
+
+    def test_a_relearn_while_the_proxy_is_live_is_picked_up(self, tmp_path: Path) -> None:
+        """`learn --apply` rewrites the SHARED baseline while an isolated proxy
+        holds its own observations file. The periodic reload must re-read the
+        shared copy, or the new baseline never takes effect until a restart."""
+        from headroom.proxy.output_savings import SavingsLedger, SavingsRecorder
+        from headroom.proxy.output_savings_policy import stratum_label
+
+        shared = paths.ensure_workspace_dir()
+        seeded = SavingsLedger()
+        for _ in range(5):
+            seeded.baseline.observe("s", 100)
+        seeded.save(shared / "output_savings.json")
+        run_dir = isolation.activate_isolated_workspace()
+        recorder = SavingsRecorder(
+            run_dir / "output_savings.json",
+            baseline_path=paths.output_savings_baseline_path(),
+        )
+        recorder.record_from_labels([stratum_label("treatment", "s")], 42)
+        recorder.flush()
+
+        # A fresh `learn --apply` lands on the shared root mid-session.
+        relearned = SavingsLedger()
+        for _ in range(9):
+            relearned.baseline.observe("s", 80)
+        relearned.save(shared / "output_savings.json")
+        recorder.record_from_labels([stratum_label("treatment", "s")], 42)
+        recorder.flush()
+
+        assert recorder._ledger.baseline.total_samples == 9, (
+            "the proxy kept using the stale baseline from its own run file"
+        )
+
+    def test_same_file_when_not_isolated(self, tmp_path: Path) -> None:
+        from headroom.proxy.output_savings import SavingsRecorder
+
+        recorder = SavingsRecorder(paths.workspace_dir() / "output_savings.json")
+
+        assert recorder._baseline_path == recorder._path

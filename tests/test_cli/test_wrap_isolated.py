@@ -2273,3 +2273,201 @@ class TestSelfhealHookWriteIsSerialized:
 
         assert wrap_mod._wrap_marker_lock_depth == 0
         assert "hooks" in json.loads(settings.read_text())
+
+
+class TestUnwrapRestoresEachKey:
+    """`unwrap` read `_prior` from the top-level mirror, so with interleaved
+    keys every non-mirrored one got None — and `_force=True` then DELETED the
+    user's pre-existing gateway instead of restoring it (round 16, P2)."""
+
+    def test_each_key_restores_its_own_recorded_previous(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "proj"
+        settings = project / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://127.0.0.1:8788",
+                        "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:8790",
+                    }
+                }
+            )
+        )
+        marker = wrap_mod._wrap_marker_path(settings)
+        base_owner = {
+            "pid": 111,
+            "port": 8788,
+            "key": "ANTHROPIC_BASE_URL",
+            "previous": "https://user-gateway",
+            "url": "http://127.0.0.1:8788",
+        }
+        vertex_owner = {
+            "pid": 222,
+            "port": 8790,
+            "key": "ANTHROPIC_VERTEX_BASE_URL",
+            "previous": "https://vertex-original",
+            "url": "http://127.0.0.1:8790",
+        }
+        # Vertex is newest, so the mirror names it and Base is invisible there.
+        marker.write_text(json.dumps({"owners": [base_owner, vertex_owner], **vertex_owner}))
+
+        for foundry, vertex in ((False, False), (True, False), (False, True)):
+            key = wrap_mod._claude_wrap_base_url_env_key(foundry_mode=foundry, vertex_mode=vertex)
+            prior_owner = wrap_mod._newest_persisted_owner(settings, key=key)
+            prior = prior_owner.get("previous") if prior_owner is not None else None
+            wrap_mod._restore_claude_wrap_base_url(
+                prior,
+                foundry_mode=foundry,
+                vertex_mode=vertex,
+                settings_path=settings,
+                _force=True,
+            )
+
+        env = json.loads(settings.read_text())["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://user-gateway"
+        assert env["ANTHROPIC_VERTEX_BASE_URL"] == "https://vertex-original"
+
+    def test_newest_persisted_owner_ignores_the_mirror(self, tmp_path: Path) -> None:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        marker = wrap_mod._wrap_marker_path(settings)
+        base = {"pid": 111, "key": "ANTHROPIC_BASE_URL", "previous": "https://user-gateway"}
+        vertex = {"pid": 222, "key": "ANTHROPIC_VERTEX_BASE_URL", "previous": None}
+        marker.write_text(json.dumps({"owners": [base, vertex], **vertex}))
+
+        found = wrap_mod._newest_persisted_owner(settings, key="ANTHROPIC_BASE_URL")
+
+        assert found is not None and found["previous"] == "https://user-gateway"
+
+
+class TestInterruptedProxyIsReaped:
+    """SIGHUP can land inside the readiness loop, after the DETACHED child is
+    spawned but before `_ensure_proxy` returns it — the caller's cleanup never
+    sees it and GC never learns about it (round 16, P2)."""
+
+    def test_child_is_killed_when_the_wait_is_interrupted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        killed: list[bool] = []
+
+        class _Proc:
+            pid = 4242
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                killed.append(True)
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *a, **k: _Proc())
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
+
+        def interrupt(_seconds: float) -> None:
+            raise SystemExit(0)  # what the SIGHUP handler raises
+
+        monkeypatch.setattr(wrap_mod.time, "sleep", interrupt)
+        monkeypatch.setattr(wrap_mod, "_build_proxy_env", lambda *a, **k: {}, raising=False)
+
+        with pytest.raises(SystemExit):
+            wrap_mod._start_proxy(8788)
+
+        assert killed == [True], "the detached child was abandoned"
+
+    def test_a_spawn_failure_still_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`proc` is unbound if Popen itself raised; the reaper must not mask
+        the original error with a NameError."""
+
+        def boom(*_a: Any, **_k: Any) -> Any:
+            raise OSError("no exec for you")
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", boom)
+
+        with pytest.raises(OSError, match="no exec for you"):
+            wrap_mod._start_proxy(8788)
+
+
+class TestOpenclawBootstrapIsExempt:
+    """`wrap openclaw` is a durable installer that hands off to a gateway whose
+    autoStart launches its own detached proxy — that proxy must not land on a
+    run directory this wrapper never records (round 16, P2)."""
+
+    def test_openclaw_is_exempt_from_isolation(self) -> None:
+        assert "openclaw" in wrap_mod._WRAP_ISOLATION_EXEMPT_SUBCOMMANDS
+
+    def test_a_wrapper_owned_session_is_not_exempt(self) -> None:
+        for name in ("claude", "codex", "copilot", "grok"):
+            assert name not in wrap_mod._WRAP_ISOLATION_EXEMPT_SUBCOMMANDS
+
+    def test_openclaw_run_creates_no_run_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv(isolation.HEADROOM_ISOLATED_ENV, raising=False)
+        runner = CliRunner()
+
+        result = runner.invoke(main, ["wrap", "openclaw", "--prepare-only"])
+
+        runs = tmp_path / "ws" / "runs"
+        assert not runs.exists() or not list(runs.iterdir()), result.output
+
+
+class TestParentUpstreamSurvivesNesting:
+    """A nested wrap correctly refuses to chain onto the parent's proxy, but
+    the parent's REAL upstream was never propagated — so the child silently
+    fell back to api.anthropic.com (round 16, P2)."""
+
+    def test_inherited_upstream_is_adopted_instead_of_the_parent_proxy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        monkeypatch.setenv(wrap_mod._PARENT_UPSTREAM_ENV, "https://litellm.example.com")
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) == "https://litellm.example.com"
+
+    def test_without_an_inherited_upstream_it_is_still_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        monkeypatch.delenv(wrap_mod._PARENT_UPSTREAM_ENV, raising=False)
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8788) is None
+
+    def test_a_real_gateway_still_wins_over_the_inherited_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://direct-gateway.example.com")
+        monkeypatch.setenv(wrap_mod._PARENT_UPSTREAM_ENV, "https://litellm.example.com")
+
+        assert (
+            wrap_mod._detect_inbound_anthropic_upstream(8788)
+            == "https://direct-gateway.example.com"
+        )
+
+    def test_export_sets_and_clears(self) -> None:
+        env: dict[str, str] = {}
+        wrap_mod._export_parent_upstream(env, "https://litellm.example.com")
+        assert env[wrap_mod._PARENT_UPSTREAM_ENV] == "https://litellm.example.com"
+
+        # A grandparent's value must not be adopted by our child as ours.
+        wrap_mod._export_parent_upstream(env, None)
+        assert wrap_mod._PARENT_UPSTREAM_ENV not in env
+
+    def test_foundry_falls_back_to_the_inherited_upstream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(wrap_mod._PARENT_UPSTREAM_ENV, "https://foo.services.ai.azure.com")
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"service": "headroom-proxy"}
+        )
+
+        assert wrap_mod._url_is_local_headroom_proxy("http://127.0.0.1:8788/anthropic") is True
+        assert wrap_mod._inherited_parent_upstream() == "https://foo.services.ai.azure.com"

@@ -361,13 +361,20 @@ class SavingsRecorder:
     JSON file on every request.
     """
 
-    def __init__(self, path: Any, flush_every: int = 25) -> None:
+    def __init__(self, path: Any, flush_every: int = 25, baseline_path: Any = None) -> None:
         import threading
         from pathlib import Path
 
         self._path = Path(path)
+        # The baseline may live in a DIFFERENT file from the observations: an
+        # isolated run records its own treatment/control while reading the
+        # baseline `learn --apply` seeded on the shared root. They are the same
+        # file in the ordinary (non-isolated) case, so nothing changes there.
+        self._baseline_path = Path(baseline_path) if baseline_path else self._path
         self._lock = threading.Lock()
         self._ledger = SavingsLedger.load(self._path)
+        if self._baseline_path != self._path:
+            self._ledger.baseline = SavingsLedger.load(self._baseline_path).baseline
         self._flush_every = flush_every
         self._since_flush = 0
 
@@ -424,7 +431,7 @@ class SavingsRecorder:
         same number of samples still takes effect, and the empty-disk guard keeps
         a truncated file from wiping a baseline we already hold."""
         try:
-            disk = SavingsLedger.load(self._path)
+            disk = SavingsLedger.load(self._baseline_path)
         except OSError:
             return
         if disk.baseline.total_samples == 0:
@@ -463,9 +470,12 @@ def get_recorder() -> SavingsRecorder:
     """Process-wide recorder singleton, rooted at the workspace dir."""
     global _RECORDER
     if _RECORDER is None:
-        from ..paths import workspace_dir
+        from ..paths import output_savings_baseline_path, workspace_dir
 
-        _RECORDER = SavingsRecorder(workspace_dir() / "output_savings.json")
+        _RECORDER = SavingsRecorder(
+            workspace_dir() / "output_savings.json",
+            baseline_path=output_savings_baseline_path(),
+        )
     return _RECORDER
 
 

@@ -439,7 +439,6 @@ def _run_verbosity(
     from ..learn.registry import auto_detect_plugins, get_plugin
     from ..learn.verbosity import analyze
     from ..paths import ensure_shared_workspace_dir as _ensure_shared_workspace_dir
-    from ..paths import ensure_workspace_dir
     from ..proxy.output_savings import BaselineModel, SavingsLedger
 
     # Verbosity mining reads Claude Code transcripts; restrict to that plugin.
@@ -530,7 +529,6 @@ def _run_verbosity(
         return
 
     if apply:
-        ws = ensure_workspace_dir()
         # The learned profile is a persisted preference for FUTURE proxies, so
         # it must not land in an ephemeral per-run workspace when `learn` is
         # invoked from inside an isolated wrap (see paths.verbosity_profile_path).
@@ -541,7 +539,9 @@ def _run_verbosity(
         best_profile.save(profile_path)
         # Seed the savings baseline: replace baseline, preserve any live
         # treatment/control already accumulated.
-        ledger_path = ws / "output_savings.json"
+        # Seeded for FUTURE proxies, so it goes to the shared root alongside
+        # the verbosity profile — an isolated proxy reads its baseline there.
+        ledger_path = _ensure_shared_workspace_dir() / "output_savings.json"
         ledger = SavingsLedger.load(ledger_path)
         ledger.baseline = aggregated
         ledger.save(ledger_path)

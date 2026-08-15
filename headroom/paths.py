@@ -76,6 +76,7 @@ _MEMORY_DB_FILE = "memory.db"
 _MEMORIES_DIR = "memories"
 _LICENSE_CACHE_FILE = "license_cache.json"
 _VERBOSITY_PROFILE_FILE = "verbosity.json"
+_OUTPUT_SAVINGS_FILE = "output_savings.json"
 _SESSION_STATS_FILE = "session_stats.jsonl"
 _SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
@@ -321,6 +322,24 @@ def verbosity_profile_path() -> Path:
     return shared_workspace_dir() / _VERBOSITY_PROFILE_FILE
 
 
+def output_savings_baseline_path() -> Path:
+    """Return the ledger holding the learned output-savings BASELINE.
+
+    ``learn --verbosity --apply`` seeds a synthetic-control baseline that it
+    promises will apply to future proxies, so it resolves against the shared
+    workspace for the same reason :func:`verbosity_profile_path` does — an
+    isolated proxy would otherwise look in a fresh run directory and never
+    find it.
+
+    Live treatment/control observations stay in the RUN's own
+    ``output_savings.json``: those are this session's measurements, not a
+    saved preference, and keeping them separate also stops an isolated
+    proxy's periodic flush from overwriting the shared baseline.
+    """
+
+    return shared_workspace_dir() / _OUTPUT_SAVINGS_FILE
+
+
 def license_cache_path() -> Path:
     """Return the path for the cached license envelope.
 
@@ -535,6 +554,7 @@ __all__ = [
     "native_memory_dir",
     "license_cache_path",
     "verbosity_profile_path",
+    "output_savings_baseline_path",
     "session_stats_path",
     "savings_events_path",
     "settings_path",

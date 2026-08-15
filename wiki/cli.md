@@ -839,7 +839,19 @@ is still adopted as the upstream, per issue #1353. The same check covers
 Foundry and Vertex mode, which route through their own endpoint variables
 (`ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
 `VERTEX_TARGET_API_URL`) — a nested wrap inherits whichever one its parent
-set, so all of them are probed the same way.
+set, so all of them are probed the same way. The parent's *resolved upstream*
+travels with it (`HEADROOM_PARENT_ANTHROPIC_UPSTREAM`), so a nested wrap keeps
+routing through a user gateway the parent was configured with instead of
+falling back to `api.anthropic.com`.
+
+`wrap openclaw` is exempt from isolation alongside `selfheal`: it is a durable
+installer that hands off to `openclaw gateway start`, whose `autoStart` spawns
+a proxy of its own — that proxy belongs on shared state, not on a run
+directory this wrapper never records and GC could later delete.
+
+`--memory --no-proxy` reconciles onto the shared memory database. The reused
+proxy serves retrieval from its own store, so keeping this run pinned to an
+isolated one would give the session two conflicting memory views.
 
 With `--no-proxy` an isolated run deliberately attaches to the shared
 proxy; its client marker is registered in the shared workspace so the

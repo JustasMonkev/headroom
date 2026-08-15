@@ -820,6 +820,18 @@ def _start_proxy(
             f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
             f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
         )
+    except BaseException:
+        # SIGHUP (or SIGINT/SIGTERM) can land inside the readiness loop, after
+        # the DETACHED child is spawned but before we return it. The caller's
+        # cleanup only knows about a proxy it has been handed, so without this
+        # the child is abandoned: still serving, unrecorded in `.proxy.json`,
+        # and therefore invisible to run-dir GC, which can then delete the
+        # workspace out from under it. Reap it here, where we still have the
+        # handle. `proc` may be unbound if the spawn itself raised.
+        with contextlib.suppress(NameError, OSError):
+            if proc.poll() is None:
+                proc.kill()
+        raise
     finally:
         stdio_log_file.close()
 
@@ -4586,6 +4598,20 @@ def _ensure_proxy(
             "  Warning: --no-proxy reuses the existing proxy, so this isolated run "
             "gets no dedicated proxy instance (pass --shared for fully shared state)."
         )
+        if memory:
+            # The reused proxy serves API-side retrieval from ITS database, so
+            # leaving this run pinned to an isolated one would give the session
+            # two conflicting memory views: wrap-side sync and the agent's
+            # memory MCP on the run DB, retrieval on the proxy's. Reconcile
+            # rather than warn about it.
+            from headroom import isolation as _isolation
+
+            restored = _isolation.restore_shared_memory_db()
+            if restored is not None:
+                click.echo(
+                    f"  Memory follows the reused proxy: using the shared database "
+                    f"({restored}) instead of a per-run one."
+                )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
@@ -5477,11 +5503,19 @@ def _copy_openclaw_plugin_into_extensions(
     return target_dir
 
 
-# Utility subcommands that must not spin up a per-run workspace: selfheal is
-# fired by a SessionStart hook on every Claude session and only repairs a
-# stale base_url in Claude's own settings — creating (and GC-scanning) a run
-# dir for it would be pure churn.
-_WRAP_ISOLATION_EXEMPT_SUBCOMMANDS = frozenset({"selfheal"})
+# Subcommands that must not spin up a per-run workspace.
+#
+# `selfheal` is fired by a SessionStart hook on every Claude session and only
+# repairs a stale base_url in Claude's own settings — creating (and
+# GC-scanning) a run dir for it would be pure churn.
+#
+# `openclaw` is a durable INSTALLER, not a wrapper-owned session: it configures
+# the plugin and hands off to `openclaw gateway start`. The gateway inherits
+# this environment and its `autoStart=true` launches a detached Headroom proxy
+# of its own — which would land on the run directory even though this wrapper
+# never calls `record_run_proxy()`, so GC could delete that workspace beneath a
+# still-running proxy once the installer exits. It belongs on shared state.
+_WRAP_ISOLATION_EXEMPT_SUBCOMMANDS = frozenset({"selfheal", "openclaw"})
 
 
 def _wrapper_own_args(tokens: list[str]) -> list[str]:
@@ -5626,6 +5660,34 @@ def wrap_selfheal(marker: str | None) -> None:
 _LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+# Set on the wrapped agent's environment, carrying the upstream THIS wrap
+# resolved for its proxy. A nested wrap inherits only the parent's proxy URL,
+# which it correctly refuses to chain onto — but without this it would then
+# fall back to api.anthropic.com, silently bypassing the user's gateway (or
+# failing outright, since the credentials may only exist there).
+_PARENT_UPSTREAM_ENV = "HEADROOM_PARENT_ANTHROPIC_UPSTREAM"
+
+
+def _inherited_parent_upstream() -> str | None:
+    """The upstream our parent wrap resolved, when we are nested inside one."""
+
+    return (os.environ.get(_PARENT_UPSTREAM_ENV) or "").strip() or None
+
+
+def _export_parent_upstream(env: dict[str, str], upstream: str | None) -> None:
+    """Record ``upstream`` for a nested wrap, or clear a grandparent's value.
+
+    Clearing matters: if THIS wrap has no custom upstream, an inherited value
+    from further up would otherwise be adopted by our child as though it were
+    ours.
+    """
+
+    if upstream:
+        env[_PARENT_UPSTREAM_ENV] = upstream
+    else:
+        env.pop(_PARENT_UPSTREAM_ENV, None)
+
+
 def _url_is_local_headroom_proxy(url: str | None) -> bool:
     """True when ``url`` points at a Headroom proxy on this machine.
 
@@ -5703,9 +5765,14 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
         except ValueError:
             return None
         if parsed_port == port:
-            return None
+            # Self-referential: fall through to the inherited value below.
+            return _inherited_parent_upstream()
     if _url_is_local_headroom_proxy(base_url):
-        return None
+        # A parent wrap's proxy. Do not chain onto it — but do adopt whatever
+        # upstream the PARENT resolved, so a user gateway configured outside
+        # this process tree survives the nesting instead of being replaced by
+        # api.anthropic.com.
+        return _inherited_parent_upstream()
     return base_url
 
 
@@ -5945,10 +6012,11 @@ def claude(
             foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
             if _url_is_local_headroom_proxy(foundry_upstream):
                 # Inherited from a parent wrap running in Foundry mode: its
-                # value is the PARENT's proxy, not an Azure endpoint. Fall
-                # through to the resource name so we forward to Foundry
+                # value is the PARENT's proxy, not an Azure endpoint. Prefer
+                # the upstream the parent itself resolved, else fall through
+                # to the resource name — either way we forward to Foundry
                 # directly instead of chaining through the parent.
-                foundry_upstream = None
+                foundry_upstream = _inherited_parent_upstream()
             if not foundry_upstream:
                 resource = os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE", "").strip()
                 if resource:
@@ -6102,6 +6170,9 @@ def claude(
             env["ANTHROPIC_FOUNDRY_BASE_URL"] = _foundry_proxy_url(proxy_url)
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
+        # A nested wrap sees only our proxy URL above; hand it the upstream we
+        # actually resolved so it can keep routing through the user's gateway.
+        _export_parent_upstream(env, upstream_for_proxy)
 
         # Issue #951: write to settings.json so daemon-spawned conversation
         # workers (which read settings.json fresh rather than inheriting the
@@ -6292,10 +6363,13 @@ def unwrap_claude(
         click.echo("  Removed Headroom wrap self-heal SessionStart hook (issue #2221).")
     for _foundry, _vertex in ((False, False), (True, False), (False, True)):
         _key = _claude_wrap_base_url_env_key(foundry_mode=_foundry, vertex_mode=_vertex)
-        _marker = _read_wrap_marker(_unwrap_settings_path)
-        _prior = (
-            _marker.get("previous") if _marker is not None and _marker.get("key") == _key else None
-        )
+        # Per KEY, from the persisted stack — never the top-level mirror.
+        # The mirror is owners[-1] across ALL keys, so with interleaved
+        # Base/Vertex wraps every non-mirrored key resolved to None and the
+        # forced restore below DELETED that setting instead of putting the
+        # user's pre-existing gateway back.
+        _marker = _newest_persisted_owner(_unwrap_settings_path, key=_key)
+        _prior = _marker.get("previous") if _marker is not None else None
         _restore_claude_wrap_base_url(
             _prior,
             foundry_mode=_foundry,
