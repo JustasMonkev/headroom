@@ -190,10 +190,13 @@ def record_run_proxy(pid: int, port: int, *, run_dir: Path | None = None) -> Non
     """Record the dedicated proxy this isolated run started.
 
     Without this, GC's only liveness signal is the wrapper PID in the run
-    directory's name. The proxy is spawned detached and keeps serving after the
-    wrapper exits (``wrap ... --proxy-only``, a wrapper killed while its proxy
-    survives), so a quiet-but-live proxy's workspace — its databases, caches
-    and logs — could be deleted out from under it once the age cutoff passed.
+    directory's name. ``_start_proxy`` spawns the proxy detached
+    (``start_new_session`` on POSIX, ``CREATE_BREAKAWAY_FROM_JOB`` on Windows),
+    so it keeps serving after the wrapper exits — a wrapper killed without
+    running its cleanup, or the proxy-only watcher flows the editor
+    integrations (``wrap cursor``/``cline``/``continue``) use. A quiet-but-live
+    proxy's workspace — its databases, caches and logs — could otherwise be
+    deleted out from under it once the age cutoff passed.
 
     No-op outside isolated mode, and best-effort: never break a launch.
     """
