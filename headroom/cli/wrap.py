@@ -9605,10 +9605,28 @@ def omp(
     # releases it on exit; `--shared` keeps the original contract, since the
     # shared port outlives the session and the persisted override stays true.
     _omp_isolated = _isolation_requested()
-    _write_omp_override = (
-        _hold_omp_models_override if _omp_isolated else _inject_omp_models_override
-    )
-    models_file, _ = _write_omp_override(port, _project_name_from_cwd())
+
+    def _omp_write(target_port: int) -> tuple[Path, str]:
+        if not _omp_isolated:
+            return _inject_omp_models_override(target_port, _project_name_from_cwd())
+        # Record who is listening, so a peer's handover check can tell a live
+        # proxy from a wrapper that merely outlived its own.
+        return _hold_omp_models_override(
+            target_port, _project_name_from_cwd(), _proxy_reported_pid(target_port)
+        )
+
+    def _omp_proxy_still_serving(peer_port: int, peer_proxy_pid: int | None) -> bool:
+        """Whether a peer owner's proxy can still serve the override.
+
+        Its wrapper stays blocked on the omp child long after a detached proxy
+        dies, so handing `models.yml` back on wrapper liveness alone rewrites a
+        machine-global file to a dead port.
+        """
+        return _wrap_proxy_alive(
+            peer_port, owner={"pid": peer_proxy_pid, "proxy_pid": peer_proxy_pid}
+        )
+
+    models_file, _ = _omp_write(port)
     click.echo(f"  models.yml override written: {models_file}")
 
     def reconcile_omp_port(actual_port: int) -> None:
@@ -9616,7 +9634,7 @@ def omp(
         # only affects its web-search helper). It was written with the requested
         # port; a dedicated proxy binds a different one, so rewrite it — otherwise
         # omp would route inference to the reserved shared port, not its proxy.
-        rewritten, _ = _write_omp_override(actual_port, _project_name_from_cwd())
+        rewritten, _ = _omp_write(actual_port)
         click.echo(f"  models.yml override updated for port {actual_port}: {rewritten}")
 
     try:
@@ -9639,7 +9657,7 @@ def omp(
             # Hand the override to a still-live peer, or restore the pre-wrap
             # file. Doing nothing here is what leaves a dead per-run port in a
             # file every future omp process reads.
-            _omp_release = _release_omp_models_override()
+            _omp_release = _release_omp_models_override(_omp_proxy_still_serving)
             if _omp_release == "handover":
                 click.echo("  models.yml override handed to a still-live wrap session.")
             elif _omp_release != "noop":

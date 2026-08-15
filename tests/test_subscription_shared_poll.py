@@ -492,6 +492,110 @@ class TestCoordinationIsScopedToOneAccount:
         ).exists()
 
 
+class TestTheKeySurvivesTokenRotation:
+    """Hashing the raw access token split one account across rotations: two
+    sessions holding different vintages of the same account's token elected
+    separately, polled separately, and left a new pair of files behind on every
+    rotation (round 25, P2)."""
+
+    def _credentials(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access: str) -> None:
+        home = tmp_path / "claude"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": "stable-refresh"}})
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+
+    def test_two_token_vintages_share_one_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._credentials(tmp_path, monkeypatch, "access-v2")
+
+        assert tracker_mod._account_key("access-v1") == tracker_mod._account_key("access-v2")
+
+    def test_a_different_account_still_gets_a_different_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._credentials(tmp_path, monkeypatch, "access-v2")
+        mine = tracker_mod._account_key("access-v2")
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"refreshToken": "someone-else"}})
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+
+        assert tracker_mod._account_key("access-v2") != mine
+
+    def test_no_credentials_file_falls_back_to_the_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "absent"))
+
+        assert tracker_mod._account_key("tok-a") != tracker_mod._account_key("tok-b")
+        assert tracker_mod._account_key("tok-a") != ""
+
+    def test_the_key_never_contains_credential_material(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._credentials(tmp_path, monkeypatch, "access-v2")
+
+        key = tracker_mod._account_key("access-v2")
+
+        assert "stable-refresh" not in key
+        assert "access-v2" not in key
+
+    def test_a_broken_credentials_file_never_breaks_a_poll(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        home = tmp_path / "claude"
+        home.mkdir()
+        (home / ".credentials.json").write_text("{not json")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+
+        assert tracker_mod._account_key("tok-a")
+
+
+class TestAForeignPublicationIsNotWaitedOut:
+    """Any residual key collision must stay cheap: a fresh publication we will
+    reject on the account check should end the wait immediately, not burn the
+    full handoff timeout the dashboard's 2s budget cannot absorb."""
+
+    def test_a_foreign_snapshot_ends_the_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = _snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_snapshot(token_prefix="OTHERACC", age_s=1).to_dict()))
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+        monkeypatch.setattr("headroom._filelock.acquire", lambda *_a, **_k: False)
+        waits = {"n": 0}
+
+        async def counted(delay: float) -> None:
+            waits["n"] += 1
+
+        monkeypatch.setattr("headroom.subscription.tracker.asyncio.sleep", counted)
+
+        _poll(tracker, monkeypatch)
+
+        assert waits["n"] <= 2 * tracker_mod._POLL_ELECTION_ROUNDS, (
+            f"waited {waits['n']} intervals on a snapshot it would reject"
+        )
+        assert client.calls == 1
+
+    def test_our_own_fresh_snapshot_still_ends_the_wait_by_adoption(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_snapshot(age_s=1).to_dict()))
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 0
+
+
 class TestSnapshotRoundTrip:
     """`to_dict` renames `utilization` and publishes USD, so the API parser
     cannot read our own serialization back — hence the explicit `from_dict`."""

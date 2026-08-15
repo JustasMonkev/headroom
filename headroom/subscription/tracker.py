@@ -165,17 +165,36 @@ def _get_persist_path() -> Path:
 
 
 def _account_key(token: str | None) -> str:
-    """Opaque, stable per-OAuth-account key for the shared coordination files.
+    """Opaque, rotation-stable key for the shared coordination files.
 
-    A digest rather than the token prefix: these names sit in a shared
-    directory, and a filename is the wrong place for credential material.
-    ``""`` when there is no token — such a poll coordinates with nothing, which
-    is right, since it cannot say which account it is about.
+    Derived from the credentials file's refresh token when one is readable,
+    NOT from the access token: access tokens rotate, and two sessions holding
+    different vintages of the same account's token would otherwise elect
+    separately, poll separately, and leave a new pair of files behind on every
+    rotation — undoing the coordination for the account that has it.
+
+    Falls back to the access token when there is no credentials file (an
+    explicitly configured `CLAUDE_CODE_OAUTH_TOKEN`, say). That is less stable
+    but never wrong: `_adopt_shared_snapshot` validates `token_prefix`
+    independently, so correctness never rests on this key — only how well the
+    coordination groups.
+
+    A digest either way: these names sit in a shared directory, and a filename
+    is the wrong place for credential material. ``""`` when there is nothing to
+    key on, which coordinates with nothing — right, since such a poll cannot
+    say which account it is about.
     """
 
-    if not token:
+    from headroom.subscription.client import stable_account_identity
+
+    try:
+        identity = stable_account_identity()
+    except Exception:  # never let key derivation break a poll
+        identity = None
+    material = identity or token
+    if not material:
         return ""
-    return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()[:16]
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 class SubscriptionTracker(QuotaTracker):
@@ -658,7 +677,30 @@ class SubscriptionTracker(QuotaTracker):
             if snapshot is not None:
                 logger.debug("event=subscription_snapshot_awaited")
                 return snapshot
+            if self._published_snapshot_is_foreign(token):
+                # A fresh publication we will never accept: the holder is a
+                # different account that happens to share our key. Waiting out
+                # the rest of the timeout for a snapshot we have already
+                # rejected is pure latency — and the dashboard's on-demand poll
+                # has a 2s budget.
+                logger.debug("event=subscription_handoff_abandoned reason=foreign_account")
+                return None
         return None
+
+    def _published_snapshot_is_foreign(self, token: str | None) -> bool:
+        """A fresh published snapshot that belongs to a DIFFERENT account."""
+
+        try:
+            raw = json.loads(
+                _paths.subscription_snapshot_path(_account_key(token)).read_text(encoding="utf-8")
+            )
+            snapshot = SubscriptionSnapshot.from_dict(raw)
+        except (OSError, ValueError, TypeError):
+            return False
+        if not token or not snapshot.token_prefix or snapshot.token_prefix == token[:8]:
+            return False
+        age = (_utc_now() - snapshot.polled_at).total_seconds()
+        return 0 <= age <= self._poll_interval_s
 
     def _adopt_shared_snapshot(self, token: str | None) -> SubscriptionSnapshot | None:
         """The account snapshot another proxy published, if we may use it.

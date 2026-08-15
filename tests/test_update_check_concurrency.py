@@ -141,3 +141,63 @@ class TestConcurrentWritersDoNotCorruptTheCache:
         cached = json.loads(update_check._cache_path().read_text())
         assert cached["latest_version"] == "1.2.3"
         assert len(list(marker.iterdir())) == 1, "both processes hit the network"
+
+
+class TestAFailedProbeBacksOffToo:
+    """A failed fetch published nothing, so every peer queued behind the lock
+    re-ran `should_check()`, still saw a stale cache, and made its own request
+    — one PyPI request per launch during exactly the outage when repeating
+    them is least useful (round 25, P2)."""
+
+    def test_a_failure_stamps_the_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(update_check, "fetch_latest_version", lambda **_k: None)
+
+        assert update_check.run_check() is None
+
+        cached = json.loads(update_check._cache_path().read_text())
+        assert isinstance(cached["last_check"], (int, float))
+        assert cached["last_failure"] == cached["last_check"]
+
+    def test_a_peer_reuses_the_failed_attempt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The point: the second launch must not retry immediately."""
+        monkeypatch.setattr(update_check, "fetch_latest_version", lambda **_k: None)
+        update_check.run_check()
+        calls: list[int] = []
+
+        def counted(**_k: Any) -> str | None:
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(update_check, "fetch_latest_version", counted)
+        update_check.run_check()
+
+        assert calls == [], "a peer retried through the outage"
+
+    def test_the_backoff_is_short_not_a_whole_day(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A transient failure must not be cached as if it were an answer."""
+        monkeypatch.setattr(update_check, "fetch_latest_version", lambda **_k: None)
+        update_check.run_check()
+        aged = time.time() + update_check._FAILED_CHECK_TTL_SECONDS + 1
+
+        assert update_check._FAILED_CHECK_TTL_SECONDS < update_check._CHECK_TTL_SECONDS
+        assert update_check.should_check(now=aged) is True
+
+    def test_a_failure_never_erases_a_known_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        update_check.write_cache("1.2.3")
+        monkeypatch.setattr(update_check, "fetch_latest_version", lambda **_k: None)
+
+        update_check.run_check(now=time.time())
+
+        assert json.loads(update_check._cache_path().read_text())["latest_version"] == "1.2.3"
+
+    def test_a_success_does_not_set_the_failure_stamp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise every successful check would back off on the short TTL."""
+        monkeypatch.setattr(update_check, "fetch_latest_version", lambda **_k: "1.2.3")
+
+        update_check.run_check()
+
+        cached = json.loads(update_check._cache_path().read_text())
+        assert "last_failure" not in cached
+        assert update_check.should_check(now=cached["last_check"] + 1000) is False

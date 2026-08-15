@@ -133,9 +133,10 @@ a lost update. The account snapshot is only adopted when its recorded
 accounts never read each other's quota out of it. A proxy that loses the
 election waits for the winner's snapshot rather than issuing its own request,
 falling back to polling only if nothing is published. Both files are keyed by
-account (`<account>` is an opaque digest of the OAuth token, never the token
-itself), so proxies on unrelated accounts neither block nor overwrite each
-other — otherwise a cold start,
+account (`<account>` is an opaque digest of the credentials file's refresh
+token — never a token itself, and stable across access-token rotation so one
+account keeps one election), so proxies on unrelated accounts neither block nor
+overwrite each other — otherwise a cold start,
 where every proxy finds the snapshot empty at the same moment, would make the
 election decide nothing.
 

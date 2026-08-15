@@ -171,3 +171,82 @@ class TestWritesAreSerialized:
             omp._inject_locked = real  # type: ignore[assignment]
 
         assert observed == [False]
+
+
+class TestHandoverRequiresALiveProxy:
+    """A peer's wrapper stays blocked on its omp child long after a detached
+    proxy dies. Handing `models.yml` back on wrapper liveness alone rewrites a
+    machine-global file to a dead port, breaking omp for everyone until that
+    wrapper finally exits (round 25, P2)."""
+
+    @staticmethod
+    def _live_peer(port: int, proxy_pid: int | None = 4242) -> dict:
+        from headroom._subprocess import proc_identity
+
+        ident = proc_identity(os.getppid())
+        return {
+            "pid": os.getppid(),
+            "proxy_pid": proxy_pid,
+            "port": port,
+            "project": "peer",
+            "start_src": ident[0] if ident else None,
+            "start_time": ident[1] if ident else None,
+        }
+
+    def _hold_with_peer(self, peer: dict) -> None:
+        _pre_wrap_file()
+        omp.hold_models_override(8788, "proj", 1111)
+        owners = json.loads(omp.owners_path(omp.models_yml_path()).read_text())
+        omp.owners_path(omp.models_yml_path()).write_text(json.dumps([peer, *owners]))
+
+    def test_a_peer_whose_proxy_died_is_not_handed_the_override(self) -> None:
+        original = omp.models_yml_path()
+        self._hold_with_peer(self._live_peer(8790))
+        pre_wrap = omp.backup_path(original).read_text()
+
+        status = omp.release_models_override(proxy_probe=lambda _port, _pid: False)
+
+        assert status == "restored"
+        assert original.read_text() == pre_wrap
+
+    def test_a_peer_with_a_live_proxy_still_gets_it(self) -> None:
+        self._hold_with_peer(self._live_peer(8790))
+
+        assert omp.release_models_override(proxy_probe=lambda _port, _pid: True) == "handover"
+        assert "127.0.0.1:8790" in _base_url()
+
+    def test_the_probe_is_asked_about_the_peers_port_and_proxy(self) -> None:
+        seen: list[tuple[int, int | None]] = []
+        self._hold_with_peer(self._live_peer(8790, proxy_pid=777))
+
+        omp.release_models_override(
+            proxy_probe=lambda port, pid: seen.append((port, pid)) or True  # type: ignore[func-returns-value]
+        )
+
+        assert seen == [(8790, 777)], "the probe must target the PEER's listener"
+
+    def test_without_a_probe_the_wrapper_check_still_stands(self) -> None:
+        """Callers with no way to probe keep the previous behaviour."""
+        self._hold_with_peer(self._live_peer(8790))
+
+        assert omp.release_models_override() == "handover"
+
+    def test_the_holder_records_its_own_proxy_identity(self) -> None:
+        _pre_wrap_file()
+
+        omp.hold_models_override(8788, "proj", 9999)
+
+        owners = json.loads(omp.owners_path(omp.models_yml_path()).read_text())
+        assert owners[-1]["proxy_pid"] == 9999
+        assert owners[-1]["pid"] == os.getpid() != 9999
+
+    def test_the_launcher_passes_a_real_probe(self) -> None:
+        """The wiring, not a reimplementation of it: `wrap omp` must hand the
+        release a probe rather than relying on wrapper liveness."""
+        import inspect
+
+        from headroom.cli import wrap as wrap_mod
+
+        source = inspect.getsource(wrap_mod.omp.callback)
+        assert "_release_omp_models_override(_omp_proxy_still_serving)" in source
+        assert "_wrap_proxy_alive(" in source

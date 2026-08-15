@@ -42,6 +42,14 @@ _CHECK_TTL_SECONDS = 86_400
 # case is that the waiter outlasts the winner's request and reuses its result.
 _REFRESH_LOCK_TIMEOUT_S = 6.0
 
+# Back-off after a FAILED probe. A failure publishes a timestamp too, so the
+# peers queued behind the lock reuse the attempt instead of each re-running
+# `should_check()`, still seeing a stale cache, and hitting PyPI again — a
+# fan-out would otherwise make one request per launch during exactly the
+# outage when repeating them is least useful. Much shorter than the success
+# TTL, since a transient failure should not cost a whole day of staleness.
+_FAILED_CHECK_TTL_SECONDS = 900
+
 _OFF_VALUES = frozenset(("off", "false", "0", "no", "disable", "disabled"))
 _TRUE_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
 
@@ -139,17 +147,29 @@ def read_cache() -> dict[str, Any] | None:
         return None
 
 
-def write_cache(latest_version: str, *, now: float | None = None) -> None:
-    """Persist the latest-known version + check timestamp. Never raises."""
+def write_cache(latest_version: str | None, *, now: float | None = None) -> None:
+    """Persist the latest-known version + check timestamp. Never raises.
+
+    ``latest_version=None`` records a FAILED attempt: the timestamp is written
+    so peers back off, and any previously known version is carried forward so a
+    failure never erases a good answer.
+    """
     try:
         # Must match _cache_path()'s root, which is the shared workspace.
         from headroom.paths import ensure_shared_workspace_dir
 
         ensure_shared_workspace_dir()
-        payload = {
-            "last_check": now if now is not None else time.time(),
-            "latest_version": latest_version,
-        }
+        stamp = now if now is not None else time.time()
+        if latest_version is None:
+            previous = read_cache() or {}
+            known = previous.get("latest_version")
+            payload = {
+                "last_check": stamp,
+                "latest_version": known if isinstance(known, str) else None,
+                "last_failure": stamp,
+            }
+        else:
+            payload = {"last_check": stamp, "latest_version": latest_version}
         path = _cache_path()
         # Unique per writer. A single shared `.json.tmp` lets concurrent
         # refreshes scribble over each other's partial writes and can make one
@@ -230,7 +250,12 @@ def should_check(now: float | None = None) -> bool:
     if not isinstance(last, (int, float)):
         return True
     now = now if now is not None else time.time()
-    return (now - last) >= _CHECK_TTL_SECONDS
+    # A failed attempt backs off for a short window rather than a whole day:
+    # long enough that a fan-out of launches does not each retry through an
+    # outage, short enough that a transient failure is not cached as if it
+    # were an answer.
+    ttl = _FAILED_CHECK_TTL_SECONDS if cache.get("last_failure") == last else _CHECK_TTL_SECONDS
+    return (now - last) >= ttl
 
 
 def run_check(*, allow_pre: bool = False, now: float | None = None) -> str | None:
@@ -263,8 +288,10 @@ def run_check(*, allow_pre: bool = False, now: float | None = None) -> str | Non
             latest_cached = cached.get("latest_version")
             return latest_cached if isinstance(latest_cached, str) else None
         latest = fetch_latest_version(allow_pre=allow_pre)
-        if latest:
-            write_cache(latest, now=now)
+        # Record the FAILURE too, before releasing the lock. Otherwise every
+        # peer queued behind us re-runs `should_check()`, still sees a stale
+        # cache, and makes its own request.
+        write_cache(latest, now=now)
         return latest
 
 

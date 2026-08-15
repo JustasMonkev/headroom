@@ -80,6 +80,32 @@ def read_cached_oauth_token() -> str | None:
     return token
 
 
+def stable_account_identity() -> str | None:
+    """A token-rotation-stable identifier for the logged-in account, if any.
+
+    The access token is NOT one: it rotates, and a session holding the older
+    one would key its coordination files differently from a session holding the
+    newer one — same quota, separate elections, and the request fan-out the
+    coordination exists to prevent comes back (plus a new pair of files left
+    behind on every rotation).
+
+    The refresh token in the credentials file outlives those rotations and
+    identifies the account this machine is logged in as. ``CLAUDE_CONFIG_DIR``
+    already separates genuinely different accounts into different files, so
+    different accounts still get different identities.
+
+    None when there is no readable credentials file — the caller then falls
+    back to the token it has, which is less stable but never wrong.
+    """
+
+    creds = _load_credentials_file()
+    if not creds:
+        return None
+    oauth = creds.get("claudeAiOauth") or {}
+    refresh = oauth.get("refreshToken")
+    return refresh.strip() if isinstance(refresh, str) and refresh.strip() else None
+
+
 class SubscriptionClient:
     """Thin async wrapper around the Anthropic OAuth usage endpoint."""
 

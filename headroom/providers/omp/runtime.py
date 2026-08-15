@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from headroom import _filelock
@@ -79,12 +79,34 @@ def _read_owners(models_file: Path) -> list[dict]:
     return [o for o in raw if isinstance(o, dict) and isinstance(o.get("pid"), int)]
 
 
-def _owner_is_live(owner: dict) -> bool:
-    """Alive AND not a recycled PID now belonging to something else."""
+ProxyProbe = Callable[[int, "int | None"], bool]
+
+
+def _owner_is_live(owner: dict, proxy_probe: ProxyProbe | None = None) -> bool:
+    """Whether ``owner`` can still serve the override we would hand it.
+
+    The wrapper being alive is NOT enough. `models.yml` names a PORT, and the
+    proxy behind it is a detached process that can die while its wrapper (and
+    the omp child it is blocked on) keep running — handing the override to that
+    session rewrites the machine-global file to a dead port and breaks omp for
+    everyone until the wrapper finally exits.
+
+    ``proxy_probe(port, proxy_pid)`` answers "is that listener still ours?".
+    Without one the wrapper check stands alone, which is the pre-existing
+    behaviour and still correct for callers that have no way to probe.
+    """
     pid = owner.get("pid")
     if not isinstance(pid, int) or not pid_alive(pid):
         return False
-    return not identity_mismatch(owner.get("start_src"), owner.get("start_time"), pid)
+    if identity_mismatch(owner.get("start_src"), owner.get("start_time"), pid):
+        return False
+    if proxy_probe is None:
+        return True
+    port = owner.get("port")
+    if not isinstance(port, int):
+        return False
+    proxy_pid = owner.get("proxy_pid")
+    return proxy_probe(port, proxy_pid if isinstance(proxy_pid, int) else None)
 
 
 def _write_owners(models_file: Path, owners: list[dict]) -> None:
@@ -98,11 +120,15 @@ def _write_owners(models_file: Path, owners: list[dict]) -> None:
     os.replace(tmp, path)
 
 
-def _self_owner(port: int, project: str | None) -> dict:
+def _self_owner(port: int, project: str | None, proxy_pid: int | None = None) -> dict:
     ident = proc_identity(os.getpid())
     return {
         "pid": os.getpid(),
         "port": port,
+        # Identity of the process LISTENING on `port` — a different process
+        # from `pid`, and the one that actually has to be alive for a handover
+        # to this owner to mean anything.
+        "proxy_pid": proxy_pid,
         "project": project,
         "start_src": ident[0] if ident else None,
         "start_time": ident[1] if ident else None,
@@ -201,7 +227,9 @@ def _inject_locked(port: int, project: str | None = None) -> tuple[Path, str]:
     return models_file, base_url
 
 
-def hold_models_override(port: int, project: str | None = None) -> tuple[Path, str]:
+def hold_models_override(
+    port: int, project: str | None = None, proxy_pid: int | None = None
+) -> tuple[Path, str]:
     """Inject the override AND register this session as an owner.
 
     For runs whose port is ephemeral (an isolated run's dedicated proxy). Pair
@@ -213,11 +241,11 @@ def hold_models_override(port: int, project: str | None = None) -> tuple[Path, s
     with _filelock.exclusive(_filelock.lock_path_for(models_file)):
         result = _inject_locked(port, project)
         owners = [o for o in _read_owners(models_file) if o.get("pid") != os.getpid()]
-        _write_owners(models_file, [*owners, _self_owner(port, project)])
+        _write_owners(models_file, [*owners, _self_owner(port, project, proxy_pid)])
     return result
 
 
-def release_models_override() -> str:
+def release_models_override(proxy_probe: ProxyProbe | None = None) -> str:
     """Drop this session's hold, handing the override to a live peer if any.
 
     Returns ``"handover"`` when another live wrap session's port was written
@@ -231,7 +259,7 @@ def release_models_override() -> str:
         survivors = [
             o
             for o in _read_owners(models_file)
-            if o.get("pid") != os.getpid() and _owner_is_live(o)
+            if o.get("pid") != os.getpid() and _owner_is_live(o, proxy_probe)
         ]
         _write_owners(models_file, survivors)
         if survivors:
