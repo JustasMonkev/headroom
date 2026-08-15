@@ -165,19 +165,28 @@ def _get_persist_path() -> Path:
 
 
 def _account_key(token: str | None) -> str:
-    """Opaque, rotation-stable key for the shared coordination files.
+    """Opaque key grouping the shared coordination files by account.
 
-    Derived from the credentials file's refresh token when one is readable,
-    NOT from the access token: access tokens rotate, and two sessions holding
-    different vintages of the same account's token would otherwise elect
-    separately, poll separately, and leave a new pair of files behind on every
-    rotation — undoing the coordination for the account that has it.
+    Derived from the credentials file's refresh token when the token we hold IS
+    that file's access token. The refresh token outlives access-token
+    rotations, so a session that has caught up to the current access token
+    keeps the same key across them — where hashing the access token directly
+    would start a fresh election and leave a new pair of files behind on every
+    rotation.
 
-    Falls back to the access token when there is no credentials file (an
-    explicitly configured `CLAUDE_CODE_OAUTH_TOKEN`, say). That is less stable
-    but never wrong: `_adopt_shared_snapshot` validates `token_prefix`
-    independently, so correctness never rests on this key — only how well the
-    coordination groups.
+    The match is required, not assumed. An explicit `CLAUDE_CODE_OAUTH_TOKEN`
+    (or a token lifted from a live request) may belong to a DIFFERENT account
+    than the file, and `read_cached_oauth_token` resolves it first — claiming
+    the file's identity for it would put two accounts on one lock and one
+    snapshot, each rejecting the other's publications.
+
+    The cost of requiring the match is that a session still holding a
+    pre-rotation token keys separately until it catches up. That is transient —
+    `notify_active` replaces `_current_token` on the next OAuth request through
+    this proxy — whereas mis-grouping two accounts persists for as long as both
+    run. Both failure modes are efficiency only: `_adopt_shared_snapshot`
+    validates `token_prefix` independently, so no key can make one account
+    report another's quota.
 
     A digest either way: these names sit in a shared directory, and a filename
     is the wrong place for credential material. ``""`` when there is nothing to
@@ -188,7 +197,7 @@ def _account_key(token: str | None) -> str:
     from headroom.subscription.client import stable_account_identity
 
     try:
-        identity = stable_account_identity()
+        identity = stable_account_identity(token)
     except Exception:  # never let key derivation break a poll
         identity = None
     material = identity or token

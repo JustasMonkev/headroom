@@ -359,6 +359,39 @@ def test_health_leaves_an_absolute_database_alone(monkeypatch, tmp_path):
     assert payload["config"]["memory_db_path"] == str(db)
 
 
+def test_health_reports_the_server_instance_from_the_environment(monkeypatch):
+    """Workers inherit this from the launcher, so every worker reports the same
+    value — unlike `pid`, which is the answering worker's. `headroom wrap`
+    compares against it to recognise the proxy it just started, and with
+    HEADROOM_WORKERS>1 a pid comparison cannot succeed at all.
+    """
+    monkeypatch.setenv("HEADROOM_SERVER_INSTANCE", "srv-abc123")
+    app, _proxy = _health_app(monkeypatch)
+
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    assert payload["config"]["server_instance"] == "srv-abc123"
+
+
+def test_health_server_instance_is_empty_when_unset(monkeypatch):
+    """A proxy nobody launched through wrap reports no instance, which callers
+    must read as inconclusive rather than as a mismatch."""
+    monkeypatch.delenv("HEADROOM_SERVER_INSTANCE", raising=False)
+    app, _proxy = _health_app(monkeypatch)
+
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    assert payload["config"]["server_instance"] == ""
+
+
 def test_health_memory_db_path_is_present_even_when_unset(monkeypatch):
     """The key must always exist, so a caller can tell "this proxy does not
     report it" (older build) from "it reports no path"."""

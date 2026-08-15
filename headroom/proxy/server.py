@@ -2963,6 +2963,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # actually using and hot-sync it via /admin/runtime-env.
                 "runtime_env": runtime_env.effective_runtime_env(),
                 "pid": os.getpid(),
+                # Identity of this SERVER, not this process. Workers inherit it
+                # from the launcher's environment, so every worker reports the
+                # same value — a `wrap` that started us can recognise its own
+                # proxy even under HEADROOM_WORKERS>1, where `pid` is a worker's
+                # and the launcher only knows the uvicorn parent's.
+                "server_instance": os.environ.get("HEADROOM_SERVER_INSTANCE", ""),
             }
         return payload
 

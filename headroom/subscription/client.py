@@ -80,7 +80,7 @@ def read_cached_oauth_token() -> str | None:
     return token
 
 
-def stable_account_identity() -> str | None:
+def stable_account_identity(token: str | None = None) -> str | None:
     """A token-rotation-stable identifier for the logged-in account, if any.
 
     The access token is NOT one: it rotates, and a session holding the older
@@ -102,6 +102,16 @@ def stable_account_identity() -> str | None:
     if not creds:
         return None
     oauth = creds.get("claudeAiOauth") or {}
+    if token:
+        # An EXPLICIT token (CLAUDE_CODE_OAUTH_TOKEN, or one lifted from a live
+        # request) may belong to a different account than the file — the
+        # resolution order in `read_cached_oauth_token` puts it first. Claiming
+        # the file's identity for it would make two accounts share one lock and
+        # one snapshot, each rejecting the other's publications: the
+        # cross-account contention per-account keying exists to remove.
+        access = oauth.get("accessToken")
+        if not isinstance(access, str) or access.strip() != token.strip():
+            return None
     refresh = oauth.get("refreshToken")
     return refresh.strip() if isinstance(refresh, str) and refresh.strip() else None
 

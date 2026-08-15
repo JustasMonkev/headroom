@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -629,6 +630,46 @@ class _DedicatedProxyPortRaceLost(Exception):
         self.port = port
 
 
+_SERVER_INSTANCE_ENV = "HEADROOM_SERVER_INSTANCE"
+
+
+def _proxy_reported_instance(port: int) -> str | None:
+    """The server-instance id the proxy on ``port`` reports, if it reports one.
+
+    Stable across uvicorn workers (they inherit it), unlike the reporting
+    worker's PID. None means "could not determine" — an older proxy, or one we
+    did not start — which callers must treat as inconclusive.
+    """
+
+    config = _query_proxy_config(port)
+    if not isinstance(config, dict):
+        return None
+    value = config.get("server_instance")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _listener_is_our_launch(port: int, instance_id: str, child_pid: int) -> bool | None:
+    """Whether the healthy listener on ``port`` is the server we just spawned.
+
+    Returns None while /health has not answered yet — never False, since a
+    not-yet-ready proxy is not a lost race.
+
+    Prefers the instance id we put in its environment: it is the same for every
+    worker, whereas the reported PID is a worker's and ours is the parent's, so
+    a PID comparison fails outright under HEADROOM_WORKERS>1. Falls back to the
+    PID for a proxy old enough not to report an instance, which is exactly the
+    single-worker case where the two agree.
+    """
+
+    reported_instance = _proxy_reported_instance(port)
+    if reported_instance is not None:
+        return reported_instance == instance_id
+    owner_pid = _proxy_reported_pid(port)
+    if owner_pid is None:
+        return None
+    return owner_pid == child_pid
+
+
 def _proxy_reported_pid(port: int) -> int | None:
     """Return the PID the proxy on ``port`` reports via /health, else None.
 
@@ -726,6 +767,14 @@ def _start_proxy(
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    # A launcher-known identity for the server we are about to start, shared by
+    # every uvicorn worker through the inherited environment. `proc.pid` cannot
+    # serve as one: with HEADROOM_WORKERS>1 it is the uvicorn PARENT while
+    # /health answers from whichever worker took the request, so a pid
+    # comparison declares our own healthy proxy foreign and the launch retries
+    # itself to death.
+    instance_id = uuid.uuid4().hex
+    proxy_env[_SERVER_INSTANCE_ENV] = instance_id
     # Vertex AI RST_STREAMs HTTP/2 connections (error_code:2). Force HTTP/1.1
     # when wrapping a Vertex-mode client so upstream requests succeed.
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
@@ -826,17 +875,17 @@ def _start_proxy(
                 # and be the one now healthy here. Confirm the listener is OUR
                 # child (its /health PID matches) before trusting it; otherwise
                 # retry on a fresh port so we never route through another run.
-                owner_pid = _proxy_reported_pid(port)
-                if owner_pid is not None and owner_pid == proc.pid:
+                owned = _listener_is_our_launch(port, instance_id, proc.pid)
+                if owned is True:
                     click.echo(f"  Logs: {log_path}")
                     return proc
-                if owner_pid is not None and owner_pid != proc.pid:
+                if owned is False:
                     if not child_exited:
                         proc.kill()
                     raise _DedicatedProxyPortRaceLost(port)
-                # owner_pid is None: PID not yet reported. If our child is gone,
-                # something else owns the port (race lost); otherwise /health
-                # just isn't ready — keep waiting.
+                # Inconclusive: /health has not answered yet. If our child is
+                # gone, something else owns the port (race lost); otherwise
+                # keep waiting.
                 if child_exited:
                     raise _DedicatedProxyPortRaceLost(port)
                 continue
@@ -1458,6 +1507,7 @@ def _write_wrap_marker(
     previous: str | None,
     url: str | None = None,
     proxy_pid: int | None = None,
+    proxy_instance: str | None = None,
 ) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1491,6 +1541,11 @@ def _write_wrap_marker(
             # None when it cannot be determined; readers treat that as
             # inconclusive rather than as proof of anything.
             "proxy_pid": proxy_pid,
+            # Preferred over `proxy_pid` on the way back out: with
+            # HEADROOM_WORKERS>1 the reporting worker differs between requests,
+            # so a pid recorded now would not match a pid read later even from
+            # the same server.
+            "proxy_instance": proxy_instance,
         }
         # Push onto the live owner stack rather than replacing it. The whole
         # read-append-write cycle is serialized so a concurrent push cannot
@@ -1599,6 +1654,12 @@ def _listener_is_recorded_proxy(port: int, owner: dict[str, Any] | None) -> bool
     # The PROXY's pid, never the wrapper's: the proxy is a separate (detached)
     # process, so comparing /health against `owner["pid"]` could not match even
     # for our own live proxy.
+    recorded_instance = owner.get("proxy_instance")
+    if isinstance(recorded_instance, str) and recorded_instance:
+        reported_instance = _proxy_reported_instance(port)
+        if reported_instance is None:
+            return True
+        return reported_instance == recorded_instance
     recorded_proxy = owner.get("proxy_pid")
     if not isinstance(recorded_proxy, int):
         return True  # legacy marker, or a proxy that never reported one
@@ -2022,6 +2083,7 @@ def _write_claude_wrap_base_url(
     settings_path: Path | None = None,
     port: int | None = None,
     proxy_pid: int | None = None,
+    proxy_instance: str | None = None,
 ) -> str | None:
     """Persist proxy URL into project-local settings env key for daemon child inheritance.
 
@@ -2051,6 +2113,7 @@ def _write_claude_wrap_base_url(
             vertex_mode=vertex_mode,
             port=port,
             proxy_pid=proxy_pid,
+            proxy_instance=proxy_instance,
         )
 
 
@@ -2062,6 +2125,7 @@ def _write_claude_wrap_base_url_locked(
     vertex_mode: bool = False,
     port: int | None = None,
     proxy_pid: int | None = None,
+    proxy_instance: str | None = None,
 ) -> str | None:
     payload: dict[str, Any] = {}
     if path.exists():
@@ -2111,7 +2175,13 @@ def _write_claude_wrap_base_url_locked(
         # (Foundry appends /anthropic), which is exactly what a handover must
         # restore for a surviving owner.
         _write_wrap_marker(
-            path, port=port, key=key, previous=previous, url=proxy_url, proxy_pid=proxy_pid
+            path,
+            port=port,
+            key=key,
+            previous=previous,
+            url=proxy_url,
+            proxy_pid=proxy_pid,
+            proxy_instance=proxy_instance,
         )
     return previous
 
@@ -6479,6 +6549,7 @@ def claude(
             # from our own Popen because `--no-proxy` attaches to a proxy this
             # wrapper did not start.
             proxy_pid=_proxy_reported_pid(actual_port),
+            proxy_instance=_proxy_reported_instance(actual_port),
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)

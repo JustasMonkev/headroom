@@ -492,40 +492,64 @@ class TestCoordinationIsScopedToOneAccount:
         ).exists()
 
 
-class TestTheKeySurvivesTokenRotation:
-    """Hashing the raw access token split one account across rotations: two
-    sessions holding different vintages of the same account's token elected
-    separately, polled separately, and left a new pair of files behind on every
-    rotation (round 25, P2)."""
+class TestTheKeyGroupsByAccount:
+    """Hashing the raw access token split one account across rotations; keying
+    unconditionally by the credentials file instead would merge two accounts
+    that share a machine. The key follows the file only when the token we hold
+    IS the file's (rounds 25 and 26, P2)."""
 
-    def _credentials(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access: str) -> None:
+    def _credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access: str, refresh: str = "stable"
+    ) -> None:
         home = tmp_path / "claude"
         home.mkdir(parents=True, exist_ok=True)
         (home / ".credentials.json").write_text(
-            json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": "stable-refresh"}})
+            json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh}})
         )
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
 
-    def test_two_token_vintages_share_one_key(
+    def test_sessions_on_the_current_token_share_one_key(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        """The coordination that matters: every session that has caught up to
+        the file's access token elects together."""
         self._credentials(tmp_path, monkeypatch, "access-v2")
 
-        assert tracker_mod._account_key("access-v1") == tracker_mod._account_key("access-v2")
+        # The key follows the REFRESH token, so it survives the next rotation
+        # once sessions converge on the new access token.
+        before = tracker_mod._account_key("access-v2")
+        self._credentials(tmp_path, monkeypatch, "access-v3")
+        assert tracker_mod._account_key("access-v3") == before
 
-    def test_a_different_account_still_gets_a_different_key(
+    def test_another_accounts_explicit_token_is_not_given_our_identity(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        self._credentials(tmp_path, monkeypatch, "access-v2")
-        mine = tracker_mod._account_key("access-v2")
-        other = tmp_path / "other"
-        other.mkdir()
-        (other / ".credentials.json").write_text(
-            json.dumps({"claudeAiOauth": {"refreshToken": "someone-else"}})
+        """`CLAUDE_CODE_OAUTH_TOKEN` for account B must not land on account A's
+        lock and snapshot just because A owns the credentials file."""
+        self._credentials(tmp_path, monkeypatch, "account-a-token")
+
+        assert tracker_mod._account_key("account-b-token") != tracker_mod._account_key(
+            "account-a-token"
         )
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
 
-        assert tracker_mod._account_key("access-v2") != mine
+    def test_a_stale_pre_rotation_token_keys_separately(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The accepted cost of requiring the match. Transient: `notify_active`
+        replaces the token on the next request through this proxy, after which
+        the session rejoins the account's election."""
+        self._credentials(tmp_path, monkeypatch, "access-v2")
+
+        assert tracker_mod._account_key("access-v1") != tracker_mod._account_key("access-v2")
+
+    def test_a_different_credentials_file_is_a_different_account(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._credentials(tmp_path, monkeypatch, "shared-access", refresh="mine")
+        mine = tracker_mod._account_key("shared-access")
+        self._credentials(tmp_path, monkeypatch, "shared-access", refresh="someone-else")
+
+        assert tracker_mod._account_key("shared-access") != mine
 
     def test_no_credentials_file_falls_back_to_the_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -538,7 +562,7 @@ class TestTheKeySurvivesTokenRotation:
     def test_the_key_never_contains_credential_material(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        self._credentials(tmp_path, monkeypatch, "access-v2")
+        self._credentials(tmp_path, monkeypatch, "access-v2", refresh="stable-refresh")
 
         key = tracker_mod._account_key("access-v2")
 

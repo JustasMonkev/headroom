@@ -3289,3 +3289,81 @@ class TestProxyIdentityComparesTheProxyNotTheWrapper:
 
         source = inspect.getsource(wrap_mod.claude.callback)
         assert "proxy_pid=_proxy_reported_pid(actual_port)" in source
+
+
+class TestOwnershipSurvivesMultipleWorkers:
+    """`proc.pid` is uvicorn's PARENT; /health answers `os.getpid()` from
+    whichever worker took the request. With HEADROOM_WORKERS>1 those never
+    match, so the launcher declared its own healthy proxy foreign, killed it,
+    and retried until every isolated wrap failed to start (round 26, P2)."""
+
+    def test_a_worker_reporting_its_own_pid_is_still_our_launch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_instance", lambda _p: "abc123")
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 777)  # a worker
+
+        assert wrap_mod._listener_is_our_launch(8788, "abc123", 4242) is True
+
+    def test_a_different_server_is_still_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The race detection the check exists for must survive the fix."""
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_instance", lambda _p: "someone-else")
+
+        assert wrap_mod._listener_is_our_launch(8788, "abc123", 4242) is False
+
+    def test_an_older_proxy_falls_back_to_the_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_instance", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 4242)
+
+        assert wrap_mod._listener_is_our_launch(8788, "abc123", 4242) is True
+
+    def test_a_silent_health_endpoint_is_inconclusive_not_foreign(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A proxy still starting up must not read as a lost race."""
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_instance", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: None)
+
+        assert wrap_mod._listener_is_our_launch(8788, "abc123", 4242) is None
+
+    def test_the_launcher_exports_the_instance_to_the_proxy(self) -> None:
+        import inspect
+
+        source = inspect.getsource(wrap_mod._start_proxy)
+        assert "proxy_env[_SERVER_INSTANCE_ENV] = instance_id" in source
+        assert "_listener_is_our_launch(port, instance_id, proc.pid)" in source
+
+    def test_the_marker_prefers_the_instance_over_the_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same defect on the self-heal path: a marker holding one worker's pid
+        would not match the next worker to answer."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_instance", lambda _p: "srv-1")
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 999999)
+        owner = {
+            "pid": 111,
+            "proxy_pid": 222,  # a different worker than the one answering now
+            "proxy_instance": "srv-1",
+            "port": 8788,
+            "key": "ANTHROPIC_BASE_URL",
+        }
+
+        assert wrap_mod._wrap_proxy_alive(8788, owner=owner) is True
+
+    def test_a_marker_from_another_server_still_reads_as_dead(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_instance", lambda _p: "srv-2")
+        owner = {
+            "pid": 111,
+            "proxy_pid": 222,
+            "proxy_instance": "srv-1",
+            "port": 8788,
+            "key": "ANTHROPIC_BASE_URL",
+        }
+
+        assert wrap_mod._wrap_proxy_alive(8788, owner=owner) is False
