@@ -573,12 +573,44 @@ def _dedicated_port_attempts(reserved_port: int, search_from: int) -> int:
     """Probe budget that can never hand back ``reserved_port`` itself.
 
     When searching below the reserved port, stop one short of it; the base
-    port belongs to the shared proxy even when momentarily free.
+    port belongs to the shared proxy even when momentarily free. Above it, the
+    budget is clamped to what actually exists — ``--port 65534`` leaves exactly
+    one candidate, and reporting a 100-wide range there would only make the
+    exhaustion message wrong.
     """
 
     if search_from < reserved_port:
         return max(1, reserved_port - search_from)
-    return 100
+    return max(1, min(_DEDICATED_PORT_WINDOW, _MAX_PORT - search_from + 1))
+
+
+def _find_dedicated_port(reserved_port: int, search_from: int) -> int:
+    """First free port for a dedicated proxy, preferring the window above.
+
+    The upward window can be too small to matter: ``--port 65534`` leaves a
+    single candidate, so one busy port exhausts it. Isolation is the DEFAULT,
+    so exhausting it must not fail a run the user never asked to isolate —
+    fall back to the window strictly BELOW the reserved port, which is what
+    `_dedicated_port_search_start` already does when there is no room above at
+    all. This covers the case where there is *almost* none.
+    """
+
+    helpers = _live_wrap_module()
+    try:
+        return int(
+            helpers._find_available_port(
+                search_from, max_attempts=_dedicated_port_attempts(reserved_port, search_from)
+            )
+        )
+    except RuntimeError:
+        below = max(1, reserved_port - _DEDICATED_PORT_WINDOW)
+        if search_from < reserved_port or below >= reserved_port:
+            raise  # already searching below, or there is no room below either
+        return int(
+            helpers._find_available_port(
+                below, max_attempts=_dedicated_port_attempts(reserved_port, below)
+            )
+        )
 
 
 class _DedicatedProxyPortRaceLost(Exception):
@@ -5058,9 +5090,7 @@ def _ensure_proxy(
         while True:
             try:
                 if dedicated_session_proxy:
-                    actual_port = helpers._find_available_port(
-                        search_from, max_attempts=_dedicated_port_attempts(port, search_from)
-                    )
+                    actual_port = _find_dedicated_port(port, search_from)
                 else:
                     actual_port = helpers._find_available_port(search_from)
             except OSError as e:

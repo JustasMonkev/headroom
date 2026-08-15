@@ -204,6 +204,72 @@ class TestOnlyOnePollerHitsTheAccountAPI:
         assert observed == [False], "the usage request ran outside the poll lock"
 
 
+class TestSnapshotsAreAccountScoped:
+    """The snapshot file is machine-global. Two proxies signed in to different
+    Claude accounts — or one user switching accounts mid-window — must not
+    adopt each other's quota. `token_prefix` is persisted for exactly this
+    multi-account detection and was going unread (round 21, P2)."""
+
+    def test_a_snapshot_from_another_account_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = paths.subscription_snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_snapshot(token_prefix="OTHERACC", age_s=5).to_dict()))
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)  # notify_active uses tok12345678
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 1, "the other account's quota must not be adopted"
+        adopted = tracker.latest_snapshot
+        assert adopted is not None
+        assert adopted.token_prefix == "tok12345"
+
+    def test_a_snapshot_from_this_account_is_still_adopted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate must not defeat the coordination it guards."""
+        path = paths.subscription_snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_snapshot(token_prefix="tok12345", age_s=5).to_dict()))
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 0
+
+    def test_a_snapshot_with_no_recorded_account_is_not_adopted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Written before the prefix existed: unknown account, so poll."""
+        path = paths.subscription_snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _snapshot(age_s=5).to_dict()
+        payload["token_prefix"] = ""
+        path.write_text(json.dumps(payload))
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 1
+
+    def test_the_published_snapshot_carries_the_account(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the contract — a publish with no prefix would
+        make every peer's account check fail forever."""
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+
+        _poll(tracker, monkeypatch)
+
+        published = json.loads(paths.subscription_snapshot_path().read_text())
+        assert published["token_prefix"] == "tok12345"
+
+
 class TestSnapshotRoundTrip:
     """`to_dict` renames `utilization` and publishes USD, so the API parser
     cannot read our own serialization back — hence the explicit `from_dict`."""

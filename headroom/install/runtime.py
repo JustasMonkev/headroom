@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from headroom._subprocess import pid_alive, run
+from headroom.isolation import shared_state_env
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind, SupervisorKind
@@ -49,6 +50,16 @@ PASSTHROUGH_ENV_PREFIXES = (
     "QDRANT_",
     "NEO4J_",
     "LANGSMITH_",
+)
+
+
+# Names the container pins for itself below. A bare `--env NAME` passthrough
+# reads the HOST value and Docker resolves duplicate `--env` last-wins, so
+# letting these through would override the container's own paths — with an
+# isolated wrap's run directory, that is a host path with no mount inside the
+# container and the container fails immediately.
+_CONTAINER_PINNED_ENV = frozenset(
+    {"HOME", "PYTHONUNBUFFERED", "HEADROOM_WORKSPACE_DIR", "HEADROOM_CONFIG_DIR"}
 )
 
 
@@ -143,14 +154,28 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     runtime_env = {**manifest.base_env, **_deployment_env(manifest)}
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])
-    for name in sorted(os.environ):
-        # Skip any name the manifest already pinned above: Docker resolves
-        # duplicate `--env` last-wins, so a bare `--env HEADROOM_BACKEND`
-        # passthrough (which reads the host process env at
+    # Pass through the environment as it would look WITHOUT this run's
+    # isolation: a container started from inside an isolated wrap is durable
+    # and belongs on the shared roots, not on an ephemeral run directory.
+    host_env = shared_state_env()
+    for name in sorted(host_env):
+        # Skip any name the manifest or the container already pinned above:
+        # Docker resolves duplicate `--env` last-wins, so a bare `--env
+        # HEADROOM_BACKEND` passthrough (which reads the host process env at
         # `start_persistent_docker` time) would silently override the manifest's
         # `--env HEADROOM_BACKEND=<value>`, diverging the container from its
         # deployment config.
-        if name.startswith(PASSTHROUGH_ENV_PREFIXES) and name not in runtime_env:
+        if not name.startswith(PASSTHROUGH_ENV_PREFIXES):
+            continue
+        if name in runtime_env or name in _CONTAINER_PINNED_ENV:
+            continue
+        if host_env[name] != os.environ.get(name):
+            # Sanitization changed this one, so the bare form (which reads the
+            # host value) would undo it. These are paths and flags, never
+            # secrets, so naming the value here does not put one on the
+            # command line.
+            command.extend(["--env", f"{name}={host_env[name]}"])
+        else:
             command.extend(["--env", name])
     # The image ENTRYPOINT already runs `headroom proxy` (see Dockerfile), so
     # the args appended after the image name are only the proxy flags — never
@@ -278,7 +303,15 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
     log_file_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_file_path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115
 
-    kwargs: dict[str, Any] = {"stdout": log_file, "stderr": log_file}
+    # A persistent deployment outlives the session that started it, so it must
+    # not inherit an isolated wrap's per-run workspace: nothing records this
+    # process as a run owner, and stale-run GC would delete the deployment's
+    # state out from under it seven quiet days later.
+    kwargs: dict[str, Any] = {
+        "stdout": log_file,
+        "stderr": log_file,
+        "env": shared_state_env(),
+    }
     if _is_windows():
         # DETACHED_PROCESS makes CREATE_NO_WINDOW a no-op (per Win32 docs), so a
         # detached console child pops up a visible window. Use CREATE_NO_WINDOW

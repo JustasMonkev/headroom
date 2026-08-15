@@ -33,6 +33,7 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +201,46 @@ def disable_isolation() -> None:
     isolated_db = str(Path(isolated_ws) / _MEMORY_DB_FILE)
     if os.environ.get(HEADROOM_MEMORY_DB_PATH_ENV) == isolated_db:
         os.environ.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
+
+
+def shared_state_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """An environment copy with this run's isolation undone.
+
+    For launching something DURABLE from inside an isolated wrap — a persistent
+    deployment's detached agent, or its Docker container. Those processes
+    outlive the wrap and are never recorded as run owners, so inheriting
+    ``HEADROOM_WORKSPACE_DIR`` would point a permanent deployment at an
+    ephemeral run directory that stale-run GC later deletes underneath it; in
+    the Docker case the inherited value also overrides the container's own
+    mounted workspace with a host path that does not exist inside it.
+
+    Unlike :func:`disable_isolation` this does NOT touch ``os.environ``: the
+    wrapper itself is still isolated and must stay that way. ``HEADROOM_ISOLATED``
+    is set to ``0`` rather than removed, since an unset value is re-defaulted to
+    isolated by the next CLI layer.
+
+    Only an actual activation is undone — a user who configured distinct
+    workspace and shared roots keeps both, same test as
+    :func:`disable_isolation`.
+    """
+
+    env = dict(os.environ if base is None else base)
+    env[HEADROOM_ISOLATED_ENV] = "0"
+    isolated_ws = env.pop(HEADROOM_ISOLATED_WORKSPACE_ENV, None)
+    if not isolated_ws:
+        return env
+
+    restore_to = (
+        env.get(HEADROOM_PREISOLATION_WORKSPACE_ENV, "").strip()
+        or env.get(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, "").strip()
+    )
+    if restore_to:
+        env[paths.HEADROOM_WORKSPACE_DIR_ENV] = restore_to
+    env.pop(HEADROOM_PREISOLATION_WORKSPACE_ENV, None)
+
+    if env.get(HEADROOM_MEMORY_DB_PATH_ENV) == str(Path(isolated_ws) / _MEMORY_DB_FILE):
+        env.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
+    return env
 
 
 def active_isolated_workspace() -> Path | None:
@@ -607,6 +648,7 @@ __all__ = [
     "prune_stale_runs",
     "persistent_memory_db_path",
     "align_memory_db_with_reused_proxy",
+    "shared_state_env",
     "record_run_owner",
     "record_run_proxy",
 ]

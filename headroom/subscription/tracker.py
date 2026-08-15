@@ -578,11 +578,20 @@ class SubscriptionTracker(QuotaTracker):
             with contextlib.suppress(OSError):
                 handle.close()
 
-    def _adopt_shared_snapshot(self) -> SubscriptionSnapshot | None:
-        """The account snapshot another proxy published, if it is still fresh.
+    def _adopt_shared_snapshot(self, token: str | None) -> SubscriptionSnapshot | None:
+        """The account snapshot another proxy published, if we may use it.
 
-        "Fresh" is one poll interval: adopting anything older would leave a
-        session reporting usage windows it should have refreshed by now.
+        Two gates, both necessary:
+
+        * Freshness — one poll interval. Adopting anything older would leave a
+          session reporting usage windows it should have refreshed by now.
+        * ACCOUNT — the published `token_prefix` must match the token we would
+          have polled with. The snapshot file is machine-global, so concurrent
+          proxies signed in to different Claude accounts (or one user switching
+          accounts mid-window) would otherwise report the other account's quota
+          and skip polling their own. `token_prefix` exists for exactly this
+          multi-account detection; a snapshot that predates it, or a poll with
+          no token to compare, is not adopted rather than assumed compatible.
         """
 
         try:
@@ -594,6 +603,9 @@ class SubscriptionTracker(QuotaTracker):
         try:
             snapshot = SubscriptionSnapshot.from_dict(raw)
         except (TypeError, ValueError):
+            return None
+        if not token or not snapshot.token_prefix or snapshot.token_prefix != token[:8]:
+            logger.debug("event=subscription_snapshot_rejected reason=account_mismatch")
             return None
         age = (_utc_now() - snapshot.polled_at).total_seconds()
         if age < 0 or age > self._poll_interval_s:
@@ -826,7 +838,7 @@ class SubscriptionTracker(QuotaTracker):
         # what the tracker's own rate-limit and token-flagging safeguards exist
         # to prevent. Elect one poller through a SHARED lock; everyone else
         # adopts what it published.
-        snapshot = self._adopt_shared_snapshot()
+        snapshot = self._adopt_shared_snapshot(token)
         if snapshot is None:
             with self._poll_ownership() as owns_poll:
                 if not owns_poll:

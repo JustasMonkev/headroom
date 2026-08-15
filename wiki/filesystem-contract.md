@@ -121,6 +121,15 @@ real `~/.headroom` while the workspace bucket above moves into the run dir.
 | Legacy models catalog (fallback) | `${SHARED_WORKSPACE_DIR}/models.json` | — |
 | Account usage snapshot | `${SHARED_WORKSPACE_DIR}/subscription_snapshot.json` | — |
 | Account poll lock | `${SHARED_WORKSPACE_DIR}/subscription_poll.lock` | — |
+| Dashboard settings lock | `${SHARED_WORKSPACE_DIR}/settings.json.lock` | — |
+
+Anything on the shared bucket is a multi-process path by definition, so a
+read-modify-write on one needs an interprocess lock, not just an atomic
+replace: `settings.json` saves take `settings.json.lock` across the whole
+load-merge-write cycle, since an atomic replace prevents a torn file but not
+a lost update. The account snapshot is only adopted when its recorded
+`token_prefix` matches the polling token, so two proxies on different Claude
+accounts never read each other's quota out of it.
 
 The subscription split follows the same rule as the savings baseline: the
 usage windows describe an **account**, so one proxy polls

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from headroom import paths
+from headroom import _filelock, paths
 
 logger = logging.getLogger(__name__)
 
@@ -875,10 +875,6 @@ def save(values: dict[str, Any]) -> None:
         if key not in clear_keys and key not in retained_keys
     }
     validated = validate(to_validate)
-    merged = {**load(), **validated}
-    for key in clear_keys:
-        merged.pop(key, None)
-    payload = json.dumps(merged, indent=2, sort_keys=True) + "\n"
     # Create the SETTINGS file's own parent, not the workspace root: the
     # settings path derives from the shared workspace (and can be relocated
     # outright by HEADROOM_SETTINGS_PATH), so those can be different
@@ -886,7 +882,18 @@ def save(values: dict[str, Any]) -> None:
     # which fails outright if that parent does not exist yet.
     settings_file = paths.settings_path()
     settings_file.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(settings_file, payload)
+    # Serialize the whole load-merge-write cycle, not just the write. This file
+    # lives on the SHARED root, so every concurrent isolated proxy's dashboard
+    # saves into the same one: two of them saving different fields can both
+    # read the same pre-image, merge only their own key, and the later write
+    # silently discards the other's. The atomic replace below prevents a
+    # partial file; it does nothing about a lost update.
+    with _filelock.exclusive(_filelock.lock_path_for(settings_file)):
+        merged = {**load(), **validated}
+        for key in clear_keys:
+            merged.pop(key, None)
+        payload = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+        _atomic_write_text(settings_file, payload)
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:

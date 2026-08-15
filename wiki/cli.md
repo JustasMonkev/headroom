@@ -874,6 +874,14 @@ The exemptions above also apply when a wrap is nested inside an
 already-isolated agent: `selfheal`, `openclaw` and `--prepare-only` return to
 shared state rather than inheriting the parent's run directory.
 
+The same applies to anything DURABLE an isolated agent starts. `headroom
+install apply` can be run from inside a wrap, and the runtime it launches —
+the detached agent, or the Docker container — outlives that wrap and is never
+recorded as a run owner. Both are handed a de-isolated environment, so a
+permanent deployment never lands on a run directory GC deletes after seven
+quiet days, and the container keeps its own mounted workspace instead of
+having it overridden by an inherited host path that does not exist inside it.
+
 With `--no-proxy` an isolated run deliberately attaches to the shared
 proxy; its client marker is registered in the shared workspace so the
 wrapper that owns that proxy still sees it and will not shut the proxy down

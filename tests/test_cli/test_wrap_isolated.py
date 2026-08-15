@@ -2828,8 +2828,7 @@ class TestLegacyOwnerHandoverRebuildsTheURL:
         owner = self._legacy(1234, 8788, "ANTHROPIC_BASE_URL")
 
         assert (
-            wrap_mod._owner_handover_url(owner, key="ANTHROPIC_BASE_URL")
-            == "http://127.0.0.1:8788"
+            wrap_mod._owner_handover_url(owner, key="ANTHROPIC_BASE_URL") == "http://127.0.0.1:8788"
         )
 
     def test_a_legacy_foundry_owner_keeps_the_anthropic_suffix(self) -> None:
@@ -2859,9 +2858,7 @@ class TestLegacyOwnerHandoverRebuildsTheURL:
         still live, and settings must end up on the PEER's port, not ours."""
         settings = tmp_path / "proj" / ".claude" / "settings.local.json"
         settings.parent.mkdir(parents=True)
-        settings.write_text(
-            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8789"}})
-        )
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8789"}}))
         marker = wrap_mod._wrap_marker_path(settings)
         peer = self._legacy(424242, 8788, "ANTHROPIC_BASE_URL")  # live, legacy: no "url"
         mine = {
@@ -3022,9 +3019,7 @@ class TestMemoryIsAlignedBeforeAnyMemorySetup:
 
         assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(theirs)
 
-    def test_alignment_is_idempotent(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
+    def test_alignment_is_idempotent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """It runs twice on every flow now (early, then from `_ensure_proxy`);
         the second call must not re-report or re-decide."""
         isolation.activate_isolated_workspace()
@@ -3108,3 +3103,84 @@ class TestIsolatedMCPRegistrationIsPortAgnostic:
         proxy_url = next(p for p in serve.params if p.name == "proxy_url")
 
         assert proxy_url.envvar == "HEADROOM_PROXY_URL"
+
+
+class TestHighPortFallsBackBelowTheReservedBase:
+    """`--port 65535` leaves no room above and already fell back below. The
+    gap was the *almost* no room case: `--port 65534` leaves exactly one
+    candidate, so a single busy port exhausted the upward window and failed the
+    launch outright — even though isolation was never explicitly requested and
+    plenty of ports below the base were free (round 21, P2)."""
+
+    def test_the_upward_budget_never_exceeds_the_port_space(self) -> None:
+        assert wrap_mod._dedicated_port_attempts(65534, 65535) == 1
+        assert wrap_mod._dedicated_port_attempts(8787, 8788) == 100
+
+    def test_an_exhausted_upward_window_continues_below(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        probed: list[int] = []
+
+        def busy_at_the_top(start: int, max_attempts: int = 100) -> int:
+            probed.append(start)
+            if start > 65534:
+                raise RuntimeError(f"No available port found in range {start}-65535")
+            return start
+
+        monkeypatch.setattr(wrap_mod, "_find_available_port", busy_at_the_top)
+
+        port = wrap_mod._find_dedicated_port(65534, 65535)
+
+        assert port == 65534 - wrap_mod._DEDICATED_PORT_WINDOW
+        assert probed == [65535, 65534 - wrap_mod._DEDICATED_PORT_WINDOW]
+
+    def test_the_lower_window_never_hands_back_the_reserved_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The base port belongs to the shared proxy even when free."""
+        budgets: list[tuple[int, int]] = []
+
+        def record(start: int, max_attempts: int = 100) -> int:
+            budgets.append((start, max_attempts))
+            if start > 65534:
+                raise RuntimeError("exhausted")
+            return start
+
+        monkeypatch.setattr(wrap_mod, "_find_available_port", record)
+        wrap_mod._find_dedicated_port(65534, 65535)
+
+        start, attempts = budgets[-1]
+        assert start + attempts == 65534, "the probe window must stop short of the base port"
+
+    def test_exhausting_the_lower_window_still_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Falling back is not the same as never failing."""
+
+        def always_busy(start: int, max_attempts: int = 100) -> int:
+            raise RuntimeError("exhausted")
+
+        monkeypatch.setattr(wrap_mod, "_find_available_port", always_busy)
+
+        with pytest.raises(RuntimeError):
+            wrap_mod._find_dedicated_port(65534, 65535)
+
+    def test_an_ordinary_port_does_not_go_looking_below(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        probed: list[int] = []
+
+        def first_free(start: int, max_attempts: int = 100) -> int:
+            probed.append(start)
+            return start
+
+        monkeypatch.setattr(wrap_mod, "_find_available_port", first_free)
+
+        assert wrap_mod._find_dedicated_port(8787, 8788) == 8788
+        assert probed == [8788]
+
+    def test_the_launch_path_delegates_to_the_fallback(self) -> None:
+        import inspect
+
+        source = inspect.getsource(wrap_mod._ensure_proxy)
+        assert "_find_dedicated_port(port, search_from)" in source
