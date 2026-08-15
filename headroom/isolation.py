@@ -314,29 +314,38 @@ def persistent_memory_db_path() -> Path:
     return paths.shared_workspace_dir() / _MEMORY_DB_FILE
 
 
-def restore_shared_memory_db() -> Path | None:
-    """Undo the per-run memory pin, returning the shared DB it restored to.
+def align_memory_db_with_reused_proxy(explicit: str | None = None) -> bool:
+    """Drop this run's isolated memory pin so it matches the proxy we reuse.
 
     For a run that attaches to a proxy it did not start (``--no-proxy``), the
     isolated database is actively harmful: wrap-side sync and the agent's
     memory MCP would read and mutate the run DB while the reused proxy serves
     API-side retrieval from its own, presenting two conflicting memory views
-    inside one session. Dropping the pin puts both back on the same store.
+    inside one session.
 
-    Only the path ISOLATION chose is dropped — a user-supplied
+    Substituting a path of our own does not fix that — the proxy's documented
+    default is ``{cwd}/.headroom/memory.db`` (project-local), not any workspace
+    root, so picking one would just invent a third store. So:
+
+    * ``explicit`` (a persistent manifest's recorded ``memory_db_path``) is
+      adopted when known — that is the reused proxy's *actual* database;
+    * otherwise the pin is REMOVED, letting every consumer fall back to the
+      same default the proxy itself resolved.
+
+    Only the path ISOLATION chose is touched; a user-supplied
     ``HEADROOM_MEMORY_DB_PATH`` is left alone, same test as
-    :func:`disable_isolation`. Returns None when there was nothing to undo.
+    :func:`disable_isolation`. Returns whether anything changed.
     """
 
     isolated_ws = active_isolated_workspace()
     if isolated_ws is None:
-        return None
+        return False
     if _trimmed_env(HEADROOM_MEMORY_DB_PATH_ENV) != str(isolated_ws / _MEMORY_DB_FILE):
-        return None
+        return False
     os.environ.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
-    shared = paths.shared_workspace_dir() / _MEMORY_DB_FILE
-    os.environ[HEADROOM_MEMORY_DB_PATH_ENV] = _abs(shared)
-    return shared
+    if explicit and explicit.strip():
+        os.environ[HEADROOM_MEMORY_DB_PATH_ENV] = _abs(Path(explicit.strip()).expanduser())
+    return True
 
 
 def record_run_owner(run_dir: Path) -> None:
@@ -507,7 +516,7 @@ __all__ = [
     "activate_isolated_workspace",
     "prune_stale_runs",
     "persistent_memory_db_path",
-    "restore_shared_memory_db",
+    "align_memory_db_with_reused_proxy",
     "record_run_owner",
     "record_run_proxy",
 ]

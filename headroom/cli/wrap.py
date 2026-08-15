@@ -4603,14 +4603,21 @@ def _ensure_proxy(
             # leaving this run pinned to an isolated one would give the session
             # two conflicting memory views: wrap-side sync and the agent's
             # memory MCP on the run DB, retrieval on the proxy's. Reconcile
-            # rather than warn about it.
+            # rather than warn about it. A persistent deployment records the
+            # database it was started with; otherwise drop the pin so every
+            # consumer falls back to the same default the proxy resolved
+            # ({cwd}/.headroom/memory.db) rather than a path we invented.
             from headroom import isolation as _isolation
 
-            restored = _isolation.restore_shared_memory_db()
-            if restored is not None:
+            _reused = helpers._find_persistent_manifest(port)
+            _manifest_db = getattr(_reused, "memory_db_path", None) if _reused else None
+            if _isolation.align_memory_db_with_reused_proxy(_manifest_db):
+                _now = os.environ.get(_isolation.HEADROOM_MEMORY_DB_PATH_ENV)
                 click.echo(
-                    f"  Memory follows the reused proxy: using the shared database "
-                    f"({restored}) instead of a per-run one."
+                    f"  Memory follows the reused proxy: {_now}"
+                    if _now
+                    else "  Memory follows the reused proxy: using its own default database "
+                    "instead of a per-run one."
                 )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
@@ -5518,6 +5525,20 @@ def _copy_openclaw_plugin_into_extensions(
 _WRAP_ISOLATION_EXEMPT_SUBCOMMANDS = frozenset({"selfheal", "openclaw"})
 
 
+def _leave_inherited_isolation() -> None:
+    """Return to shared state when isolation was inherited from a parent wrap.
+
+    A no-op at top level (nothing was activated). Used by the isolation-exempt
+    paths, where merely declining to activate would still leave a nested
+    invocation running on the parent's per-run workspace.
+    """
+
+    from headroom import isolation as _isolation
+
+    if _isolation.active_isolated_workspace() is not None:
+        _isolation.disable_isolation()
+
+
 def _wrapper_own_args(tokens: list[str]) -> list[str]:
     """Tokens belonging to Headroom itself, i.e. everything before ``--``.
 
@@ -5613,6 +5634,13 @@ def wrap(ctx: click.Context, isolated: bool) -> None:
     # spawn (proxy, wrapped agent, its MCP servers) inherits os.environ, so
     # a single env override here isolates the whole process tree.
     if ctx.invoked_subcommand in _WRAP_ISOLATION_EXEMPT_SUBCOMMANDS:
+        # Skipping activation is not enough when we are NESTED inside an
+        # already-isolated agent: the per-run workspace and its pins are
+        # already in os.environ, inherited. An exempt subcommand would hand
+        # that ephemeral run dir to whatever it starts (the OpenClaw gateway
+        # and its auto-started detached proxy), which is exactly what the
+        # exemption exists to prevent. Actively return to shared state.
+        _leave_inherited_isolation()
         return
     if _prepare_only_invocation(ctx):
         # `--prepare-only` is a machine-readable config-generation step: it
@@ -5620,7 +5648,10 @@ def wrap(ctx: click.Context, isolated: bool) -> None:
         # into `openclaw config set --strict-json`. Isolating it would both
         # create a pointless run directory (whose GC would later delete the
         # config it just wrote) and print a banner that breaks that JSON
-        # contract. Leave the environment exactly as the caller set it.
+        # contract. Leave the environment as the caller set it — except for an
+        # inherited per-run workspace, which for the same reason as above must
+        # not leak into the config this step emits.
+        _leave_inherited_isolation()
         return
     if isolated:
         run_dir = _activate_isolated_workspace()

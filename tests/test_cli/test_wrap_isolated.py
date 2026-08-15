@@ -2471,3 +2471,45 @@ class TestParentUpstreamSurvivesNesting:
 
         assert wrap_mod._url_is_local_headroom_proxy("http://127.0.0.1:8788/anthropic") is True
         assert wrap_mod._inherited_parent_upstream() == "https://foo.services.ai.azure.com"
+
+
+class TestExemptSubcommandsLeaveInheritedIsolation:
+    """Declining to ACTIVATE isolation is not enough when nested inside an
+    already-isolated agent: the parent's per-run workspace is already in the
+    environment, inherited (round 17, P2)."""
+
+    def test_nested_openclaw_returns_to_shared_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A parent wrap already activated isolation in this process tree.
+        run_dir = isolation.activate_isolated_workspace()
+        shared = paths.shared_workspace_dir()
+        assert paths.workspace_dir() == run_dir
+
+        wrap_mod._leave_inherited_isolation()
+
+        assert paths.workspace_dir() == shared
+        assert isolation.active_isolated_workspace() is None
+        assert isolation.isolation_requested() is False
+
+    def test_it_is_a_noop_at_top_level(self, tmp_path: Path) -> None:
+        before = paths.workspace_dir()
+
+        wrap_mod._leave_inherited_isolation()
+
+        assert paths.workspace_dir() == before
+        # `disable_isolation` was never called, so no explicit opt-out was
+        # recorded for children either.
+        assert isolation.HEADROOM_ISOLATED_ENV not in os.environ
+
+    def test_the_gateway_would_inherit_the_shared_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """What actually matters: the env a spawned gateway/proxy receives."""
+        isolation.activate_isolated_workspace()
+
+        wrap_mod._leave_inherited_isolation()
+
+        inherited = os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV]
+        assert "runs" not in Path(inherited).parts
+        assert isolation.HEADROOM_MEMORY_DB_PATH_ENV not in os.environ

@@ -969,26 +969,39 @@ class TestExistingOverridesAreNormalized:
         assert "~" not in os.environ[paths.HEADROOM_CONFIG_DIR_ENV]
 
 
-class TestSharedMemoryForReusedProxy:
+class TestMemoryAlignsWithReusedProxy:
     """`--memory --no-proxy` under isolation gave the session two conflicting
-    memory views: wrap-side sync + MCP on the run DB, API-side retrieval on the
-    reused proxy's own (round 16, P2)."""
+    memory views. Substituting a workspace path does NOT reconcile them: the
+    proxy's default is `{cwd}/.headroom/memory.db`, so picking a workspace root
+    invents a third store (round 17, P2 — correcting round 16's fix)."""
 
-    def test_restore_drops_the_isolated_pin(self, tmp_path: Path) -> None:
-        shared = paths.workspace_dir()
+    def test_the_pin_is_removed_not_replaced(self, tmp_path: Path) -> None:
         run_dir = isolation.activate_isolated_workspace()
-        assert paths.memory_db_path() == run_dir / "memory.db"
+        assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(run_dir / "memory.db")
 
-        restored = isolation.restore_shared_memory_db()
+        assert isolation.align_memory_db_with_reused_proxy() is True
 
-        assert restored == shared / "memory.db"
-        # HEADROOM_MEMORY_DB_PATH is what memory consumers actually read (the
-        # proxy, the memory MCP's --db default, `headroom memory`), so that is
-        # the contract this must move — not the workspace-derived default.
+        # Unset, so every consumer falls back to the SAME default the reused
+        # proxy resolved — not to a path we chose.
+        assert isolation.HEADROOM_MEMORY_DB_PATH_ENV not in os.environ
+
+    def test_a_known_manifest_database_is_adopted(self, tmp_path: Path) -> None:
+        """A persistent deployment records the DB it was started with; that is
+        the reused proxy's ACTUAL store, so prefer it over any fallback."""
+        isolation.activate_isolated_workspace()
+        manifest_db = tmp_path / "deploy" / "memory.db"
+
+        assert isolation.align_memory_db_with_reused_proxy(str(manifest_db)) is True
+
         exported = Path(os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV])
         assert exported.is_absolute()
-        assert exported == (shared / "memory.db").resolve()
-        assert exported != run_dir / "memory.db"
+        assert exported == manifest_db.resolve()
+
+    def test_a_blank_manifest_value_falls_back_to_unset(self, tmp_path: Path) -> None:
+        isolation.activate_isolated_workspace()
+
+        assert isolation.align_memory_db_with_reused_proxy("   ") is True
+        assert isolation.HEADROOM_MEMORY_DB_PATH_ENV not in os.environ
 
     def test_a_user_pinned_db_is_left_alone(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -997,11 +1010,47 @@ class TestSharedMemoryForReusedProxy:
         monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, str(pinned))
         isolation.activate_isolated_workspace()
 
-        assert isolation.restore_shared_memory_db() is None
+        assert isolation.align_memory_db_with_reused_proxy() is False
         assert os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV] == str(pinned)
 
     def test_outside_isolation_it_is_a_noop(self) -> None:
-        assert isolation.restore_shared_memory_db() is None
+        assert isolation.align_memory_db_with_reused_proxy() is False
+
+
+class TestLearnProvenanceIsShared:
+    """The learn sidecar carries per-section token estimates used to decide
+    what survives an over-budget rewrite. Run-scoped, a later `learn` reads
+    zero and `_apply_block_cap` can evict the highest-value rules first
+    (round 17, P2)."""
+
+    def test_sidecar_follows_the_shared_root(self, tmp_path: Path) -> None:
+        from headroom.learn.writer import _sidecar_path
+
+        shared = paths.workspace_dir()
+        target = tmp_path / "CLAUDE.local.md"
+        before = _sidecar_path(target)
+        assert before.parent == shared / "learn"
+
+        run_dir = isolation.activate_isolated_workspace()
+
+        after = _sidecar_path(target)
+        assert after == before, "the sidecar moved into the run directory"
+        assert run_dir not in after.parents
+
+    def test_a_sidecar_written_before_isolation_is_still_read(self, tmp_path: Path) -> None:
+        """The actual failure: estimates saved by an earlier run must survive
+        into an isolated one, or carried-forward sections score zero."""
+        from headroom.learn.writer import _load_sidecar, _sidecar_path
+
+        target = tmp_path / "CLAUDE.local.md"
+        target.write_text("x")
+        path = _sidecar_path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"sections": {"rules": 1234}}))
+
+        isolation.activate_isolated_workspace()
+
+        assert _load_sidecar(target) == {"rules": 1234}
 
 
 class TestLearnedBaselineIsShared:

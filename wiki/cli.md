@@ -849,9 +849,17 @@ installer that hands off to `openclaw gateway start`, whose `autoStart` spawns
 a proxy of its own — that proxy belongs on shared state, not on a run
 directory this wrapper never records and GC could later delete.
 
-`--memory --no-proxy` reconciles onto the shared memory database. The reused
-proxy serves retrieval from its own store, so keeping this run pinned to an
-isolated one would give the session two conflicting memory views.
+`--memory --no-proxy` reconciles memory with the proxy it reuses. That proxy
+serves retrieval from its own store, so keeping this run pinned to an isolated
+database would give the session two conflicting memory views. Headroom adopts
+the database a persistent deployment recorded when there is one, and otherwise
+simply drops the per-run pin so every consumer falls back to the same default
+the proxy itself resolved (`{cwd}/.headroom/memory.db`) — substituting a
+workspace path would invent a third store rather than reconcile.
+
+The exemptions above also apply when a wrap is nested inside an
+already-isolated agent: `selfheal`, `openclaw` and `--prepare-only` return to
+shared state rather than inheriting the parent's run directory.
 
 With `--no-proxy` an isolated run deliberately attaches to the shared
 proxy; its client marker is registered in the shared workspace so the

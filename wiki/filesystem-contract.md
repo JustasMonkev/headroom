@@ -11,7 +11,7 @@ they behave inside Docker containers.
 |---|---|---|---|
 | `HEADROOM_CONFIG_DIR` | `~/.headroom/config` | User/admin-authored configuration (model catalogs, plugin settings, etc.) | Read-mostly |
 | `HEADROOM_WORKSPACE_DIR` | `~/.headroom` | Runtime state written by the proxy and CLI (savings, logs, memory DB, telemetry, caches) | Read-write |
-| `HEADROOM_SHARED_WORKSPACE_DIR` | `= HEADROOM_WORKSPACE_DIR` | Persistent, cross-run state that must never land in a throwaway per-run workspace (managed binaries, Copilot auth, MCP install ledger, license cache, learned verbosity profile, learned savings baseline) | Read-write |
+| `HEADROOM_SHARED_WORKSPACE_DIR` | `= HEADROOM_WORKSPACE_DIR` | Persistent, cross-run state that must never land in a throwaway per-run workspace (managed binaries, Copilot auth, MCP install ledger, license cache, learned verbosity profile, learned savings baseline, learn provenance sidecars) | Read-write |
 
 `HEADROOM_SHARED_WORKSPACE_DIR` is normally **unset and identical to
 `HEADROOM_WORKSPACE_DIR`**. Per-run isolation (`headroom wrap`, isolated by

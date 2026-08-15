@@ -287,7 +287,12 @@ def _sidecar_path(file_path: Path) -> Path:
     the agent should be billed for.
     """
     key = hashlib.sha256(str(file_path.resolve()).encode("utf-8")).hexdigest()[:16]
-    return _paths.workspace_dir() / "learn" / f"{key}.json"
+    # SHARED root: this is cross-run machine state. A later `learn` runs in a
+    # different per-run workspace, so resolving it against the run root would
+    # make carried-forward sections load an estimate of zero — and
+    # `_apply_block_cap` would then evict previously high-value rules first
+    # when it has to shrink an over-budget context file.
+    return _paths.shared_workspace_dir() / "learn" / f"{key}.json"
 
 
 def _load_sidecar(file_path: Path) -> dict[str, int]:
