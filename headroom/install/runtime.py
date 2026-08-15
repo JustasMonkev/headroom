@@ -59,7 +59,14 @@ PASSTHROUGH_ENV_PREFIXES = (
 # isolated wrap's run directory, that is a host path with no mount inside the
 # container and the container fails immediately.
 _CONTAINER_PINNED_ENV = frozenset(
-    {"HOME", "PYTHONUNBUFFERED", "HEADROOM_WORKSPACE_DIR", "HEADROOM_CONFIG_DIR"}
+    {
+        "HOME",
+        "PYTHONUNBUFFERED",
+        "HEADROOM_WORKSPACE_DIR",
+        "HEADROOM_CONFIG_DIR",
+        "HEADROOM_SHARED_WORKSPACE_DIR",
+        "HEADROOM_SETTINGS_PATH",
+    }
 )
 
 
@@ -132,6 +139,16 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"HEADROOM_WORKSPACE_DIR={container_home}/.headroom",
         "--env",
         f"HEADROOM_CONFIG_DIR={container_home}/.headroom/config",
+        # The remaining filesystem pins, translated to the container's view of
+        # the mount. An isolated wrap pins these to ABSOLUTE HOST paths before
+        # `install apply` runs, and the passthrough below would otherwise hand
+        # them to the container by name — where the host `~/.headroom` is
+        # visible only at `{container_home}/.headroom`, so the proxy would read
+        # shared resources and settings from paths that do not exist inside it.
+        "--env",
+        f"HEADROOM_SHARED_WORKSPACE_DIR={container_home}/.headroom",
+        "--env",
+        f"HEADROOM_SETTINGS_PATH={container_home}/.headroom/settings.json",
         "--volume",
         f"{_mount_source(home, '.headroom')}:{container_home}/.headroom",
         "--volume",

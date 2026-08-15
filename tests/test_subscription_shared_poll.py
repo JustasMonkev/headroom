@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+import headroom.subscription.tracker as tracker_mod
 from headroom import paths
 from headroom.subscription.models import (
     ExtraUsage,
@@ -161,10 +162,13 @@ class TestOnlyOnePollerHitsTheAccountAPI:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Losing the election must not leave a session with no usage data at
-        all — a duplicate request is the safe failure."""
+        all. The loser waits for the winner first (see
+        `TestTheLoserWaitsForTheWinner`); only when nothing is published does a
+        duplicate request become the safe failure."""
         client = _Client()
         tracker = _tracker(monkeypatch, client)
         monkeypatch.setattr("headroom._filelock.acquire", lambda *_a, **_k: False)
+        monkeypatch.setattr(tracker_mod, "_POLL_HANDOFF_TIMEOUT_S", 0.05)
 
         _poll(tracker, monkeypatch)
 
@@ -202,6 +206,82 @@ class TestOnlyOnePollerHitsTheAccountAPI:
         _poll(tracker, monkeypatch)
 
         assert observed == [False], "the usage request ran outside the poll lock"
+
+
+class TestTheLoserWaitsForTheWinner:
+    """Electing a poller is not enough on a COLD start: every proxy reaches an
+    empty snapshot at the same moment, so a non-owner that immediately fetches
+    puts the fan-out back on one request per proxy and leaves the lock deciding
+    only whose response gets stored (round 22, P2)."""
+
+    def test_a_non_owner_adopts_what_the_owner_publishes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+        monkeypatch.setattr("headroom._filelock.acquire", lambda *_a, **_k: False)
+        published = _snapshot()
+        state = {"waits": 0}
+
+        real_sleep = asyncio.sleep
+
+        async def publish_after_one_tick(delay: float) -> None:
+            await real_sleep(0)
+            state["waits"] += 1
+            if state["waits"] == 2:  # the owner's request lands mid-wait
+                path = paths.subscription_snapshot_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(published.to_dict()))
+
+        monkeypatch.setattr("headroom.subscription.tracker.asyncio.sleep", publish_after_one_tick)
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 0, "the loser must not duplicate the winner's request"
+        adopted = tracker.latest_snapshot
+        assert adopted is not None
+        assert adopted.five_hour.used == 41
+
+    def test_a_silent_owner_still_falls_back_to_polling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Waiting must not become hanging: an owner that died mid-fetch (or
+        whose request failed) publishes nothing, and a session with no usage
+        data is worse than a duplicate request."""
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+        monkeypatch.setattr("headroom._filelock.acquire", lambda *_a, **_k: False)
+        # Short-circuit the real 10s wait; the bound itself has its own test.
+        monkeypatch.setattr(tracker_mod, "_POLL_HANDOFF_TIMEOUT_S", 0.05)
+
+        async def no_op(delay: float) -> None:
+            return None
+
+        monkeypatch.setattr("headroom.subscription.tracker.asyncio.sleep", no_op)
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 1
+
+    def test_the_wait_is_bounded_by_the_request_timeout(self) -> None:
+        """A wait that outlasts the fetch it waits on is a hang, not a
+        handoff — past the client's own timeout the owner is gone, not slow."""
+        from headroom.subscription.client import SubscriptionClient
+
+        assert tracker_mod._POLL_HANDOFF_TIMEOUT_S <= SubscriptionClient()._timeout
+
+    def test_the_owner_never_waits_on_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _Client()
+        tracker = _tracker(monkeypatch, client)
+
+        async def unexpected(delay: float) -> None:
+            raise AssertionError("the elected poller must fetch, not wait")
+
+        monkeypatch.setattr("headroom.subscription.tracker.asyncio.sleep", unexpected)
+
+        _poll(tracker, monkeypatch)
+
+        assert client.calls == 1
 
 
 class TestSnapshotsAreAccountScoped:

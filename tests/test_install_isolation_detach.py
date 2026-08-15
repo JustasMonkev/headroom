@@ -171,6 +171,38 @@ class TestDockerDoesNotInheritTheRunDirectory:
         assert f"{isolation.HEADROOM_ISOLATED_ENV}=0" in args
         assert isolation.HEADROOM_ISOLATED_ENV not in args
 
+    def test_the_shared_root_is_translated_to_the_container_mount(self) -> None:
+        """Activation pins this to an absolute HOST path. The host `~/.headroom`
+        is visible inside the container only at `<container_home>/.headroom`, so
+        passing the host value by name points the proxy at a path that does not
+        exist there."""
+        args = self._docker_env_args()
+
+        assert paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV not in args
+        pinned = [a for a in args if a.startswith(f"{paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV}=")]
+        assert pinned == ["HEADROOM_SHARED_WORKSPACE_DIR=/tmp/headroom-home/.headroom"]
+
+    def test_the_settings_path_is_translated_too(self) -> None:
+        args = self._docker_env_args()
+
+        assert paths.HEADROOM_SETTINGS_PATH_ENV not in args
+        pinned = [a for a in args if a.startswith(f"{paths.HEADROOM_SETTINGS_PATH_ENV}=")]
+        assert pinned == ["HEADROOM_SETTINGS_PATH=/tmp/headroom-home/.headroom/settings.json"]
+
+    def test_no_host_filesystem_pin_reaches_the_container_by_name(self) -> None:
+        """The general rule the two tests above are instances of: a bare
+        passthrough sends the HOST value, so no path variable isolation pins may
+        travel that way."""
+        args = self._docker_env_args()
+        pinned_by_activation = (
+            paths.HEADROOM_WORKSPACE_DIR_ENV,
+            paths.HEADROOM_CONFIG_DIR_ENV,
+            paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
+            paths.HEADROOM_SETTINGS_PATH_ENV,
+        )
+
+        assert not [name for name in pinned_by_activation if name in args]
+
     def test_unrelated_credentials_still_pass_through_by_name(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

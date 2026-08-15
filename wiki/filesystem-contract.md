@@ -129,7 +129,16 @@ replace: `settings.json` saves take `settings.json.lock` across the whole
 load-merge-write cycle, since an atomic replace prevents a torn file but not
 a lost update. The account snapshot is only adopted when its recorded
 `token_prefix` matches the polling token, so two proxies on different Claude
-accounts never read each other's quota out of it.
+accounts never read each other's quota out of it. A proxy that loses the
+election waits for the winner's snapshot rather than issuing its own request,
+falling back to polling only if nothing is published — otherwise a cold start,
+where every proxy finds the snapshot empty at the same moment, would make the
+election decide nothing.
+
+A persistent Docker deployment does not inherit these host paths: the
+container mounts the host `~/.headroom` at `<container_home>/.headroom`, so
+the workspace, config, shared root and settings path are all pinned to the
+container's view of that mount instead of being passed through by name.
 
 The subscription split follows the same rule as the savings baseline: the
 usage windows describe an **account**, so one proxy polls
