@@ -1535,3 +1535,305 @@ class TestOwnerStackIsPerEndpointKey:
         # Handover went to the live same-key peer, not the Vertex owner.
         env = json.loads(settings.read_text())["env"]
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8789"
+
+
+class TestCrashHandoverPreservesOtherKeys:
+    """The crash-cleanup handover rewrote the stack to just its own key,
+    deleting a concurrent other-key run's record (round 12, P2)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    @staticmethod
+    def _owner(pid: int, port: int, key: str) -> dict[str, Any]:
+        return {
+            "pid": pid,
+            "port": port,
+            "key": key,
+            "previous": "https://user-gateway",
+            "url": f"http://127.0.0.1:{port}",
+        }
+
+    def test_vertex_owner_survives_a_base_url_crash_handover(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Newest Base owner crashed; an older live Base owner takes over and
+        the live Vertex owner must still be on the stack afterwards."""
+        settings, marker = self._project(tmp_path)
+        live_base = self._owner(os.getpid(), 8788, "ANTHROPIC_BASE_URL")
+        live_vertex = self._owner(111, 8790, "ANTHROPIC_VERTEX_BASE_URL")
+        dead_base = self._owner(2147480000, 8789, "ANTHROPIC_BASE_URL")
+        marker.write_text(json.dumps({"owners": [live_base, live_vertex, dead_base], **dead_base}))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda o: o.get("pid") == 2147480000)
+
+        handover = wrap_mod._handover_to_live_owner(settings, key="ANTHROPIC_BASE_URL")
+
+        assert handover == "http://127.0.0.1:8788"
+        owners = json.loads(marker.read_text())["owners"]
+        assert sorted(o["pid"] for o in owners) == [111, os.getpid()]
+        # The handover target must remain newest, since the top-level mirror
+        # is owners[-1] and self-heal reads it.
+        assert owners[-1]["pid"] == os.getpid()
+
+    def test_other_key_survives_when_no_same_key_owner_remains(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        live_vertex = self._owner(111, 8790, "ANTHROPIC_VERTEX_BASE_URL")
+        dead_base = self._owner(2147480000, 8789, "ANTHROPIC_BASE_URL")
+        marker.write_text(json.dumps({"owners": [live_vertex, dead_base], **dead_base}))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda o: o.get("pid") == 2147480000)
+
+        handover = wrap_mod._handover_to_live_owner(settings, key="ANTHROPIC_BASE_URL")
+
+        assert handover is None, "no live Base owner to hand to"
+        assert marker.exists(), "the Vertex run's record must not be collateral damage"
+        assert [o["key"] for o in json.loads(marker.read_text())["owners"]] == [
+            "ANTHROPIC_VERTEX_BASE_URL"
+        ]
+
+
+class TestPreviousComesFromTheMatchingOwner:
+    """`previous` was read from the top-level mirror, which is just owners[-1]
+    across ALL keys — so an interleaved run inherited the wrong original
+    (round 12, P2)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    def test_interleaved_keys_do_not_poison_previous(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Base A, then Vertex V, then Base B: B must inherit A's recorded
+        original, not A's proxy URL (which is what the file holds)."""
+        settings, marker = self._project(tmp_path)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        # Run A takes the Base key.
+        prev_a = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        assert prev_a == "https://user-gateway"
+        payload = json.loads(marker.read_text())
+        payload["owners"][-1]["pid"] = 111  # A is another live process
+        marker.write_text(json.dumps(payload))
+
+        # Run V takes the Vertex key, landing on top of the stack/mirror.
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8790", settings_path=settings, port=8790, vertex_mode=True
+        )
+        payload = json.loads(marker.read_text())
+        payload["owners"][-1]["pid"] = 222
+        marker.write_text(json.dumps(payload))
+        assert payload["owners"][-1]["key"] == "ANTHROPIC_VERTEX_BASE_URL"
+
+        # Run B takes the Base key again — the mirror names V, not A.
+        prev_b = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+
+        assert prev_b == "https://user-gateway", "B inherited a dead proxy URL as the original"
+
+    def test_first_owner_still_reads_the_files_real_value(self, tmp_path: Path) -> None:
+        settings, _marker = self._project(tmp_path)
+
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        assert previous == "https://user-gateway"
+
+    def test_other_keys_owner_alone_does_not_supply_previous(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Only a Vertex owner exists; a fresh Base run must read the file."""
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {
+                            "pid": 111,
+                            "port": 8790,
+                            "key": "ANTHROPIC_VERTEX_BASE_URL",
+                            "previous": "https://somebody-elses-original",
+                            "url": "http://127.0.0.1:8790",
+                        }
+                    ]
+                }
+            )
+        )
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        assert previous == "https://user-gateway"
+
+
+class TestCloudModesAlsoRejectNestedProxies:
+    """Foundry and Vertex have their own endpoint variables, and a nested wrap
+    inherits whichever its parent set (round 12, P2)."""
+
+    @staticmethod
+    def _is_headroom(monkeypatch: pytest.MonkeyPatch, *, yes: bool) -> None:
+        monkeypatch.setattr(
+            wrap_mod,
+            "_query_proxy_health",
+            lambda _p: {"service": "headroom-proxy" if yes else "litellm"},
+        )
+
+    def test_url_predicate_covers_every_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._is_headroom(monkeypatch, yes=True)
+
+        assert wrap_mod._url_is_local_headroom_proxy("http://127.0.0.1:8788") is True
+        # Foundry appends a path component; it must not defeat the check.
+        assert wrap_mod._url_is_local_headroom_proxy("http://127.0.0.1:8788/anthropic") is True
+        assert wrap_mod._url_is_local_headroom_proxy("https://foo.services.ai.azure.com") is False
+        assert wrap_mod._url_is_local_headroom_proxy("http://localhost/v1") is False
+        assert wrap_mod._url_is_local_headroom_proxy("") is False
+        assert wrap_mod._url_is_local_headroom_proxy(None) is False
+
+    def test_vertex_ignores_an_inherited_parent_proxy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "http://127.0.0.1:8788")
+        self._is_headroom(monkeypatch, yes=True)
+
+        assert wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789") is None
+
+    def test_vertex_explicit_target_ignores_an_inherited_parent_proxy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VERTEX_TARGET_API_URL", "http://127.0.0.1:8788")
+        self._is_headroom(monkeypatch, yes=True)
+
+        assert wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789") is None
+
+    def test_vertex_keeps_a_real_gateway(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "https://vertex.example.com")
+
+        def unexpected(_port: int) -> Any:
+            raise AssertionError("remote hosts must not be probed")
+
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", unexpected)
+
+        assert (
+            wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789")
+            == "https://vertex.example.com"
+        )
+
+    def test_vertex_keeps_a_local_non_headroom_gateway(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "http://127.0.0.1:4000")
+        self._is_headroom(monkeypatch, yes=False)
+
+        assert (
+            wrap_mod._vertex_target_api_url_from_claude_env("http://127.0.0.1:8789")
+            == "http://127.0.0.1:4000"
+        )
+
+
+class TestClearMarkerIsKeyScoped:
+    """`_clear_wrap_marker` unlinked the whole file based on the top-level
+    mirror. One marker serves every endpoint key, so the forced stale-cleanup
+    path could destroy a live Vertex run's record as collateral damage."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    def test_only_the_named_keys_owners_are_removed(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {"pid": 111, "port": 8790, "key": "ANTHROPIC_VERTEX_BASE_URL"},
+                        {"pid": 222, "port": 8789, "key": "ANTHROPIC_BASE_URL"},
+                    ],
+                    "pid": 222,
+                    "key": "ANTHROPIC_BASE_URL",
+                }
+            )
+        )
+
+        wrap_mod._clear_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert marker.exists()
+        assert [o["key"] for o in json.loads(marker.read_text())["owners"]] == [
+            "ANTHROPIC_VERTEX_BASE_URL"
+        ]
+
+    def test_file_is_removed_once_nothing_remains(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        marker.write_text(json.dumps({"pid": 222, "port": 8789, "key": "ANTHROPIC_BASE_URL"}))
+
+        wrap_mod._clear_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert not marker.exists()
+
+    def test_other_keys_marker_is_untouched(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps({"pid": 111, "port": 8790, "key": "ANTHROPIC_VERTEX_BASE_URL"})
+        )
+
+        wrap_mod._clear_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert marker.exists()
+
+    def test_forced_stale_cleanup_spares_a_live_other_key_owner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End-to-end: a crashed Base run's cleanup must not take the live
+        Vertex run's record with it."""
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {
+                            "pid": 111,
+                            "port": 8790,
+                            "key": "ANTHROPIC_VERTEX_BASE_URL",
+                            "previous": None,
+                            "url": "http://127.0.0.1:8790",
+                        },
+                        {
+                            "pid": 2147480000,
+                            "port": 8789,
+                            "key": "ANTHROPIC_BASE_URL",
+                            "previous": "https://user-gateway",
+                            "url": "http://127.0.0.1:8789",
+                        },
+                    ],
+                    "pid": 2147480000,
+                    "port": 8789,
+                    "key": "ANTHROPIC_BASE_URL",
+                    "previous": "https://user-gateway",
+                }
+            )
+        )
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda o: o.get("pid") == 2147480000)
+
+        restored = wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert restored == "https://user-gateway"
+        assert marker.exists(), "the live Vertex run's record must survive"
+        assert [o["key"] for o in json.loads(marker.read_text())["owners"]] == [
+            "ANTHROPIC_VERTEX_BASE_URL"
+        ]

@@ -1255,11 +1255,12 @@ def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
     """Return the Vertex upstream that the proxy should use for Claude Code."""
     explicit_target = os.environ.get("VERTEX_TARGET_API_URL", "").strip()
     if explicit_target:
-        return (
-            None
-            if _normalize_proxy_api_url(explicit_target) == _normalize_proxy_api_url(proxy_url)
-            else explicit_target
-        )
+        if _normalize_proxy_api_url(explicit_target) == _normalize_proxy_api_url(proxy_url):
+            return None
+        # A nested wrap inherits the parent's port here, which is never equal
+        # to ours — without this it reads as a real Vertex target and the child
+        # proxy forwards through the parent (Headroom applied twice).
+        return None if _url_is_local_headroom_proxy(explicit_target) else explicit_target
 
     vertex_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL", "").strip()
     if not vertex_url:
@@ -1271,6 +1272,8 @@ def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
     if normalized_vertex_url == _normalize_proxy_api_url(DEFAULT_VERTEX_API_URL):
         return None
     if normalized_vertex_url == _normalize_proxy_api_url(proxy_url):
+        return None
+    if _url_is_local_headroom_proxy(vertex_url):
         return None
     return vertex_url
 
@@ -1419,14 +1422,28 @@ def _wrap_marker_owners(settings_path: Path) -> list[dict[str, Any]]:
     owners. A legacy single-dict marker reads as a one-entry stack.
     """
 
+    return [
+        owner
+        for owner in _raw_wrap_marker_owners(settings_path)
+        if not _wrap_marker_is_stale(owner)
+    ]
+
+
+def _raw_wrap_marker_owners(settings_path: Path) -> list[dict[str, Any]]:
+    """The owner stack exactly as persisted — no staleness filtering.
+
+    Anything that REWRITES the stack needs this rather than
+    :func:`_wrap_marker_owners`: that one drops dead entries, so writing its
+    result back would prune another endpoint key's records as a side effect of
+    an update that has nothing to do with them.
+    """
+
     raw = _read_wrap_marker(settings_path)
     if raw is None:
         return []
     recorded = raw.get("owners")
     owners: list[Any] = recorded if isinstance(recorded, list) else [raw]
-    return [
-        owner for owner in owners if isinstance(owner, dict) and not _wrap_marker_is_stale(owner)
-    ]
+    return [owner for owner in owners if isinstance(owner, dict)]
 
 
 def _write_wrap_marker_owners(settings_path: Path, owners: list[dict[str, Any]]) -> None:
@@ -1540,9 +1557,21 @@ def _wrap_marker_proxy_is_dead(marker: dict[str, Any]) -> bool:
 
 
 def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
-    marker = _read_wrap_marker(settings_path)
-    if marker is not None and marker.get("key") == key:
-        _wrap_marker_path(settings_path).unlink(missing_ok=True)
+    """Drop ``key``'s owners, removing the file only when nothing else is left.
+
+    One project-local marker serves EVERY Claude endpoint key, so unlinking it
+    outright (the old behavior, decided from the top-level mirror) destroyed a
+    concurrent Vertex/Foundry-mode run's crash/self-heal record — after which
+    an unclean exit would strand that run's URL on a dead proxy. Other keys'
+    entries are carried over verbatim, stale ones included: pruning them is
+    not this call's business.
+    """
+
+    persisted = _raw_wrap_marker_owners(settings_path)
+    remaining = [o for o in persisted if o.get("key") != key]
+    if len(remaining) == len(persisted):
+        return  # nothing of ours recorded here
+    _write_wrap_marker_owners(settings_path, remaining)
 
 
 def _handover_to_live_owner(
@@ -1575,6 +1604,14 @@ def _handover_to_live_owner(
 def _handover_to_live_owner_locked(
     settings_path: Path, *, key: str, require_live_port: bool = False
 ) -> str | None:
+    # Owners of OTHER endpoint keys are none of this handover's business — a
+    # concurrent Vertex/Foundry-mode run in the same project keeps its own
+    # crash/self-heal record. Carry them over verbatim (from the PERSISTED
+    # stack, so their own stale entries are not pruned as a side effect);
+    # rewriting the stack to just our key would delete them, leaving that run's
+    # URL pointing at a dead proxy if it exits uncleanly.
+    persisted = _raw_wrap_marker_owners(settings_path)
+    others = [o for o in persisted if o.get("key") != key]
     owners = [o for o in _wrap_marker_owners(settings_path) if o.get("key") == key]
     if require_live_port:
         owners = [
@@ -1583,10 +1620,16 @@ def _handover_to_live_owner_locked(
             if not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"]))
         ]
     if not owners:
+        if len(others) != len(persisted):
+            # Our key's dead owners are gone; persist that much so the caller's
+            # ordinary cleanup does not re-see them.
+            _write_wrap_marker_owners(settings_path, others)
         return None
 
     handover = owners[-1].get("url")
-    _write_wrap_marker_owners(settings_path, owners)
+    # Preserve relative order: `_write_wrap_marker_owners` mirrors owners[-1]
+    # at the top level, and the handover target must be the newest entry.
+    _write_wrap_marker_owners(settings_path, [*others, *owners])
     if not isinstance(handover, str) or not handover:
         # Legacy owner with no recorded URL: leave the file as-is rather than
         # guess and strand the live session.
@@ -1909,22 +1952,21 @@ def _write_claude_wrap_base_url_locked(
     # the file is THAT session's proxy URL, not the user's original. Inherit
     # its recorded original so exiting never restores a peer's (soon dead)
     # proxy URL as if it were the project's own setting.
-    concurrent = _read_wrap_marker(path)
-    if (
-        concurrent is not None
-        and concurrent.get("key") == key
-        and not _wrap_marker_is_stale(concurrent)
-    ):
-        # A live marker means the value in the file was written by Headroom
+    #
+    # Read the newest live owner OF THIS KEY from the stack rather than the
+    # top-level mirror. The mirror is just `owners[-1]`, so with interleaved
+    # keys (Base run A, then Vertex run V, then Base run B) it names V, and B
+    # would miss A entirely — saving A's proxy URL as its own `previous` and
+    # restoring that dead endpoint on exit, with V still on top so Base
+    # self-heal cannot repair it.
+    same_key = [o for o in _wrap_marker_owners(path) if o.get("key") == key]
+    concurrent = same_key[-1] if same_key else None
+    if concurrent is not None:
+        # A live owner means the value in the file was written by Headroom
         # (this process on a re-entrant write, or a peer session), so the
-        # user's real original is the one that marker recorded.
+        # user's real original is the one that owner recorded.
         previous = concurrent.get("previous")
-    if (
-        concurrent is not None
-        and concurrent.get("key") == key
-        and concurrent.get("pid") != os.getpid()
-        and not _wrap_marker_is_stale(concurrent)
-    ):
+    if concurrent is not None and concurrent.get("pid") != os.getpid():
         click.echo(
             f"  Note: another live wrap session (pid {concurrent.get('pid')}) is routing "
             f"this project through port {concurrent.get('port')}. Claude re-reads "
@@ -5520,6 +5562,37 @@ def wrap_selfheal(marker: str | None) -> None:
 _LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _url_is_local_headroom_proxy(url: str | None) -> bool:
+    """True when ``url`` points at a Headroom proxy on this machine.
+
+    The one predicate every "did I inherit my parent wrap's endpoint?" check
+    needs. Every Claude routing mode has its own endpoint variable
+    (``ANTHROPIC_BASE_URL``, ``ANTHROPIC_FOUNDRY_BASE_URL``,
+    ``ANTHROPIC_VERTEX_BASE_URL``, ``VERTEX_TARGET_API_URL``) and a nested
+    wrap inherits whichever one its parent set — on the parent's dedicated
+    port, never equal to the child's requested base port. Treating that as a
+    user-configured upstream chains two Headroom pipelines.
+
+    Only loopback URLs with an explicit port are probed: a remote host is
+    never this machine's proxy, and a portless URL means a default 80/443
+    listener, which a Headroom proxy never is.
+    """
+
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return False
+    if (parsed.hostname or "").lower() not in _LOCAL_HOSTNAMES:
+        return False
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return False
+    return parsed_port is not None and _is_local_headroom_proxy(parsed_port)
+
+
 def _is_local_headroom_proxy(port: int) -> bool:
     """True when the loopback listener on ``port`` is itself a Headroom proxy.
 
@@ -5567,8 +5640,8 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
             return None
         if parsed_port == port:
             return None
-        if parsed_port is not None and _is_local_headroom_proxy(parsed_port):
-            return None
+    if _url_is_local_headroom_proxy(base_url):
+        return None
     return base_url
 
 
@@ -5806,6 +5879,12 @@ def claude(
         foundry_upstream = None
         if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
             foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
+            if _url_is_local_headroom_proxy(foundry_upstream):
+                # Inherited from a parent wrap running in Foundry mode: its
+                # value is the PARENT's proxy, not an Azure endpoint. Fall
+                # through to the resource name so we forward to Foundry
+                # directly instead of chaining through the parent.
+                foundry_upstream = None
             if not foundry_upstream:
                 resource = os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE", "").strip()
                 if resource:

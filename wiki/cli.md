@@ -821,7 +821,10 @@ The lock file itself lives under `<shared-workspace>/locks/`, keyed by a
 digest of the resolved settings path — never in your project, since nothing
 ever deletes a lock file. Exiting pops only that run's own `(pid, key)`
 entry, so a concurrent run owning a different endpoint key
-(`ANTHROPIC_VERTEX_BASE_URL`, the Foundry key) keeps its own record.
+(`ANTHROPIC_VERTEX_BASE_URL`, the Foundry key) keeps its own record — that
+holds for the crash-handover and marker-clearing paths too, and each run
+inherits the project's original URL from the newest live owner of *its own*
+key rather than whichever owner happens to be newest overall.
 For genuinely independent Claude routing, run each agent from its own
 working directory. (`headroom unwrap claude` still always wins.)
 
@@ -832,7 +835,11 @@ gives every run its own port, so it is never equal to the nested run's own
 port. Headroom probes such loopback URLs and ignores any listener that
 self-identifies as `headroom-proxy` on `/health`, so requests pass through
 one pipeline rather than two. A genuine local gateway (LiteLLM and friends)
-is still adopted as the upstream, per issue #1353.
+is still adopted as the upstream, per issue #1353. The same check covers
+Foundry and Vertex mode, which route through their own endpoint variables
+(`ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
+`VERTEX_TARGET_API_URL`) — a nested wrap inherits whichever one its parent
+set, so all of them are probed the same way.
 
 With `--no-proxy` an isolated run deliberately attaches to the shared
 proxy; its client marker is registered in the shared workspace so the
