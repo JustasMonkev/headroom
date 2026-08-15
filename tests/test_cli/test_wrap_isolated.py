@@ -593,6 +593,9 @@ class TestClaudeWrapMarkerConcurrency:
         marker["owners"][-1]["pid"] = 424242  # run B owns the stack entry now
         settings.parent.joinpath(".headroom_wrap_marker.json").write_text(json.dumps(marker))
         monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _m: False)
+        # Handover now requires the peer's proxy to still answer; these
+        # ports are fixtures with nothing listening.
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _port, **_k: True)
 
         wrap_mod._restore_claude_wrap_base_url(None, settings_path=settings)
 
@@ -830,6 +833,9 @@ class TestWrapMarkerOwnerStack:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> tuple[Path, Path, str | None, str | None]:
         settings, marker = self._project(tmp_path)
+        # Handover now requires the peer's proxy to still answer; these
+        # ports are fixtures with nothing listening.
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _port, **_k: True)
         prev_a = wrap_mod._write_claude_wrap_base_url(
             "http://127.0.0.1:8788", settings_path=settings, port=8788
         )
@@ -1515,6 +1521,9 @@ class TestOwnerStackIsPerEndpointKey:
         settings, marker = self._project(tmp_path)
         self._seed_vertex_peer(marker)
         monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        # Handover now requires the peer's proxy to still answer; these
+        # ports are fixtures with nothing listening.
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _port, **_k: True)
         payload = json.loads(marker.read_text())
         payload["owners"].append(
             {
@@ -2024,6 +2033,9 @@ class TestFoundryHandoverKeepsThePathPrefix:
         url_a = wrap_mod._foundry_proxy_url(wrap_mod._claude_proxy_base_url(8788))
         url_b = wrap_mod._foundry_proxy_url(wrap_mod._claude_proxy_base_url(8789))
         monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        # Handover now requires the peer's proxy to still answer; these
+        # ports are fixtures with nothing listening.
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _port, **_k: True)
 
         wrap_mod._write_claude_wrap_base_url(
             url_a, settings_path=settings, port=8788, foundry_mode=True
@@ -2059,3 +2071,121 @@ class TestFoundryHandoverKeepsThePathPrefix:
         wrap_mod._write_wrap_marker(settings, port=8788, key="ANTHROPIC_BASE_URL", previous=None)
 
         assert json.loads(marker.read_text())["owners"][-1]["url"] == "http://127.0.0.1:8788"
+
+
+class TestHandoverRequiresALiveProxy:
+    """A live WRAPPER is not enough to hand routing back to (round 14, P2).
+
+    The wrapper stays blocked on the agent process long after its dedicated
+    proxy dies, so handing settings.local.json to its recorded URL would point
+    every later conversation at a dead port.
+    """
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    def _peer_then_us(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[Path, Path, str | None]:
+        settings, marker = self._project(tmp_path)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        payload = json.loads(marker.read_text())
+        payload["owners"][-1]["pid"] = 111  # peer A: a different LIVE wrapper
+        marker.write_text(json.dumps(payload))
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+        return settings, marker, previous
+
+    @staticmethod
+    def _url(settings: Path) -> str | None:
+        if not settings.exists():
+            return None
+        return json.loads(settings.read_text())["env"].get("ANTHROPIC_BASE_URL")
+
+    def test_dead_peer_proxy_falls_back_to_the_original(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, _marker, previous = self._peer_then_us(monkeypatch, tmp_path)
+        # Peer A's wrapper is alive, but its proxy no longer answers.
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _port, **_k: False)
+
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert self._url(settings) == "https://user-gateway", (
+            "routing was handed to a wrapper whose proxy is dead"
+        )
+
+    def test_live_peer_proxy_still_receives_the_handover(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker, previous = self._peer_then_us(monkeypatch, tmp_path)
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _port, **_k: True)
+
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert self._url(settings) == "http://127.0.0.1:8788"
+        assert marker.exists()
+
+    def test_only_the_peer_with_a_live_port_is_chosen(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Two live peers, one dead proxy: the handover must skip it."""
+        settings, marker = self._project(tmp_path)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda port, **_k: port == 8788)
+        for port, pid in ((8788, 111), (8790, 222)):
+            wrap_mod._write_claude_wrap_base_url(
+                f"http://127.0.0.1:{port}", settings_path=settings, port=port
+            )
+            payload = json.loads(marker.read_text())
+            payload["owners"][-1]["pid"] = pid
+            marker.write_text(json.dumps(payload))
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        # 8790 is newer but dead; 8788 is the newest owner that still answers.
+        assert self._url(settings) == "http://127.0.0.1:8788"
+
+    def test_a_portless_legacy_owner_is_not_excluded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No recorded port means no liveness signal — don't invent one."""
+        settings, marker = self._project(tmp_path)
+        marker.write_text(
+            json.dumps(
+                {
+                    "owners": [
+                        {
+                            "pid": 111,
+                            "key": "ANTHROPIC_BASE_URL",
+                            "previous": "https://user-gateway",
+                            "url": "http://127.0.0.1:8788",
+                        }
+                    ]
+                }
+            )
+        )
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        def unexpected(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("a portless owner must not be probed")
+
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", unexpected)
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert self._url(settings) == "http://127.0.0.1:8788"

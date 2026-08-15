@@ -744,3 +744,121 @@ class TestIsolatedWorkspaceIsAbsolute:
 
         assert run_dir.is_absolute()
         assert run_dir.parent == (tmp_path / "ws" / "runs").resolve()
+
+
+class TestPinnedRootsAreAbsolute:
+    """Not just the run dir — every pin is inherited by subprocesses that may
+    run from another cwd (round 14, P2).
+
+    A relative HEADROOM_CONFIG_DIR / HEADROOM_SHARED_WORKSPACE_DIR would make a
+    nested command miss the intended model config and redirect settings,
+    managed binaries, the MCP ledger and marker locks into a second tree.
+    """
+
+    def test_every_exported_pin_is_absolute(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, "relative-ws")
+
+        isolation.activate_isolated_workspace()
+
+        for var in (
+            paths.HEADROOM_CONFIG_DIR_ENV,
+            paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
+            paths.HEADROOM_SETTINGS_PATH_ENV,
+            isolation.HEADROOM_PREISOLATION_WORKSPACE_ENV,
+            paths.HEADROOM_WORKSPACE_DIR_ENV,
+            isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
+            isolation.HEADROOM_MEMORY_DB_PATH_ENV,
+        ):
+            assert Path(os.environ[var]).is_absolute(), f"{var} must not be cwd-relative"
+
+    def test_shared_resources_survive_a_child_chdir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, "relative-ws")
+        isolation.activate_isolated_workspace()
+        shared = paths.shared_workspace_dir()
+        config = paths.config_dir()
+
+        elsewhere = tmp_path / "deep" / "elsewhere"
+        elsewhere.mkdir(parents=True)
+        monkeypatch.chdir(elsewhere)
+
+        assert paths.shared_workspace_dir() == shared
+        assert paths.config_dir() == config
+        assert paths.bin_dir() == shared / "bin"
+
+    def test_shared_opt_out_restores_an_absolute_root(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`--shared` restores HEADROOM_PREISOLATION_WORKSPACE, which must be
+        absolute too or the opt-out lands somewhere cwd-dependent."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, "relative-ws")
+        isolation.activate_isolated_workspace()
+
+        isolation.disable_isolation()
+
+        assert paths.workspace_dir().is_absolute()
+        assert paths.workspace_dir() == (tmp_path / "relative-ws").resolve()
+
+
+class TestPersistentInstallMemoryDb:
+    """`headroom install apply --memory` from inside an isolated agent baked
+    <run>/memory.db into the deployment manifest — a database no top-level run
+    shares and that GC later deletes (round 14, P2)."""
+
+    def test_isolated_run_resolves_to_the_shared_db(self, tmp_path: Path) -> None:
+        shared = paths.workspace_dir()
+        run_dir = isolation.activate_isolated_workspace()
+
+        # The RUN's own DB is still isolated...
+        assert paths.memory_db_path() == run_dir / "memory.db"
+        # ...but anything persistent must reference the shared one.
+        assert isolation.persistent_memory_db_path() == shared / "memory.db"
+
+    def test_outside_isolation_it_is_the_ordinary_db(self, tmp_path: Path) -> None:
+        assert isolation.persistent_memory_db_path() == paths.workspace_dir() / "memory.db"
+
+    def test_a_user_pinned_db_is_honored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Only the path ISOLATION chose is overridden; an explicit user
+        override means what it says."""
+        pinned = tmp_path / "mine" / "memory.db"
+        monkeypatch.setenv(isolation.HEADROOM_MEMORY_DB_PATH_ENV, str(pinned))
+        isolation.activate_isolated_workspace()
+
+        assert isolation.persistent_memory_db_path() == pinned
+
+    def test_planner_manifest_uses_the_shared_db(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from headroom.install import planner
+
+        shared = paths.workspace_dir()
+        run_dir = isolation.activate_isolated_workspace()
+
+        manifest = planner.build_manifest(
+            profile="default",
+            preset="persistent-docker",
+            runtime_kind="docker",
+            scope="user",
+            provider_mode="manual",
+            targets=["claude"],
+            port=8787,
+            backend="anthropic",
+            anyllm_provider=None,
+            region=None,
+            proxy_mode="token",
+            memory_enabled=True,
+            telemetry_enabled=False,
+            image="ghcr.io/headroomlabs-ai/headroom:latest",
+        )
+
+        assert manifest.memory_db_path == str(shared / "memory.db")
+        assert str(run_dir) not in " ".join(manifest.proxy_args)
+        assert str(shared / "memory.db") in manifest.proxy_args

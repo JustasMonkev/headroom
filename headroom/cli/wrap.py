@@ -2079,8 +2079,17 @@ def _restore_claude_wrap_base_url_locked(
         # Pop ourselves off the owner stack; whoever is still live decides what
         # the file should say now.
         mine = os.getpid()
+        # A live WRAPPER is not enough to hand routing back to: it stays
+        # blocked on the agent process long after its dedicated proxy dies, so
+        # handing `settings.local.json` to its recorded URL would point every
+        # later conversation at a dead port. Require the peer's proxy to still
+        # answer, matching what the crash-handover path already demands.
         survivors = [
-            o for o in _wrap_marker_owners(path) if o.get("key") == key and o.get("pid") != mine
+            o
+            for o in _wrap_marker_owners(path)
+            if o.get("key") == key
+            and o.get("pid") != mine
+            and (not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"])))
         ]
         # Pop ONLY our own (pid, key) entries, computed from the PERSISTED
         # stack. The stack is shared across endpoint keys: a concurrent run in

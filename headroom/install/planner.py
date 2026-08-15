@@ -7,7 +7,7 @@ from collections.abc import Iterable
 
 import click
 
-from headroom import paths as _paths
+from headroom.isolation import persistent_memory_db_path as _persistent_memory_db_path
 from headroom.providers.install_registry import build_install_target_envs
 
 from .models import (
@@ -181,7 +181,7 @@ def build_manifest(
     ]
     proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
     if memory_enabled:
-        proxy_args.extend(["--memory", "--memory-db-path", str(_paths.memory_db_path())])
+        proxy_args.extend(["--memory", "--memory-db-path", str(_persistent_memory_db_path())])
     if anyllm_provider:
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
@@ -213,7 +213,7 @@ def build_manifest(
         region=region,
         proxy_mode=proxy_mode,
         memory_enabled=memory_enabled,
-        memory_db_path=str(_paths.memory_db_path()),
+        memory_db_path=str(_persistent_memory_db_path()),
         telemetry_enabled=telemetry_enabled,
         image=image,
         service_name=f"headroom-{normalized_profile}",

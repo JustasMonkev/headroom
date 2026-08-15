@@ -95,6 +95,24 @@ def _trimmed_env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+def _abs(path: Path) -> str:
+    """``path`` as an absolute string, resolving symlinks when possible.
+
+    Everything isolation exports is inherited by subprocesses that resolve
+    relative values against THEIR working directory, and the wrapped agent
+    routinely runs from elsewhere. A relatively configured
+    ``HEADROOM_WORKSPACE_DIR`` must therefore be absolutized before export, or
+    a nested Headroom command silently opens a different tree. Falls back to
+    ``absolute()`` when the path cannot be resolved (missing parents, an
+    unreadable link) — still absolute, just not symlink-collapsed.
+    """
+
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
+
+
 def _pin_env(name: str, value: str) -> None:
     """Set ``name`` unless it already holds a MEANINGFUL value.
 
@@ -255,6 +273,29 @@ def _owner_is_live(pid: int | None, record: dict[str, Any] | None) -> bool:
     return not identity_mismatch(record.get("start_src"), record.get("start_time"), pid)
 
 
+def persistent_memory_db_path() -> Path:
+    """The memory DB a PERSISTENT artifact should reference.
+
+    ``headroom install apply --memory`` run from inside an isolated agent
+    would otherwise bake ``<run>/memory.db`` into the deployment manifest and
+    the supervised proxy's arguments: a database no top-level run shares and
+    that run-dir GC deletes once the deployment has been quiet, even though
+    the manifest itself lives on the shared root.
+
+    Only the path ISOLATION chose is overridden. A user who pinned
+    ``HEADROOM_MEMORY_DB_PATH`` themselves meant it, so it is returned as-is —
+    the same test ``disable_isolation`` uses to decide what it may unset.
+    """
+
+    configured = _trimmed_env(HEADROOM_MEMORY_DB_PATH_ENV)
+    isolated_ws = active_isolated_workspace()
+    if isolated_ws is not None and configured == str(isolated_ws / _MEMORY_DB_FILE):
+        return paths.shared_workspace_dir() / _MEMORY_DB_FILE
+    if configured:
+        return Path(configured).expanduser()
+    return paths.shared_workspace_dir() / _MEMORY_DB_FILE
+
+
 def record_run_owner(run_dir: Path) -> None:
     """Stamp the creating wrapper's start identity into a fresh run dir.
 
@@ -378,31 +419,30 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
     # not shadow the user's real config or persistent shared state.
     # `_pin_env`, not `setdefault` — a present-but-blank override reads as
     # unset everywhere else and must not block the pin.
-    _pin_env(paths.HEADROOM_CONFIG_DIR_ENV, str(paths.config_dir()))
-    _pin_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(paths.workspace_dir()))
+    # Every pin is ABSOLUTE. These are inherited by subprocesses, and the
+    # wrapped agent routinely changes directory before spawning a nested
+    # Headroom command — a relatively configured HEADROOM_WORKSPACE_DIR would
+    # otherwise leave the child resolving the config root, the shared root and
+    # the settings path beneath ITS cwd, quietly missing the intended model
+    # config and redirecting managed binaries, the MCP ledger and marker locks
+    # into a second tree.
+    _pin_env(paths.HEADROOM_CONFIG_DIR_ENV, _abs(paths.config_dir()))
+    _pin_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, _abs(paths.workspace_dir()))
     # The dashboard-managed settings file is a persistent user preference, not
     # run state: pin it to the shared root so an edit made from an isolated
     # run's dashboard is not written into a directory GC later deletes.
-    _pin_env(paths.HEADROOM_SETTINGS_PATH_ENV, str(paths.settings_path()))
+    _pin_env(paths.HEADROOM_SETTINGS_PATH_ENV, _abs(paths.settings_path()))
     # Record the exact workspace we are taking over, so `--shared` restores it
     # rather than assuming it equals the shared-resource root.
-    os.environ[HEADROOM_PREISOLATION_WORKSPACE_ENV] = str(paths.workspace_dir())
+    os.environ[HEADROOM_PREISOLATION_WORKSPACE_ENV] = _abs(paths.workspace_dir())
 
     runs_root = paths.workspace_dir() / _RUNS_DIR
     prune_stale_runs(runs_root)
     run_dir = runs_root / f"run-{run_id or _new_run_id()}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    # Export an ABSOLUTE path. A user may configure HEADROOM_WORKSPACE_DIR
-    # relatively, in which case run_dir is relative too — and every value
-    # below is inherited by subprocesses that resolve it against THEIR cwd.
-    # A nested Headroom command run from a different directory would then open
-    # a different workspace and memory.db than the proxy, quietly defeating the
-    # process-tree isolation this whole module promises. Resolve after mkdir so
-    # symlinks in the path collapse consistently for every reader.
-    try:
-        run_dir = run_dir.resolve()
-    except OSError:
-        run_dir = run_dir.absolute()
+    # Resolve after mkdir so symlinks in the path collapse consistently for
+    # every reader (see `_abs` for why absolute matters at all).
+    run_dir = Path(_abs(run_dir))
     record_run_owner(run_dir)
 
     os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(run_dir)
@@ -423,6 +463,7 @@ __all__ = [
     "active_isolated_workspace",
     "activate_isolated_workspace",
     "prune_stale_runs",
+    "persistent_memory_db_path",
     "record_run_owner",
     "record_run_proxy",
 ]
