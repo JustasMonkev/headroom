@@ -83,6 +83,13 @@ real `~/.headroom` while the workspace bucket above moves into the run dir.
 | License cache | `${SHARED_WORKSPACE_DIR}/license_cache.json` | — |
 | Copilot OAuth token | `${SHARED_WORKSPACE_DIR}/copilot_auth.json` | `HEADROOM_COPILOT_AUTH_FILE` |
 | MCP install ledger | `${SHARED_WORKSPACE_DIR}/mcp_installs.json` | — |
+| Proxy client markers | `${SHARED_WORKSPACE_DIR}/clients/<port>/` | — |
+
+Proxy client markers reference-count a proxy instance identified by
+`127.0.0.1:<port>`, which is machine-wide — every client of a given proxy
+must register in the same directory, including an isolated `--no-proxy` run
+attaching to the shared proxy. A dedicated proxy still gets its own
+directory because the path is keyed by its distinct port.
 
 ### Config bucket (`HEADROOM_CONFIG_DIR`)
 

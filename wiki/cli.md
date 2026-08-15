@@ -779,6 +779,28 @@ For a tool that records the proxy port in its own on-disk config (Codex and
 Grok register the `headroom` retrieve MCP server; OMP writes `models.yml`),
 the dedicated port is reapplied after the proxy binds, so retrieval and
 inference target the run's actual proxy rather than the reserved base port.
+Because `models.yml` is a single shared file that omp-spawned children
+re-read, an isolated OMP run additionally gets its own copy of omp's agent
+directory (via `PI_CODING_AGENT_DIR`, seeded from the existing one so the
+model catalog and credentials carry over) — otherwise two concurrent runs
+would overwrite each other's endpoint. `wrap claude` records the actual
+bound port in its `.headroom_wrap_marker.json`, so the SessionStart
+self-heal hook does not mistake a live run on 8788 for a dead one.
+
+One project-local file cannot hold two different routes: if you run two
+isolated `wrap claude` sessions **from the same directory**, both write
+`.claude/settings.local.json`, and Claude re-reads it for each new
+conversation. Headroom keeps this safe rather than silent — the second
+launch prints a notice, never records the first run's URL as the project's
+"original" value, and an exiting run leaves a still-live peer's routing
+untouched. For genuinely independent Claude routing, run each agent from
+its own working directory. (`headroom unwrap claude` still always wins.)
+
+With `--no-proxy` an isolated run deliberately attaches to the shared
+proxy; its client marker is registered in the shared workspace so the
+wrapper that owns that proxy still sees it and will not shut the proxy down
+underneath the run. Similarly, `wrap copilot` only adopts a running proxy's
+backend when it will actually reuse that proxy.
 
 Trade-offs of the isolated default: it severs cross-agent memory for the
 run (each isolated run has its own `memory.db`), per-run savings are not

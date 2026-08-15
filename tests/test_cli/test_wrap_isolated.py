@@ -9,6 +9,7 @@ callback.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -61,7 +62,7 @@ class TestEnsureProxyIsolated:
 
     def _patch_common(self, monkeypatch: pytest.MonkeyPatch, started: list[int]) -> None:
         monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
-        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p: p)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p, max_attempts=100: p)
 
         def fake_start(port: int, **_kw: Any) -> _FakeProc:
             started.append(port)
@@ -318,7 +319,7 @@ class TestEnsureProxyPortRaceRetry:
         monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
         monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
-        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p: p)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p, max_attempts=100: p)
 
         started: list[int] = []
 
@@ -342,7 +343,7 @@ class TestEnsureProxyPortRaceRetry:
         monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
         monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
-        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p: p)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p, max_attempts=100: p)
 
         def always_lose(port: int, **_kw: Any) -> _FakeProc:
             raise wrap_mod._DedicatedProxyPortRaceLost(port)
@@ -462,3 +463,256 @@ class TestMemoryMcpServerDbDefault:
         parser = argparse.ArgumentParser()
         parser.add_argument("--db", default=default)
         assert parser.parse_args([]).db == str(tmp_path / "iso" / "memory.db")
+
+
+class TestDedicatedPortSearch:
+    """Dedicated proxies never claim the reserved base port, and --port 65535
+    (max, Click-accepted) must still work under the isolated default (P2)."""
+
+    @pytest.mark.parametrize(
+        "base,after",
+        [(8787, None), (8787, 8790), (65535, None), (65535, 65534), (65535, 65533), (1, None)],
+    )
+    def test_search_range_never_contains_reserved_port(self, base: int, after: int | None) -> None:
+        start = wrap_mod._dedicated_port_search_start(base, after=after)
+        attempts = wrap_mod._dedicated_port_attempts(base, start)
+        lo, hi = start, start + attempts - 1
+
+        assert not (lo <= base <= hi), f"reserved port {base} inside {lo}..{hi}"
+        assert hi <= 65535, f"range {lo}..{hi} exceeds the max port"
+        assert lo >= 1
+
+    def test_max_port_searches_below_instead_of_failing(self) -> None:
+        """65535 + 1 would be an empty range; fall back to a window below."""
+        start = wrap_mod._dedicated_port_search_start(65535)
+        assert start < 65535
+        assert wrap_mod._dedicated_port_attempts(65535, start) == 65535 - start
+
+    def test_normal_port_searches_above(self) -> None:
+        assert wrap_mod._dedicated_port_search_start(8787) == 8788
+
+    def test_ensure_proxy_at_max_port_still_starts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: an isolated run with --port 65535 gets a dedicated proxy
+        below the reserved port instead of "No available port found"."""
+
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
+        monkeypatch.setattr(wrap_mod, "_find_available_port", lambda p, max_attempts=100: p)
+        started: list[int] = []
+
+        def fake_start(port: int, **_kw: Any) -> _FakeProc:
+            started.append(port)
+            return _FakeProc()
+
+        monkeypatch.setattr(wrap_mod, "_start_proxy", fake_start)
+
+        result: list[Any] = []
+        _run_in_click_context(lambda: result.append(wrap_mod._ensure_proxy(65535, no_proxy=False)))
+
+        _proc, actual_port = result[0]
+        assert actual_port != 65535
+        assert actual_port < 65535
+        assert started == [actual_port]
+
+
+class TestClaudeWrapMarkerConcurrency:
+    """The project-local .claude/settings.local.json is shared by concurrent
+    isolated runs; write/restore must be ownership-aware (PR #25 review P1)."""
+
+    def _settings(self, tmp_path: Path) -> Path:
+        p = tmp_path / ".claude" / "settings.local.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _marker(self, settings: Path) -> dict[str, Any]:
+        return json.loads(settings.parent.joinpath(".headroom_wrap_marker.json").read_text())
+
+    def test_marker_records_the_port_it_was_given(self, tmp_path: Path) -> None:
+        """The self-heal hook probes the marker's port; it must be the port the
+        proxy actually bound, not the requested one."""
+        settings = self._settings(tmp_path)
+
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        assert self._marker(settings)["port"] == 8788
+        assert self._marker(settings)["pid"] == os.getpid()
+
+    def test_second_run_inherits_the_original_previous_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Run B must record the user's ORIGINAL value as `previous`, not run
+        A's proxy URL — otherwise B's exit restores a dead endpoint."""
+        settings = self._settings(tmp_path)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://upstream"}}))
+
+        # Run A (a different, still-live pid) claims the file.
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        marker = self._marker(settings)
+        marker["pid"] = 424242  # pretend a different process owns it
+        settings.parent.joinpath(".headroom_wrap_marker.json").write_text(json.dumps(marker))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _m: False)
+
+        # Run B now writes; it should inherit A's recorded original.
+        previous_for_b = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+
+        assert previous_for_b == "https://upstream"
+
+    def test_restore_defers_to_a_live_peer_owner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exiting run A must not clobber live run B's URL or marker."""
+        settings = self._settings(tmp_path)
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+        marker = self._marker(settings)
+        marker["pid"] = 424242  # run B owns the marker now
+        settings.parent.joinpath(".headroom_wrap_marker.json").write_text(json.dumps(marker))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _m: False)
+
+        wrap_mod._restore_claude_wrap_base_url(None, settings_path=settings)
+
+        # B's URL and marker survive A's exit.
+        payload = json.loads(settings.read_text())
+        assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8789"
+        assert settings.parent.joinpath(".headroom_wrap_marker.json").exists()
+
+    def test_restore_proceeds_when_we_own_the_marker(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        wrap_mod._restore_claude_wrap_base_url(None, settings_path=settings)
+
+        payload = json.loads(settings.read_text()) if settings.exists() else {}
+        assert "ANTHROPIC_BASE_URL" not in payload.get("env", {})
+        assert not settings.parent.joinpath(".headroom_wrap_marker.json").exists()
+
+    def test_force_overrides_the_ownership_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """unwrap / stale-cleanup must still be able to restore."""
+        settings = self._settings(tmp_path)
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8789", settings_path=settings, port=8789
+        )
+        marker = self._marker(settings)
+        marker["pid"] = 424242
+        settings.parent.joinpath(".headroom_wrap_marker.json").write_text(json.dumps(marker))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _m: False)
+
+        wrap_mod._restore_claude_wrap_base_url(None, settings_path=settings, _force=True)
+
+        payload = json.loads(settings.read_text()) if settings.exists() else {}
+        assert "ANTHROPIC_BASE_URL" not in payload.get("env", {})
+
+
+class TestIsolateOmpAgentDir:
+    """Concurrent isolated OMP runs must not fight over ~/.omp/agent/models.yml."""
+
+    def test_noop_without_isolation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        assert wrap_mod._isolate_omp_agent_dir() is None
+        assert "PI_CODING_AGENT_DIR" not in os.environ
+
+    def test_isolated_run_gets_its_own_agent_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        run_dir = isolation.activate_isolated_workspace()
+
+        target = wrap_mod._isolate_omp_agent_dir()
+
+        assert target == run_dir / "omp-agent"
+        assert target.is_dir()
+        assert os.environ["PI_CODING_AGENT_DIR"] == str(target)
+        # models.yml now resolves inside the run dir, so a concurrent run's
+        # rewrite cannot touch this run's endpoint.
+        from headroom.providers.omp import models_yml_path
+
+        assert models_yml_path() == target / "models.yml"
+
+    def test_seeds_from_the_users_existing_agent_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The copy preserves omp's bundled catalog and stored credentials."""
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        fake_home = tmp_path / "home"
+        source = fake_home / ".omp" / "agent"
+        source.mkdir(parents=True)
+        (source / "models.yml").write_text("providers: {anthropic: {}}\n")
+        (source / "credentials.json").write_text("{}")
+        monkeypatch.setattr(wrap_mod.Path, "home", classmethod(lambda _cls: fake_home))
+        isolation.activate_isolated_workspace()
+
+        target = wrap_mod._isolate_omp_agent_dir()
+
+        assert target is not None
+        assert (target / "models.yml").read_text() == "providers: {anthropic: {}}\n"
+        assert (target / "credentials.json").exists()
+
+    def test_explicit_user_agent_dir_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "mine"))
+        isolation.activate_isolated_workspace()
+
+        assert wrap_mod._isolate_omp_agent_dir() is None
+        assert os.environ["PI_CODING_AGENT_DIR"] == str(tmp_path / "mine")
+
+
+class TestCopilotBackendProbeGate:
+    """`wrap copilot` must only inherit a running proxy's backend when it will
+    actually REUSE that proxy. An isolated run (the default) starts its own
+    dedicated proxy with the requested/env backend (PR #25 review P1)."""
+
+    def _run(
+        self, monkeypatch: pytest.MonkeyPatch, argv: list[str], running_backend: str = "anyllm"
+    ) -> list[Any]:
+        seen: list[Any] = []
+
+        class _Stop(Exception):
+            pass
+
+        monkeypatch.setattr(wrap_mod.shutil, "which", lambda _n: "/usr/bin/copilot")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_detect_running_proxy_backend", lambda _p: running_backend)
+
+        def _validate(**kwargs: Any) -> None:
+            seen.append(kwargs.get("backend"))
+            raise _Stop()
+
+        monkeypatch.setattr(wrap_mod, "_validate_copilot_configuration", _validate)
+
+        runner = CliRunner()
+        runner.invoke(main, argv, catch_exceptions=True)
+        return seen
+
+    def test_isolated_run_does_not_inherit_shared_proxy_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = self._run(monkeypatch, ["wrap", "--isolated", "copilot"])
+
+        # An unrelated anyllm proxy on 8787 must not become our backend: this
+        # run gets its own dedicated proxy on the default (Anthropic) backend.
+        assert seen == [None]
+
+    def test_shared_run_still_inherits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = self._run(monkeypatch, ["wrap", "--shared", "copilot"])
+
+        # Shared mode genuinely reuses the running proxy, so inheriting is right.
+        assert seen == ["anyllm"]
+
+    def test_no_proxy_inherits_even_when_isolated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = self._run(monkeypatch, ["wrap", "--isolated", "copilot", "--no-proxy"])
+
+        # --no-proxy explicitly attaches to the running proxy.
+        assert seen == ["anyllm"]

@@ -334,3 +334,24 @@ class TestPrunePidLiveness:
         isolation.prune_stale_runs(runs)
 
         assert recent.exists()
+
+
+class TestProxyClientMarkersShared:
+    """Client markers reference-count a machine-wide proxy instance, so every
+    client of a given port must register in ONE directory (PR #25 review P2)."""
+
+    def test_clients_dir_follows_shared_root(self, tmp_path: Path) -> None:
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        # An isolated --no-proxy run attaches to the SHARED proxy on 8787; its
+        # marker must be visible to the shared-mode wrapper that owns it.
+        assert paths.proxy_clients_dir(8787) == pre / "clients" / "8787"
+
+    def test_dedicated_port_still_gets_its_own_dir(self, tmp_path: Path) -> None:
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        # Keyed by port, so a dedicated proxy never collides with the shared one.
+        assert paths.proxy_clients_dir(8788) == pre / "clients" / "8788"
+        assert paths.proxy_clients_dir(8788) != paths.proxy_clients_dir(8787)

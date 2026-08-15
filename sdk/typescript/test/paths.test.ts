@@ -10,6 +10,7 @@ import * as path from "path";
 import {
   HEADROOM_CONFIG_DIR_ENV,
   HEADROOM_SAVINGS_PATH_ENV,
+  HEADROOM_SHARED_WORKSPACE_DIR_ENV,
   HEADROOM_SUBSCRIPTION_STATE_PATH_ENV,
   HEADROOM_TOIN_PATH_ENV,
   HEADROOM_WORKSPACE_DIR_ENV,
@@ -19,6 +20,7 @@ import {
   configDir,
   debug400Dir,
   deployRoot,
+  leanCtxPath,
   licenseCachePath,
   logDir,
   memoryDbPath,
@@ -30,6 +32,7 @@ import {
   rtkPath,
   savingsPath,
   sessionStatsPath,
+  sharedWorkspaceDir,
   subscriptionStatePath,
   syncStatePath,
   toinPath,
@@ -43,6 +46,7 @@ import {
 const ENV_VARS = [
   HEADROOM_CONFIG_DIR_ENV,
   HEADROOM_WORKSPACE_DIR_ENV,
+  HEADROOM_SHARED_WORKSPACE_DIR_ENV,
   HEADROOM_SAVINGS_PATH_ENV,
   HEADROOM_TOIN_PATH_ENV,
   HEADROOM_SUBSCRIPTION_STATE_PATH_ENV,
@@ -443,5 +447,66 @@ describe("browser fallback", () => {
       }
       restoreEnv(snap);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared workspace root — parity with headroom.paths.shared_workspace_dir.
+// `headroom wrap` is isolated by default and relocates HEADROOM_WORKSPACE_DIR
+// into an ephemeral run dir while pinning HEADROOM_SHARED_WORKSPACE_DIR to the
+// real ~/.headroom. Persistent resources must follow the shared root.
+// ---------------------------------------------------------------------------
+
+describe("shared workspace root", () => {
+  let snap: Record<string, string | undefined>;
+  beforeEach(() => {
+    snap = saveEnv();
+    clearEnv();
+  });
+  afterEach(() => restoreEnv(snap));
+
+  it("falls back to workspaceDir when unset", () => {
+    expect(sharedWorkspaceDir()).toBe(workspaceDir());
+  });
+
+  it("falls back to a relocated workspace when unset", () => {
+    process.env[HEADROOM_WORKSPACE_DIR_ENV] = "/tmp/alt_ws";
+    expect(sharedWorkspaceDir()).toBe("/tmp/alt_ws");
+  });
+
+  it("wins over the workspace root when set", () => {
+    process.env[HEADROOM_WORKSPACE_DIR_ENV] = "/tmp/ws/runs/run-x";
+    process.env[HEADROOM_SHARED_WORKSPACE_DIR_ENV] = "/tmp/ws";
+    expect(sharedWorkspaceDir()).toBe("/tmp/ws");
+    expect(workspaceDir()).toBe("/tmp/ws/runs/run-x");
+  });
+
+  it("keeps managed binaries and the license cache off the run dir", () => {
+    process.env[HEADROOM_WORKSPACE_DIR_ENV] = "/tmp/ws/runs/run-x";
+    process.env[HEADROOM_SHARED_WORKSPACE_DIR_ENV] = "/tmp/ws";
+
+    expect(binDir()).toBe(path.join("/tmp/ws", "bin"));
+    expect(rtkPath()).toBe(
+      path.join("/tmp/ws", "bin", process.platform === "win32" ? "rtk.exe" : "rtk"),
+    );
+    expect(leanCtxPath()).toBe(
+      path.join(
+        "/tmp/ws",
+        "bin",
+        process.platform === "win32" ? "lean-ctx.exe" : "lean-ctx",
+      ),
+    );
+    expect(licenseCachePath()).toBe(path.join("/tmp/ws", "license_cache.json"));
+  });
+
+  it("leaves run-specific resources on the run dir", () => {
+    process.env[HEADROOM_WORKSPACE_DIR_ENV] = "/tmp/ws/runs/run-x";
+    process.env[HEADROOM_SHARED_WORKSPACE_DIR_ENV] = "/tmp/ws";
+
+    expect(memoryDbPath()).toBe(path.join("/tmp/ws/runs/run-x", "memory.db"));
+    expect(savingsPath()).toBe(
+      path.join("/tmp/ws/runs/run-x", "proxy_savings.json"),
+    );
+    expect(logDir()).toBe(path.join("/tmp/ws/runs/run-x", "logs"));
   });
 });

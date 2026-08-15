@@ -229,24 +229,30 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
 
     assert result.exit_code == 0, result.output
     settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    # `_force=True`: unwrap is an explicit user action and must restore even
+    # when another live wrap session currently owns the settings marker (the
+    # ownership guard only defers the automatic wrap-exit restore).
     assert restore_calls == [
         {
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": False,
             "settings_path": settings_path,
+            "_force": True,
         },
         {
             "previous": None,
             "foundry_mode": True,
             "vertex_mode": False,
             "settings_path": settings_path,
+            "_force": True,
         },
         {
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": True,
             "settings_path": settings_path,
+            "_force": True,
         },
     ]
 

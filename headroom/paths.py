@@ -380,9 +380,20 @@ def bin_dir() -> Path:
 
 
 def proxy_clients_dir(port: int) -> Path:
-    """Per-port dir of live wrap-client markers (one file per client PID)."""
+    """Per-port dir of live wrap-client markers (one file per client PID).
 
-    return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
+    Resolved against the *shared* workspace: these markers reference-count a
+    proxy instance identified by ``127.0.0.1:<port>``, which is machine-wide,
+    so every client of that proxy must register in the same directory. Under
+    per-run isolation a run that attaches to the shared proxy (``--no-proxy``)
+    would otherwise drop its marker inside its own ephemeral run directory,
+    invisible to the shared-mode wrapper that owns the proxy — which would
+    then see no remaining clients and terminate the proxy while that run is
+    still using it. A dedicated proxy keeps its own directory anyway, since
+    the path is keyed by its distinct port.
+    """
+
+    return shared_workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
 
 
 def rtk_path() -> Path:

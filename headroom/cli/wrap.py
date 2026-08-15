@@ -543,6 +543,41 @@ def _get_proxy_stdio_log_path() -> Path:
 # squatting ports.
 _MAX_DEDICATED_PORT_ATTEMPTS = 20
 
+_MAX_PORT = 65535
+# How far below the reserved port to look when there is no room above it.
+_DEDICATED_PORT_WINDOW = 100
+
+
+def _dedicated_port_search_start(reserved_port: int, after: int | None = None) -> int:
+    """First port to probe for a dedicated proxy.
+
+    Dedicated proxies take the first free port ABOVE the requested one so the
+    base port stays reserved for the shared proxy. ``--port 65535`` (a value
+    Click accepts) leaves no room above, and isolation is now the DEFAULT — so
+    rather than failing a run the user never explicitly asked to isolate, fall
+    back to a window strictly BELOW the reserved port.
+    """
+
+    start = reserved_port + 1 if after is None else after + 1
+    if start == reserved_port:
+        # A retry walked back up to the reserved port — step over it.
+        start = reserved_port + 1
+    if start > _MAX_PORT:
+        return max(1, reserved_port - _DEDICATED_PORT_WINDOW)
+    return start
+
+
+def _dedicated_port_attempts(reserved_port: int, search_from: int) -> int:
+    """Probe budget that can never hand back ``reserved_port`` itself.
+
+    When searching below the reserved port, stop one short of it; the base
+    port belongs to the shared proxy even when momentarily free.
+    """
+
+    if search_from < reserved_port:
+        return max(1, reserved_port - search_from)
+    return 100
+
 
 class _DedicatedProxyPortRaceLost(Exception):
     """A dedicated proxy start lost a concurrent bind race for its port.
@@ -1360,7 +1395,11 @@ def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str 
         f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
         err=True,
     )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    # _force: this path is explicitly restoring a DEAD session's leftover,
+    # so the ownership guard in the restorer must not skip it.
+    _restore_claude_wrap_base_url(
+        previous, settings_path=settings_path, _key_override=key, _force=True
+    )
     return previous
 
 
@@ -1400,7 +1439,11 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         f"running (issue #2221); restoring prior value",
         err=True,
     )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    # _force: this path is explicitly restoring a DEAD session's leftover,
+    # so the ownership guard in the restorer must not skip it.
+    _restore_claude_wrap_base_url(
+        previous, settings_path=settings_path, _key_override=key, _force=True
+    )
     return previous
 
 
@@ -1584,6 +1627,35 @@ def _write_claude_wrap_base_url(
     env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
     previous = env_map.get(key)
+    # Concurrent isolated runs in one project share this single project-local
+    # file. A stale marker was already cleared by the caller, so a marker still
+    # present here belongs to another LIVE wrap session — meaning the value in
+    # the file is THAT session's proxy URL, not the user's original. Inherit
+    # its recorded original so exiting never restores a peer's (soon dead)
+    # proxy URL as if it were the project's own setting.
+    concurrent = _read_wrap_marker(path)
+    if (
+        concurrent is not None
+        and concurrent.get("key") == key
+        and not _wrap_marker_is_stale(concurrent)
+    ):
+        # A live marker means the value in the file was written by Headroom
+        # (this process on a re-entrant write, or a peer session), so the
+        # user's real original is the one that marker recorded.
+        previous = concurrent.get("previous")
+    if (
+        concurrent is not None
+        and concurrent.get("key") == key
+        and concurrent.get("pid") != os.getpid()
+        and not _wrap_marker_is_stale(concurrent)
+    ):
+        click.echo(
+            f"  Note: another live wrap session (pid {concurrent.get('pid')}) is routing "
+            f"this project through port {concurrent.get('port')}. Claude re-reads "
+            f"{path.name} for new conversations, so its future conversations will use "
+            "this session's proxy. Run concurrent agents from separate working "
+            "directories to keep their routing independent.",
+        )
     env_map[key] = proxy_url
     payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1600,6 +1672,7 @@ def _restore_claude_wrap_base_url(
     vertex_mode: bool = False,
     settings_path: Path | None = None,
     _key_override: str | None = None,
+    _force: bool = False,
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -1608,11 +1681,28 @@ def _restore_claude_wrap_base_url(
     ``previous`` is None the key is removed; when it has a value it is
     restored — preserving any URL the project already had set. Also clears
     this key's sidecar wrap marker, if any (issue #1768).
+
+    Ownership: if the sidecar marker names a DIFFERENT, still-live wrap
+    session, that session took over routing for this project (concurrent
+    isolated runs share one project-local file). Restoring here would point
+    its daemon-spawned workers at a dead endpoint, so we leave both the file
+    and the marker alone. ``_force`` bypasses this for the stale-marker
+    cleanup path, which is explicitly restoring another (dead) session's
+    leftover.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
+    if not _force:
+        owner = _read_wrap_marker(path)
+        if (
+            owner is not None
+            and owner.get("key") == key
+            and owner.get("pid") != os.getpid()
+            and not _wrap_marker_is_stale(owner)
+        ):
+            return
     if not path.exists():
         _clear_wrap_marker(path, key=key)
         return
@@ -4341,11 +4431,16 @@ def _ensure_proxy(
         # defeating isolation. `_start_proxy(require_owned=True)` raises when it
         # loses that race, and we retry on a higher port. The shared path keeps
         # its single-shot behavior (a shared proxy is meant to be reused).
-        search_from = port + 1 if dedicated_session_proxy else port
+        search_from = _dedicated_port_search_start(port) if dedicated_session_proxy else port
         attempt = 0
         while True:
             try:
-                actual_port = helpers._find_available_port(search_from)
+                if dedicated_session_proxy:
+                    actual_port = helpers._find_available_port(
+                        search_from, max_attempts=_dedicated_port_attempts(port, search_from)
+                    )
+                else:
+                    actual_port = helpers._find_available_port(search_from)
             except OSError as e:
                 raise click.ClickException(f"Port {port} is unavailable: {e}") from e
             except RuntimeError as e:
@@ -4392,10 +4487,9 @@ def _ensure_proxy(
                         "Retry, or pass an explicit free --port."
                     ) from None
                 click.echo(
-                    f"  Port {actual_port} was claimed by another proxy; "
-                    "retrying on a higher port..."
+                    f"  Port {actual_port} was claimed by another proxy; retrying on another port..."
                 )
-                search_from = actual_port + 1
+                search_from = _dedicated_port_search_start(port, after=actual_port)
                 continue
             except RuntimeError as e:
                 click.echo(f"  Error: {e}")
@@ -4604,6 +4698,50 @@ def _reject_misplaced_isolated_flag(args: tuple, tool: str) -> None:
                 f"{flag} is a `wrap` group flag and goes before the tool name: "
                 f"headroom wrap {flag} {tool} ..."
             )
+
+
+def _isolate_omp_agent_dir(*, verbose: bool = False) -> Path | None:
+    """Give an isolated run its own omp agent dir. Returns it, or None.
+
+    ``~/.omp/agent/models.yml`` is omp's AUTHORITATIVE inference endpoint and
+    omp-spawned child sessions re-read it. Concurrent isolated runs each need a
+    different proxy port in that file, so sharing it means the later launch
+    silently re-routes the earlier run's children through ITS proxy (or, once
+    it exits, at a dead port).
+
+    ``PI_CODING_AGENT_DIR`` relocates omp's whole agent state directory, so
+    pointing it at a per-run copy gives each isolated run its own models.yml.
+    The existing directory is copied (not just referenced) so omp keeps its
+    bundled model catalog and stored credentials; the copy lives in the run
+    directory and disappears with it. Best-effort: any failure falls back to
+    the shared directory rather than blocking the launch.
+    """
+
+    from headroom import paths as _paths
+
+    if not _isolation_requested():
+        return None
+    if os.environ.get("PI_CODING_AGENT_DIR", "").strip():
+        # The user pinned an explicit agent dir — never second-guess it.
+        return None
+
+    target = _paths.workspace_dir() / "omp-agent"
+    source = Path.home() / ".omp" / "agent"
+    try:
+        if source.is_dir() and not target.exists():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        click.echo(
+            f"  Warning: could not create a per-run omp config ({exc}); "
+            "falling back to the shared ~/.omp/agent."
+        )
+        return None
+
+    os.environ["PI_CODING_AGENT_DIR"] = str(target)
+    if verbose:
+        click.echo(f"  Isolated omp config: {target}")
+    return target
 
 
 def _wrap_memory_db_path() -> Path:
@@ -5466,7 +5604,12 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            # The marker's port is what the SessionStart self-heal hook probes
+            # to decide whether this entry is dead. An isolated run's proxy is
+            # on actual_port (not the requested one), so recording `port` here
+            # would make self-heal clear a LIVE session's base URL and stop its
+            # daemon-spawned workers from routing through Headroom.
+            port=actual_port,
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -5635,6 +5778,10 @@ def unwrap_claude(
             foundry_mode=_foundry,
             vertex_mode=_vertex,
             settings_path=_unwrap_settings_path,
+            # `unwrap` is an explicit user action: it undoes the wrapping even
+            # when another wrap session currently owns the marker. Only the
+            # automatic wrap-exit restore defers to a live peer.
+            _force=True,
         )
 
     # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
@@ -5773,7 +5920,15 @@ def copilot(
         raise SystemExit(1)
 
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
-    if _check_proxy(port):
+    # Only inherit a running proxy's backend when this invocation will ACTUALLY
+    # reuse that proxy. An isolated run (the default) starts its own dedicated
+    # proxy on another port with the requested/env backend, and --subscription
+    # always gets a private seeded proxy — inheriting an unrelated shared
+    # proxy's backend there would validate against a proxy we never talk to
+    # (e.g. an anyllm shared proxy fails `--subscription` outright, or selects
+    # an OpenAI-style client config while our dedicated proxy starts Anthropic).
+    _will_reuse_running_proxy = no_proxy or not (_isolation_requested() or subscription)
+    if _will_reuse_running_proxy and _check_proxy(port):
         running_backend = _detect_running_proxy_backend(port)
         if effective_backend and running_backend and effective_backend != running_backend:
             raise click.ClickException(
@@ -8535,6 +8690,9 @@ def omp(
         headroom unwrap omp                     # Restore pre-wrap models.yml
     """
     _reject_misplaced_isolated_flag(omp_args, "omp")
+    # Before ANY models.yml work: an isolated run gets its own omp agent dir so
+    # concurrent runs don't overwrite each other's endpoint in the shared file.
+    _isolate_omp_agent_dir(verbose=verbose)
     # Setup CLI context tool for omp — it reads AGENTS.md from the project root.
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:

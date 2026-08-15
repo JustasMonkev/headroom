@@ -6,11 +6,21 @@
  * future local features (e.g. cache/log co-location with the Python
  * proxy) land on the same contract.
  *
- * Two canonical roots:
+ * Canonical roots:
  *   - HEADROOM_CONFIG_DIR     — read-mostly configuration
  *                               (default: ~/.headroom/config)
  *   - HEADROOM_WORKSPACE_DIR  — read-write state
  *                               (default: ~/.headroom)
+ *   - HEADROOM_SHARED_WORKSPACE_DIR — persistent, cross-run state that must
+ *                               never land in an ephemeral per-run workspace
+ *                               (default: = HEADROOM_WORKSPACE_DIR)
+ *
+ * `headroom wrap` is isolated by default: it relocates
+ * HEADROOM_WORKSPACE_DIR to ~/.headroom/runs/run-<...> and pins
+ * HEADROOM_SHARED_WORKSPACE_DIR to the original ~/.headroom. A Node process
+ * launched inside such a run must resolve managed binaries and the license
+ * cache against the shared root, or it would re-download them into a
+ * directory that run-dir garbage collection later deletes.
  *
  * Precedence for every per-resource helper is:
  *   explicit argument > per-resource env var > derived from canonical
@@ -28,6 +38,7 @@
 
 export const HEADROOM_CONFIG_DIR_ENV = "HEADROOM_CONFIG_DIR";
 export const HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR";
+export const HEADROOM_SHARED_WORKSPACE_DIR_ENV = "HEADROOM_SHARED_WORKSPACE_DIR";
 
 export const HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH";
 export const HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH";
@@ -146,6 +157,20 @@ export function configDir(): string {
   return joinPath(home, ".headroom", "config");
 }
 
+/**
+ * The persistent (never-isolated) workspace root.
+ *
+ * Mirrors `headroom.paths.shared_workspace_dir`: falls back to
+ * {@link workspaceDir} when HEADROOM_SHARED_WORKSPACE_DIR is unset, so in the
+ * common non-isolated case the shared root *is* the workspace root.
+ */
+export function sharedWorkspaceDir(): string {
+  if (!isNode()) return "";
+  const envValue = getEnv(HEADROOM_SHARED_WORKSPACE_DIR_ENV);
+  if (envValue) return expandTilde(envValue);
+  return workspaceDir();
+}
+
 // ---------------------------------------------------------------------------
 // Per-resource helpers -- workspace bucket
 // ---------------------------------------------------------------------------
@@ -184,9 +209,10 @@ export function nativeMemoryDir(): string {
   return joinPath(workspaceDir(), "memories");
 }
 
+/** Machine-scoped and persistent — resolved against the shared root. */
 export function licenseCachePath(): string {
   if (!isNode()) return "";
-  return joinPath(workspaceDir(), "license_cache.json");
+  return joinPath(sharedWorkspaceDir(), "license_cache.json");
 }
 
 export function sessionStatsPath(): string {
@@ -219,14 +245,26 @@ export function debug400Dir(): string {
   return joinPath(logDir(), "debug_400");
 }
 
+/**
+ * Managed binaries (`rtk`, `lean-ctx`) are large and cross-run, so they live
+ * on the shared root — an isolated run reuses the already-downloaded binary
+ * instead of fetching a copy into an ephemeral run dir that GC later deletes.
+ */
 export function binDir(): string {
   if (!isNode()) return "";
-  return joinPath(workspaceDir(), "bin");
+  return joinPath(sharedWorkspaceDir(), "bin");
 }
 
 export function rtkPath(): string {
   if (!isNode()) return "";
   const name = process.platform === "win32" ? "rtk.exe" : "rtk";
+  return joinPath(binDir(), name);
+}
+
+/** Mirrors `headroom.paths.lean_ctx_path` — the other managed context tool. */
+export function leanCtxPath(): string {
+  if (!isNode()) return "";
+  const name = process.platform === "win32" ? "lean-ctx.exe" : "lean-ctx";
   return joinPath(binDir(), name);
 }
 
