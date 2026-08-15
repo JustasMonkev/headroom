@@ -9,8 +9,10 @@ callback.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal as signal_mod
 from pathlib import Path
 from typing import Any
 
@@ -759,15 +761,66 @@ class TestPrepareOnlyIsExemptFromIsolation:
 
 
 class TestLaunchToolSighup:
-    def test_launch_tool_registers_sighup(self) -> None:
+    def test_launch_tool_registers_a_sighup_handler_that_exits(self) -> None:
         """Closing the terminal sends SIGHUP; without a handler the wrapper
         dies and its detached dedicated proxy survives forever on the per-run
-        port (round 3, P2). claude() already does this."""
+        port (round 3, P2). claude() already does this.
+
+        Registering `cleanup` alone is NOT enough (round 19, P2): it returns,
+        and during proxy startup `proxy_holder[0]` is still None, so it does
+        nothing and the wrapper carries on to launch the proxy and the agent
+        after the terminal has closed. The handler must raise.
+        """
         import inspect
 
         src = inspect.getsource(wrap_mod._launch_tool)
         assert 'hasattr(signal, "SIGHUP")' in src
-        assert "signal.signal(signal.SIGHUP, cleanup)" in src
+        assert "signal.signal(signal.SIGHUP, _hangup)" in src
+        assert "raise SystemExit(0)" in src
+
+    def test_claude_sighup_handler_also_exits(self) -> None:
+        """`claude()` has its own copy of the pattern and the same startup
+        window, so it needs the same raising handler."""
+        import inspect
+
+        src = inspect.getsource(wrap_mod.claude.callback)
+        assert "signal.signal(signal.SIGHUP, _claude_hangup)" in src
+        assert "raise SystemExit(0)" in src
+
+    def test_the_sighup_handler_cleans_up_then_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Behavioural check on the handler `_launch_tool` installs."""
+        installed: dict[str, Any] = {}
+        cleaned: list[bool] = []
+
+        def capture(sig: Any, handler: Any) -> Any:
+            if sig == getattr(signal_mod, "SIGHUP", None):
+                installed["handler"] = handler
+            return None
+
+        monkeypatch.setattr(wrap_mod.signal, "signal", capture)
+        monkeypatch.setattr(
+            wrap_mod, "_make_cleanup", lambda *_a, **_k: lambda *_x: cleaned.append(True)
+        )
+        monkeypatch.setattr(wrap_mod, "_reject_misplaced_isolated_flag", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            wrap_mod,
+            "_ensure_proxy",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("stop here")),
+        )
+
+        # `_launch_tool` converts a proxy failure into its own exit; all this
+        # test needs is for the handler to have been installed before then.
+        with contextlib.suppress(BaseException):
+            wrap_mod._launch_tool("true", (), {}, 8787, False, "tool", [])
+
+        handler = installed.get("handler")
+        assert handler is not None, "no SIGHUP handler was installed"
+        cleaned.clear()  # `_launch_tool`'s own error path already ran cleanup
+
+        with pytest.raises(SystemExit):
+            handler(1, None)
+
+        assert cleaned == [True], "the handler exited without cleaning up"
 
 
 class TestMcpRegistrationForcesActualPort:
@@ -1035,7 +1088,7 @@ class TestCrashedOwnerHandsBackToLivePeer:
             },
         )
         settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8788"}}))
-        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _p: False)
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _p, **_k: False)
 
         restored = wrap_mod._check_and_clear_dead_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
 
@@ -2538,12 +2591,28 @@ class TestPortRewriteOnlyTouchesOurOwnVariables:
         assert result["HTTP_PROXY"] == "http://127.0.0.1:8787"
         assert result["DATABASE_URL"] == "postgres://127.0.0.1:8787/app"
 
-    def test_headroom_knobs_are_rewritten_even_when_inherited(
+    def test_inherited_headroom_service_urls_are_left_alone(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A parent wrap's HEADROOM_* endpoint is ours to re-point."""
-        monkeypatch.setenv("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+        """A `HEADROOM_*` prefix does NOT mean proxy routing: plenty of them
+        address other local services, and re-pointing those at the proxy sends
+        the agent and its MCP children to the wrong one."""
+        monkeypatch.setenv("HEADROOM_REDIS_URL", "redis://127.0.0.1:8787/0")
+        monkeypatch.setenv("HEADROOM_QDRANT_URL", "http://127.0.0.1:8787")
+        monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "http://127.0.0.1:8787/compress")
         env = os.environ.copy()
+
+        result = self._rewrite(env, 8787, 8788)
+
+        assert result["HEADROOM_REDIS_URL"] == "redis://127.0.0.1:8787/0"
+        assert result["HEADROOM_QDRANT_URL"] == "http://127.0.0.1:8787"
+        assert result["HEADROOM_KOMPRESS_ENDPOINT"] == "http://127.0.0.1:8787/compress"
+
+    def test_a_wrapper_set_headroom_var_is_rewritten(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """What matters is that WE wrote it, not what it is called."""
+        monkeypatch.delenv("HEADROOM_PROXY_URL", raising=False)
+        env = os.environ.copy()
+        env["HEADROOM_PROXY_URL"] = "http://127.0.0.1:8787"
 
         result = self._rewrite(env, 8787, 8788)
 
@@ -2653,3 +2722,89 @@ class TestReusedProxyMemoryDbIsQueried:
         assert isolation.align_memory_db_with_reused_proxy(str(reported)) is True
 
         assert Path(os.environ[isolation.HEADROOM_MEMORY_DB_PATH_ENV]) == reported.resolve()
+
+
+class TestReusedPortNeedsProxyIdentity:
+    """An accepting socket is not proof OUR proxy is the one accepting.
+    Isolated runs allocate transient nearby ports, so another project's proxy
+    can take a dead session's port before self-heal runs (round 19, P2)."""
+
+    @staticmethod
+    def _owner(pid: int) -> dict[str, Any]:
+        return {"pid": pid, "port": 8788, "key": "ANTHROPIC_BASE_URL"}
+
+    def test_another_headroom_proxy_on_the_port_reads_as_dead(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 999999)
+
+        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234)) is False
+
+    def test_our_own_proxy_reads_as_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: 1234)
+
+        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234)) is True
+
+    def test_an_older_proxy_reporting_no_pid_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Never claim "not ours" without proof — a false negative clears a
+        LIVE session's routing."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_reported_pid", lambda _p: None)
+
+        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234)) is True
+
+    def test_a_non_headroom_listener_is_dead_only_once_the_owner_is_gone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A socket that accepts TCP but does not answer /health may still be
+        our proxy mid-startup, so it only reads as foreign once the recorded
+        process is provably gone."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", lambda _p: False)
+
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234)) is True
+
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: True)
+        assert wrap_mod._wrap_proxy_alive(8788, owner=self._owner(1234)) is False
+
+    def test_without_an_owner_a_bare_connect_still_counts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Callers with no recorded identity keep the old behaviour."""
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+
+        def unexpected(_port: int) -> Any:
+            raise AssertionError("nothing to compare against; must not probe")
+
+        monkeypatch.setattr(wrap_mod, "_is_local_headroom_proxy", unexpected)
+
+        assert wrap_mod._wrap_proxy_alive(8788) is True
+
+    def test_an_owner_without_a_pid_is_inconclusive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+
+        assert wrap_mod._wrap_proxy_alive(8788, owner={"port": 8788}) is True
+
+    def test_the_dead_marker_check_passes_the_owner_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[Any] = []
+
+        def capture(port: int, **kwargs: Any) -> bool:
+            seen.append(kwargs.get("owner"))
+            return True
+
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", capture)
+        marker = self._owner(1234)
+
+        wrap_mod._wrap_marker_proxy_is_dead(marker)
+
+        assert seen == [marker], "identity was not handed to the liveness probe"

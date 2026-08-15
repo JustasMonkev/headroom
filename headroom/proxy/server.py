@@ -1209,6 +1209,10 @@ class HeadroomProxy(
 
         # Memory Handler (persistent user memory)
         self.memory_handler: MemoryHandler | None = None
+        # The database memory ACTUALLY opened, resolved below. Published on
+        # /health because the default resolves against this process's startup
+        # cwd, which an attaching wrap cannot reproduce.
+        self.resolved_memory_db_path: str = ""
         if config.memory_enabled and config.stateless:
             # Persistent memory writes a SQLite DB + markdown files to disk,
             # which stateless mode forbids. Memory is cross-session learning and
@@ -1226,6 +1230,11 @@ class HeadroomProxy(
                 _mem_dir.mkdir(parents=True, exist_ok=True)
                 _mem_db_path = str(_mem_dir / "memory.db")
                 logger.info(f"Memory: Project-scoped DB at {_mem_db_path}")
+            # Publish the RESOLVED path. `config.memory_db_path` is still ""
+            # in the default case, and a `wrap --memory --no-proxy` attaching
+            # to us reads /health to learn which database to use — the default
+            # resolves against OUR startup cwd, which it cannot reproduce.
+            self.resolved_memory_db_path = _mem_db_path
 
             # PR-B6: translate the string-typed ``ProxyConfig.memory_mode``
             # into the typed ``MemoryMode`` enum. Unknown values raise
@@ -2889,7 +2898,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # the fallback default resolves against each process's OWN
                 # cwd, so "same rule" does not mean "same file" when the proxy
                 # was started from a different directory.
-                "memory_db_path": str(config.memory_db_path or ""),
+                "memory_db_path": str(
+                    getattr(getattr(app.state, "proxy", None), "resolved_memory_db_path", "")
+                    or config.memory_db_path
+                    or ""
+                ),
                 "learn": config.traffic_learning_enabled,
                 "code_graph": config.code_graph_watcher,
                 "anthropic_api_url": config.anthropic_api_url,

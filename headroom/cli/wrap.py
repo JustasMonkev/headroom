@@ -1553,7 +1553,13 @@ def _wrap_marker_is_stale(marker: dict[str, Any]) -> bool:
     return _identity_mismatch(marker.get("start_src"), marker.get("start_time"), pid)
 
 
-def _wrap_proxy_alive(port: int, *, attempts: int = 3, delay: float = 0.25) -> bool:
+def _wrap_proxy_alive(
+    port: int,
+    *,
+    attempts: int = 3,
+    delay: float = 0.25,
+    owner: dict[str, Any] | None = None,
+) -> bool:
     """Retry-hardened liveness probe for a wrap proxy ``port`` (issue #2221).
 
     A single 1s TCP connect can spuriously fail against a live-but-busy proxy
@@ -1562,13 +1568,53 @@ def _wrap_proxy_alive(port: int, *, attempts: int = 3, delay: float = 0.25) -> b
     proxy mid-session, so the proxy is declared ALIVE on the FIRST successful
     connect and DEAD only when all ``attempts`` (spaced ~``delay`` s apart)
     fail. Returns early on the first success, so a live proxy pays no delay.
+
+    An accepting socket alone is NOT proof our proxy is the one accepting.
+    Isolated runs allocate transient ports near the base, so another project's
+    Headroom proxy — or any unrelated listener — can take a dead session's port
+    before self-heal runs, leaving the old project routed into the wrong
+    workspace with recovery suppressed. When ``owner`` carries the recorded
+    identity, the listener must also BE that proxy (see
+    :func:`_listener_is_recorded_proxy`).
     """
     for attempt in range(attempts):
-        if _check_proxy(port):
+        if _check_proxy(port) and _listener_is_recorded_proxy(port, owner):
             return True
         if attempt < attempts - 1:
             time.sleep(delay)
     return False
+
+
+def _listener_is_recorded_proxy(port: int, owner: dict[str, Any] | None) -> bool:
+    """Whether the listener on ``port`` is the proxy ``owner`` recorded.
+
+    Conservative in the usual direction — never claim "not ours" without
+    evidence, because a false negative clears a LIVE session's routing:
+
+    * no recorded owner, or no recorded pid → inconclusive, accept;
+    * a Headroom proxy reporting a DIFFERENT pid → provably not ours. This is
+      the port-reuse case Codex described: another project's isolated run took
+      the freed port, and without this the old project stays routed into that
+      run's workspace until it exits;
+    * a Headroom proxy that reports no pid (older build) → accept;
+    * NOT a Headroom proxy → only provably not ours when the recorded process
+      is also gone. A socket that accepts TCP but does not answer ``/health``
+      may still be our proxy mid-startup or under load, and clearing a LIVE
+      session's routing is the worse failure — so an unrelated listener
+      suppresses recovery only while the recorded owner still looks alive.
+    """
+
+    if not owner:
+        return True
+    recorded = owner.get("pid")
+    if not isinstance(recorded, int):
+        return True
+    if not _is_local_headroom_proxy(port):
+        return not _wrap_marker_is_stale(owner)
+    reported = _proxy_reported_pid(port)
+    if reported is None:
+        return True
+    return reported == recorded
 
 
 def _wrap_marker_proxy_is_dead(marker: dict[str, Any]) -> bool:
@@ -1587,7 +1633,7 @@ def _wrap_marker_proxy_is_dead(marker: dict[str, Any]) -> bool:
     port = marker.get("port")
     if not isinstance(port, int):
         return False
-    return not _wrap_proxy_alive(port)
+    return not _wrap_proxy_alive(port, owner=marker)
 
 
 def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
@@ -1651,7 +1697,7 @@ def _handover_to_live_owner_locked(
         owners = [
             o
             for o in owners
-            if not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"]))
+            if not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"]), owner=o)
         ]
     if not owners:
         if len(others) != len(persisted):
@@ -1769,7 +1815,7 @@ def _check_and_clear_dead_wrap_marker_locked(settings_path: Path, *, key: str) -
         # reboot). A single retry-hardened probe decides it: a responding port
         # is a live session (never cleared); only a port that fails the whole
         # retry window is dead. One probe here — no correlated double check.
-        if _wrap_proxy_alive(port):
+        if _wrap_proxy_alive(port, owner=marker):
             return None
     elif not _wrap_marker_is_stale(marker):
         # No recorded port → fall back to PID-based staleness.
@@ -2118,7 +2164,7 @@ def _restore_claude_wrap_base_url_locked(
             for o in _wrap_marker_owners(path)
             if o.get("key") == key
             and o.get("pid") != mine
-            and (not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"])))
+            and (not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"]), owner=o))
         ]
         # Pop ONLY our own (pid, key) entries, computed from the PERSISTED
         # stack. The stack is shared across endpoint keys: a concurrent run in
@@ -4045,13 +4091,18 @@ def _repoint_own_endpoints(env: dict[str, str], port: int, actual_port: int) -> 
     the Headroom proxy. An isolated run binds a shifted port on every launch,
     so this runs on essentially every wrap rather than as a rare fallback.
 
-    "Ours" = the value differs from what we inherited (this wrapper set it), or
-    the key is a ``HEADROOM_*`` knob. Everything else belongs to the user.
+    "Ours" = the value DIFFERS from what we inherited, i.e. this wrapper wrote
+    it. Nothing else qualifies — not even a ``HEADROOM_*`` prefix, which covers
+    plenty of non-routing endpoints (``HEADROOM_KOMPRESS_ENDPOINT``,
+    ``HEADROOM_REDIS_URL``, ``HEADROOM_QDRANT_URL``,
+    ``HEADROOM_OTEL_METRICS_ENDPOINT``): an inherited one of those pointing at
+    the requested port would be re-pointed at the proxy, sending the agent and
+    its MCP children to the wrong service.
     """
 
     inherited = os.environ
     for key, value in dict(env).items():
-        if inherited.get(key) == value and not key.startswith("HEADROOM_"):
+        if inherited.get(key) == value:
             continue
         env[key] = value.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
 
@@ -5303,8 +5354,19 @@ def _launch_tool(
         # SIGTERM. The proxy is spawned detached, so without this the wrapper
         # dies while its proxy survives forever on the per-run port — and the
         # run dir records the now-dead wrapper PID, so GC could later delete a
-        # live proxy's state. The bespoke claude() path already does this.
-        signal.signal(signal.SIGHUP, cleanup)
+        # live proxy's state.
+        #
+        # Registering `cleanup` alone is not enough: it replaces the signal's
+        # terminating default but RETURNS, so during proxy startup (where
+        # `proxy_holder[0]` is still None) it does nothing and the wrapper
+        # carries on to launch the proxy and the agent after the terminal has
+        # closed. Raise, so `_start_proxy`'s handler reaps its child and the
+        # wrapper exits. Mirrors the proxy-only watcher path.
+        def _hangup(signum: int | None = None, frame: Any = None) -> None:
+            cleanup(signum, frame)
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGHUP, _hangup)
 
     try:
         click.echo()
@@ -6033,7 +6095,16 @@ def claude(
     if hasattr(signal, "SIGHUP"):
         # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM — without
         # this, the finally block's base_url restore never runs (issue #1768).
-        signal.signal(signal.SIGHUP, cleanup)
+        # `cleanup` alone would replace the signal's terminating default and
+        # RETURN, so during proxy startup (proxy_holder[0] still None) it does
+        # nothing and this wrapper launches the proxy and Claude after the
+        # terminal has closed. Raise so `_start_proxy` reaps its child and the
+        # finally block runs. Same shape as `_launch_tool` and the watcher.
+        def _claude_hangup(signum: int | None = None, frame: Any = None) -> None:
+            cleanup(signum, frame)
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGHUP, _claude_hangup)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:

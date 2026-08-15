@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -297,6 +299,28 @@ def test_health_reports_the_effective_memory_db_path(monkeypatch, tmp_path):
     )
 
     assert payload["config"]["memory_db_path"] == str(db)
+
+
+def test_health_reports_the_RESOLVED_default_database(monkeypatch, tmp_path):
+    """The load-bearing case: started WITHOUT an explicit --memory-db-path.
+
+    `config.memory_db_path` stays "" while the pipeline resolves the real file
+    against this process's startup cwd. Reporting the config value would tell
+    an attaching wrap nothing, and it would fall back to its OWN cwd — a
+    different database.
+    """
+    monkeypatch.chdir(tmp_path)
+    app, _proxy = _health_app(monkeypatch, memory_enabled=True)
+
+    payload = (
+        TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
+        .get("/health")
+        .json()
+    )
+
+    reported = payload["config"]["memory_db_path"]
+    assert reported, "the resolved default was not reported"
+    assert Path(reported) == tmp_path / ".headroom" / "memory.db"
 
 
 def test_health_memory_db_path_is_present_even_when_unset(monkeypatch):

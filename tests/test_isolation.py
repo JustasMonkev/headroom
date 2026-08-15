@@ -11,6 +11,7 @@ import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1277,3 +1278,132 @@ class TestPersistentInstallPathIsAbsolute:
 
         assert Path(manifest.memory_db_path).is_absolute()
         assert manifest.memory_db_path in manifest.proxy_args
+
+
+class TestOwnerRecordsAreSerializedAndComplete:
+    """Round 19, P2 (two findings). Re-entrant activation shares one run
+    directory, so both the wrapper list and the proxy list are multi-writer:
+    the append must be serialized and atomic, and a nested wrapper must be
+    recorded as an owner in its own right."""
+
+    @staticmethod
+    def _make_stale(path: Path) -> None:
+        stale = 1_000_000_000.0
+        for target in (path, *path.rglob("*")):
+            os.utime(target, (stale, stale))
+
+    def test_a_nested_wrapper_is_recorded_as_an_owner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A nested wrap re-enters activation and shares the directory; it must
+        register as an owner rather than just returning the parent's path.
+
+        Asserting on the recorded PID alone would not discriminate — the first
+        activation already recorded this process — so the re-entrant call is
+        observed directly."""
+        run_dir = isolation.activate_isolated_workspace()
+        calls: list[Path] = []
+        monkeypatch.setattr(isolation, "record_run_owner", lambda d: calls.append(d))
+
+        again = isolation.activate_isolated_workspace()
+
+        assert again == run_dir
+        assert calls == [run_dir], "the nested wrapper was not recorded as an owner"
+
+    def test_the_creator_is_recorded_on_first_activation(self, tmp_path: Path) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+
+        pids = [rec["pid"] for rec in isolation._recorded_run_owners(run_dir)]
+        assert pids == [os.getpid()]
+
+    def test_a_live_nested_wrapper_pins_the_dir_after_the_parent_dies(self, tmp_path: Path) -> None:
+        """The reported failure: creator dead, nested session still running."""
+        runs = tmp_path / "runs"
+        run = runs / "run-20200101-000000-2147480000-abcdef"  # creator is dead
+        run.mkdir(parents=True)
+        (run / isolation._OWNER_STATE_FILE).write_text(
+            json.dumps(
+                {
+                    "pid": 2147480000,
+                    "owners": [
+                        {"pid": 2147480000},
+                        {"pid": os.getpid(), **isolation._identity_fields(os.getpid())},
+                    ],
+                }
+            )
+        )
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert run.exists(), "a live nested session's workspace was deleted"
+
+    def test_all_dead_owners_still_prune(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        run = runs / "run-20200101-000000-2147480000-abcdef"
+        run.mkdir(parents=True)
+        (run / isolation._OWNER_STATE_FILE).write_text(
+            json.dumps({"pid": 2147480001, "owners": [{"pid": 2147480000}, {"pid": 2147480001}]})
+        )
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert not run.exists()
+
+    def test_a_legacy_owner_record_still_reads(self, tmp_path: Path) -> None:
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        (run / isolation._OWNER_STATE_FILE).write_text(json.dumps({"pid": 4321}))
+
+        assert [r["pid"] for r in isolation._recorded_run_owners(run)] == [4321]
+
+    def test_a_dir_with_no_owner_record_falls_back_to_the_name(self, tmp_path: Path) -> None:
+        runs = tmp_path / "runs"
+        run = runs / f"run-20200101-000000-{os.getpid()}-abcdef"
+        run.mkdir(parents=True)
+        self._make_stale(run)
+
+        isolation.prune_stale_runs(runs)
+
+        assert run.exists()
+
+    def test_the_append_is_serialized(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Two nested wraps racing must not drop each other's record. Probing
+        the lock file from an independent handle shows the critical section
+        covers the READ, which is where the lost update happens."""
+        from headroom import _filelock
+
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+        state = run / isolation._PROXY_STATE_FILE
+        observed: list[bool] = []
+        real = isolation._recorded_run_proxies
+
+        def probing(run_dir: Path) -> Any:
+            path = _filelock.lock_path_for(state)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a+", encoding="utf-8") as handle:
+                taken = _filelock.acquire(handle, timeout=0)
+                if taken:
+                    _filelock.release(handle)
+                observed.append(taken)
+            return real(run_dir)
+
+        monkeypatch.setattr(isolation, "_recorded_run_proxies", probing)
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)
+
+        assert observed and not any(observed), "the read happened outside the lock"
+
+    def test_the_write_is_atomic(self, tmp_path: Path) -> None:
+        """A concurrent reader must never see a partial record, and no tmp
+        file may be left behind."""
+        run = tmp_path / "run-20200101-000000-1-abcdef"
+        run.mkdir()
+
+        isolation.record_run_proxy(os.getpid(), 8788, run_dir=run)
+
+        assert json.loads((run / isolation._PROXY_STATE_FILE).read_text())["port"] == 8788
+        assert not list(run.glob("*.tmp"))

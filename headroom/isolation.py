@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from headroom import paths
+from headroom import _filelock, paths
 from headroom._subprocess import identity_mismatch, pid_alive, proc_identity
 
 HEADROOM_ISOLATED_ENV = "HEADROOM_ISOLATED"
@@ -250,25 +250,48 @@ def record_run_proxy(pid: int, port: int, *, run_dir: Path | None = None) -> Non
         return
     try:
         record = {"pid": int(pid), "port": int(port), **_identity_fields(int(pid))}
-        # APPEND, don't replace. Re-entrant activation deliberately reuses the
-        # parent's run directory, so a nested `headroom wrap` starts a second
-        # dedicated proxy against the SAME workspace. Overwriting would leave
-        # GC seeing only the newest — and once that one exits alongside the
-        # wrapper, the still-serving original looks like a dead run and its
-        # workspace gets deleted underneath it. Dead entries are dropped here
-        # so the list cannot grow without bound.
+        _append_owner_record(target, _PROXY_STATE_FILE, "proxies", record)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _append_owner_record(
+    run_dir: Path, filename: str, list_key: str, record: dict[str, Any]
+) -> None:
+    """Add ``record`` to a run directory's owner list, serialized and atomic.
+
+    APPEND, don't replace: re-entrant activation deliberately reuses the
+    parent's run directory, so a nested wrap contributes a second wrapper AND a
+    second dedicated proxy to the SAME workspace. Overwriting would leave GC
+    seeing only the newest — and once that one exits, a still-serving peer
+    looks like a dead run and its workspace is deleted underneath it.
+
+    Serialized because two nested wraps can start at once: unlocked, both read
+    the same list, each builds its own survivor set, and the later write drops
+    the other's entry. The replace is atomic so a concurrent reader never sees
+    a half-written record. Dead entries are dropped on the way through, so the
+    list cannot grow without bound across a long-lived run.
+    """
+
+    state = run_dir / filename
+    reader = _recorded_run_proxies if list_key == "proxies" else _recorded_run_owners
+    with _filelock.exclusive(_filelock.lock_path_for(state)):
         kept = [
             existing
-            for existing in _recorded_run_proxies(target)
+            for existing in reader(run_dir)
             if existing.get("pid") != record["pid"]
             and _owner_is_live(existing.get("pid"), existing)
         ]
-        target.mkdir(parents=True, exist_ok=True)
-        (target / _PROXY_STATE_FILE).write_text(
-            json.dumps({**record, "proxies": [*kept, record]}), encoding="utf-8"
-        )
-    except (OSError, ValueError, TypeError):
-        pass
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(state, {**record, list_key: [*kept, record]})
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Replace ``path`` atomically, so a reader never sees a partial record."""
+
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _recorded_run_proxies(run_dir: Path) -> list[dict[str, Any]]:
@@ -382,19 +405,42 @@ def align_memory_db_with_reused_proxy(explicit: str | None = None) -> bool:
 
 
 def record_run_owner(run_dir: Path) -> None:
-    """Stamp the creating wrapper's start identity into a fresh run dir.
+    """Add this wrapper to ``run_dir``'s owner list.
 
-    The PID alone lives in the directory name; this pins WHICH process that
-    number referred to, so a recycled PID cannot keep the directory alive
-    forever. Best-effort — GC degrades to plain liveness without it.
+    The directory name carries only the CREATOR's PID; this pins which process
+    that number referred to, so a recycled PID cannot keep the directory alive
+    forever. It also APPENDS, because re-entrant activation deliberately shares
+    one workspace: a nested wrap owns it too, and if the parent exits while a
+    backgrounded nested session keeps running, the creator's record alone would
+    let GC delete state that session is still using.
+
+    Best-effort — GC degrades to plain liveness without it.
     """
 
     try:
-        (run_dir / _OWNER_STATE_FILE).write_text(
-            json.dumps({"pid": os.getpid(), **_identity_fields(os.getpid())}), encoding="utf-8"
+        _append_owner_record(
+            run_dir,
+            _OWNER_STATE_FILE,
+            "owners",
+            {"pid": os.getpid(), **_identity_fields(os.getpid())},
         )
-    except OSError:
+    except (OSError, ValueError, TypeError):
         pass
+
+
+def _recorded_run_owners(run_dir: Path) -> list[dict[str, Any]]:
+    """Every wrapper recorded for ``run_dir``, newest last.
+
+    A legacy single-dict record (written before one workspace could have more
+    than one wrapper) reads as a one-entry list.
+    """
+
+    record = _read_run_state(run_dir, _OWNER_STATE_FILE)
+    if record is None:
+        return []
+    listed = record.get("owners")
+    entries = listed if isinstance(listed, list) else [record]
+    return [e for e in entries if isinstance(e, dict) and isinstance(e.get("pid"), int)]
 
 
 def _run_dir_proxy_pid(run_dir: Path) -> int | None:
@@ -409,14 +455,20 @@ def _run_dir_has_live_owner(run_dir: Path) -> bool:
 
     Two owners keep a run alive: the wrapper that created it (PID embedded in
     the directory name, start identity in ``.owner.json``) and the dedicated
-    proxies it started (``.proxy.json``, which holds every one of them since a
-    nested wrap shares the directory). Any one being alive is enough — but
+    proxies it started. BOTH are lists (``.owner.json`` / ``.proxy.json``),
+    because re-entrant activation shares one directory between a parent wrap
+    and its nested children. Any one being alive is enough — but
     "alive" means the recorded process, not merely the recorded PID number, so
     an unrelated process that inherits a recycled PID cannot pin the directory
     forever.
     """
 
-    if _owner_is_live(_run_dir_owner_pid(run_dir), _read_run_state(run_dir, _OWNER_STATE_FILE)):
+    recorded_owners = _recorded_run_owners(run_dir)
+    if any(_owner_is_live(rec.get("pid"), rec) for rec in recorded_owners):
+        return True
+    # No owner record at all (a directory from before they were written): fall
+    # back to the creator PID baked into the name.
+    if not recorded_owners and _owner_is_live(_run_dir_owner_pid(run_dir), None):
         return True
     # ANY recorded proxy still serving pins the workspace — a nested wrap can
     # add a second one against the same run directory.
@@ -497,6 +549,11 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
 
     existing = active_isolated_workspace()
     if existing is not None:
+        # Re-entrant: we share the parent's workspace, so we own it too.
+        # Without this the directory is protected only by its creator, and a
+        # backgrounded nested session outliving the parent could have its
+        # memory and state garbage collected while still running.
+        record_run_owner(existing)
         return existing
 
     # Pin config + shared roots BEFORE relocating the workspace: both derive

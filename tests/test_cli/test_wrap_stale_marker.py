@@ -49,4 +49,10 @@ def test_claude_command_registers_sighup_next_to_sigterm() -> None:
 
     src = inspect.getsource(wrap_cli.claude.callback)
     assert 'hasattr(signal, "SIGHUP")' in src
-    assert "signal.signal(signal.SIGHUP, cleanup)" in src
+    # The handler must RAISE, not just run cleanup and return: during proxy
+    # startup `proxy_holder[0]` is still None, so a returning handler does
+    # nothing and the wrapper carries on after the terminal has closed
+    # (round 19). `_claude_hangup` cleans up and then exits.
+    assert "signal.signal(signal.SIGHUP, _claude_hangup)" in src
+    assert "cleanup(signum, frame)" in src
+    assert "raise SystemExit(0)" in src
