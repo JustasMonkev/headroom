@@ -391,6 +391,33 @@ def _make_llm_judge(model: str) -> Any:
     return judge
 
 
+def _ambient_proxy_port() -> int:
+    """The local proxy this process actually belongs to.
+
+    ``HEADROOM_PROXY_URL`` is exported by `wrap` with the port its proxy really
+    bound, which under the isolated default is not the requested one — so
+    reading ``HEADROOM_PORT`` (or falling back to 8787) from inside a wrapped
+    agent aims at the reserved shared port instead. That silently leaves the
+    session's own shaper off, and if some unrelated shared proxy happens to be
+    on 8787 it enables THAT one and reports success.
+    """
+    import os as _os
+    import urllib.parse as _urlparse
+
+    proxy_url = _os.environ.get("HEADROOM_PROXY_URL", "").strip()
+    if proxy_url:
+        try:
+            parsed = _urlparse.urlsplit(proxy_url)
+            if parsed.port:
+                return int(parsed.port)
+        except ValueError:
+            pass
+    try:
+        return int(_os.environ.get("HEADROOM_PORT", "8787"))
+    except ValueError:
+        return 8787
+
+
 def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     """Best-effort: turn the output shaper ON for a running local proxy.
 
@@ -404,11 +431,10 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     or ``"error"``.
     """
     import json as _json
-    import os as _os
     import urllib.error
     import urllib.request
 
-    resolved_port = port if port is not None else int(_os.environ.get("HEADROOM_PORT", "8787"))
+    resolved_port = port if port is not None else _ambient_proxy_port()
     request = urllib.request.Request(
         f"http://127.0.0.1:{resolved_port}/admin/runtime-env",
         data=_json.dumps({"HEADROOM_OUTPUT_SHAPER": "1"}).encode("utf-8"),

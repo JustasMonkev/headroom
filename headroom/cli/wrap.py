@@ -3849,7 +3849,7 @@ def _run_proxy_only_watcher(
 
     try:
         _print_wrap_banner(agent_label)
-        _register_proxy_client(port)
+        _claimed_port = _register_launch_proxy_client(port, no_proxy)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -3860,7 +3860,10 @@ def _run_proxy_only_watcher(
             openai_api_url=openai_api_url,
         )
         if actual_port != port:
-            _unregister_proxy_client(port)
+            if _claimed_port:
+                _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+        elif not _claimed_port:
             _register_proxy_client(actual_port)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
@@ -5294,6 +5297,27 @@ def _client_marker_path(port: int) -> Path:
 _proc_identity = proc_identity
 
 
+def _register_launch_proxy_client(port: int, no_proxy: bool) -> bool:
+    """Claim the requested port as a client only if this run may USE it.
+
+    A dedicated (isolated) run reserves ``port`` and binds elsewhere, so
+    claiming it states something false for the whole of proxy startup: the last
+    shared wrapper exiting in that window sees an attached client, leaves its
+    detached proxy running, and once we move our marker to the actual port
+    nobody is left responsible for stopping it.
+
+    `--no-proxy` and `--shared` DO use that port, so they still register up
+    front — which is what stops a peer from shutting the shared proxy down
+    underneath a starting run. Returns whether it registered, so the caller
+    knows whether there is anything to release.
+    """
+
+    if no_proxy or not _isolation_requested():
+        _register_proxy_client(port)
+        return True
+    return False
+
+
 def _register_proxy_client(port: int) -> None:
     """Register this wrap process as a live client of the shared proxy.
 
@@ -5536,7 +5560,7 @@ def _launch_tool(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        _register_proxy_client(port)
+        _claimed_port = _register_launch_proxy_client(port, no_proxy)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -5553,7 +5577,10 @@ def _launch_tool(
             copilot_api_token_expires_at=copilot_api_token_expires_at,
         )
         if actual_port != port:
-            _unregister_proxy_client(port)
+            if _claimed_port:
+                _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+        elif not _claimed_port:
             _register_proxy_client(actual_port)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
@@ -6046,7 +6073,7 @@ def _is_local_headroom_proxy(port: int) -> bool:
     return payload is not None and payload.get("service") == "headroom-proxy"
 
 
-def _detect_inbound_anthropic_upstream(port: int) -> str | None:
+def _detect_inbound_anthropic_upstream(port: int, *, binds_port: bool = True) -> str | None:
     """Return a pre-set ANTHROPIC_BASE_URL that is NOT this proxy, else None.
 
     Issue #1353: users who already route Claude Code at a LiteLLM (or any
@@ -6064,6 +6091,16 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
     this run's ``port`` and would therefore read as a user gateway. Chaining
     onto it would send every request through two Headroom pipelines
     (double compression, doubled latency, corrupted savings accounting).
+
+    ``binds_port`` says whether THIS run will actually listen on (or reuse)
+    ``port``. Only then is an equal-port URL self-referential. A dedicated
+    run reserves that port and binds a different one, so a genuine gateway
+    there — LiteLLM on 127.0.0.1:8787, say — is a perfectly good upstream, and
+    discarding it as "ourselves" silently routes the session to
+    api.anthropic.com instead of the gateway the user configured. Equal-port
+    URLs from a dedicated run therefore fall through to the Headroom identity
+    probe below, which is what actually distinguishes another Headroom proxy
+    from a real gateway.
     """
 
     base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
@@ -6074,7 +6111,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
     except ValueError:
         return None
     hostname = (parsed.hostname or "").lower()
-    if hostname in _LOCAL_HOSTNAMES:
+    if hostname in _LOCAL_HOSTNAMES and binds_port:
         try:
             parsed_port = parsed.port
         except ValueError:
@@ -6372,11 +6409,16 @@ def claude(
             and not use_vertex
             and not os.environ.get("ANTHROPIC_TARGET_API_URL")
         ):
-            custom_upstream = _detect_inbound_anthropic_upstream(port)
+            # A dedicated proxy reserves `port` and binds elsewhere, so an
+            # equal-port gateway is not us. `--no-proxy` genuinely reuses the
+            # listener on `port`, so there it still is.
+            custom_upstream = _detect_inbound_anthropic_upstream(
+                port, binds_port=no_proxy or not _isolation_requested()
+            )
 
         upstream_for_proxy = foundry_upstream or custom_upstream
 
-        _register_proxy_client(port)
+        _claimed_port = _register_launch_proxy_client(port, no_proxy)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -6391,7 +6433,10 @@ def claude(
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
         )
         if actual_port != port:
-            _unregister_proxy_client(port)
+            if _claimed_port:
+                _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+        elif not _claimed_port:
             _register_proxy_client(actual_port)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
@@ -9185,7 +9230,7 @@ def opencode(
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
     # shared proxy during the startup gap.
-    _register_proxy_client(port)
+    _claimed_port = _register_launch_proxy_client(port, no_proxy)
 
     # Resolve port before config injection so the provider block and MCP
     # URL both point at the port the proxy will actually be on.
@@ -9212,8 +9257,11 @@ def opencode(
     try:
         # If the proxy fell back to a different port, move our marker so
         # cleanup tracking stays accurate and update MCP config.
+        if not _claimed_port and actual_port == port:
+            _register_proxy_client(actual_port)
         if actual_port != port:
-            _unregister_proxy_client(port)
+            if _claimed_port:
+                _unregister_proxy_client(port)
             _register_proxy_client(actual_port)
             if not no_mcp:
                 from headroom.mcp_registry import OpencodeRegistrar
@@ -9683,10 +9731,15 @@ def omp(
         # Record who is listening, so a peer's handover check can tell a live
         # proxy from a wrapper that merely outlived its own.
         return _hold_omp_models_override(
-            target_port, _project_name_from_cwd(), _proxy_reported_pid(target_port)
+            target_port,
+            _project_name_from_cwd(),
+            _proxy_reported_pid(target_port),
+            _proxy_reported_instance(target_port),
         )
 
-    def _omp_proxy_still_serving(peer_port: int, peer_proxy_pid: int | None) -> bool:
+    def _omp_proxy_still_serving(
+        peer_port: int, peer_proxy_pid: int | None, peer_instance: str | None = None
+    ) -> bool:
         """Whether a peer owner's proxy can still serve the override.
 
         Its wrapper stays blocked on the omp child long after a detached proxy
@@ -9694,7 +9747,12 @@ def omp(
         machine-global file to a dead port.
         """
         return _wrap_proxy_alive(
-            peer_port, owner={"pid": peer_proxy_pid, "proxy_pid": peer_proxy_pid}
+            peer_port,
+            owner={
+                "pid": peer_proxy_pid,
+                "proxy_pid": peer_proxy_pid,
+                "proxy_instance": peer_instance,
+            },
         )
 
     models_file, _ = _omp_write(port)

@@ -79,7 +79,7 @@ def _read_owners(models_file: Path) -> list[dict]:
     return [o for o in raw if isinstance(o, dict) and isinstance(o.get("pid"), int)]
 
 
-ProxyProbe = Callable[[int, "int | None"], bool]
+ProxyProbe = Callable[[int, "int | None", "str | None"], bool]
 
 
 def _owner_is_live(owner: dict, proxy_probe: ProxyProbe | None = None) -> bool:
@@ -91,7 +91,9 @@ def _owner_is_live(owner: dict, proxy_probe: ProxyProbe | None = None) -> bool:
     session rewrites the machine-global file to a dead port and breaks omp for
     everyone until the wrapper finally exits.
 
-    ``proxy_probe(port, proxy_pid)`` answers "is that listener still ours?".
+    ``proxy_probe(port, proxy_pid, proxy_instance)`` answers "is that listener
+    still ours?" — the instance id being the identity that survives uvicorn
+    workers, with the pid kept for owners recorded before it existed.
     Without one the wrapper check stands alone, which is the pre-existing
     behaviour and still correct for callers that have no way to probe.
     """
@@ -106,7 +108,12 @@ def _owner_is_live(owner: dict, proxy_probe: ProxyProbe | None = None) -> bool:
     if not isinstance(port, int):
         return False
     proxy_pid = owner.get("proxy_pid")
-    return proxy_probe(port, proxy_pid if isinstance(proxy_pid, int) else None)
+    proxy_instance = owner.get("proxy_instance")
+    return proxy_probe(
+        port,
+        proxy_pid if isinstance(proxy_pid, int) else None,
+        proxy_instance if isinstance(proxy_instance, str) and proxy_instance else None,
+    )
 
 
 def _write_owners(models_file: Path, owners: list[dict]) -> None:
@@ -120,7 +127,12 @@ def _write_owners(models_file: Path, owners: list[dict]) -> None:
     os.replace(tmp, path)
 
 
-def _self_owner(port: int, project: str | None, proxy_pid: int | None = None) -> dict:
+def _self_owner(
+    port: int,
+    project: str | None,
+    proxy_pid: int | None = None,
+    proxy_instance: str | None = None,
+) -> dict:
     ident = proc_identity(os.getpid())
     return {
         "pid": os.getpid(),
@@ -129,6 +141,11 @@ def _self_owner(port: int, project: str | None, proxy_pid: int | None = None) ->
         # from `pid`, and the one that actually has to be alive for a handover
         # to this owner to mean anything.
         "proxy_pid": proxy_pid,
+        # Preferred over `proxy_pid` by the handover probe: with
+        # HEADROOM_WORKERS>1 the answering worker differs between requests, so
+        # a pid recorded now would not match a pid read later from the SAME
+        # server — and the peer would be dropped as dead while still serving.
+        "proxy_instance": proxy_instance,
         "project": project,
         "start_src": ident[0] if ident else None,
         "start_time": ident[1] if ident else None,
@@ -228,7 +245,10 @@ def _inject_locked(port: int, project: str | None = None) -> tuple[Path, str]:
 
 
 def hold_models_override(
-    port: int, project: str | None = None, proxy_pid: int | None = None
+    port: int,
+    project: str | None = None,
+    proxy_pid: int | None = None,
+    proxy_instance: str | None = None,
 ) -> tuple[Path, str]:
     """Inject the override AND register this session as an owner.
 
@@ -241,7 +261,7 @@ def hold_models_override(
     with _filelock.exclusive(_filelock.lock_path_for(models_file)):
         result = _inject_locked(port, project)
         owners = [o for o in _read_owners(models_file) if o.get("pid") != os.getpid()]
-        _write_owners(models_file, [*owners, _self_owner(port, project, proxy_pid)])
+        _write_owners(models_file, [*owners, _self_owner(port, project, proxy_pid, proxy_instance)])
     return result
 
 

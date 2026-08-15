@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from headroom import paths
+from headroom import _filelock, paths
 
 from .base import ServerSpec
 
@@ -47,34 +48,46 @@ def spec_fingerprint(spec: ServerSpec) -> str:
 
 
 def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) -> None:
-    """Record that Headroom installed ``spec`` for ``agent``."""
+    """Record that Headroom installed ``spec`` for ``agent``.
+
+    Serialized: the ledger is on the SHARED root, so concurrent isolated wraps
+    registering different servers each read the same pre-image and the later
+    write drops the other's entry — after which `unwrap` cannot prove Headroom
+    owns the lost one and leaves it installed for good.
+    """
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
-    agents = data.setdefault("agents", {})
-    agent_entry = agents.setdefault(agent, {})
-    agent_entry[spec.name] = {
-        "fingerprint": spec_fingerprint(spec),
-        "installed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _write_ledger(ledger_file, data)
+    with _filelock.exclusive(_filelock.lock_path_for(ledger_file)):
+        data = _read_ledger(ledger_file)
+        agents = data.setdefault("agents", {})
+        agent_entry = agents.setdefault(agent, {})
+        agent_entry[spec.name] = {
+            "fingerprint": spec_fingerprint(spec),
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_ledger(ledger_file, data)
 
 
 def clear_install(agent: str, server_name: str, *, path: Path | None = None) -> None:
-    """Remove one ledger entry if present."""
+    """Remove one ledger entry if present.
+
+    Serialized for the same reason as :func:`record_install` — an unlocked
+    removal can also carry a peer's just-recorded entry away with it.
+    """
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
-    agents = data.get("agents")
-    if not isinstance(agents, dict):
-        return
-    agent_entry = agents.get(agent)
-    if not isinstance(agent_entry, dict) or server_name not in agent_entry:
-        return
-    del agent_entry[server_name]
-    if not agent_entry:
-        del agents[agent]
-    if not agents:
-        data.pop("agents", None)
-    _write_ledger(ledger_file, data)
+    with _filelock.exclusive(_filelock.lock_path_for(ledger_file)):
+        data = _read_ledger(ledger_file)
+        agents = data.get("agents")
+        if not isinstance(agents, dict):
+            return
+        agent_entry = agents.get(agent)
+        if not isinstance(agent_entry, dict) or server_name not in agent_entry:
+            return
+        del agent_entry[server_name]
+        if not agent_entry:
+            del agents[agent]
+        if not agents:
+            data.pop("agents", None)
+        _write_ledger(ledger_file, data)
 
 
 def headroom_installed_matching(
@@ -110,5 +123,19 @@ def _read_ledger(path: Path) -> dict[str, Any]:
 
 
 def _write_ledger(path: Path, data: dict[str, Any]) -> None:
+    """Publish the ledger atomically.
+
+    A reader that catches a partial write parses nothing and concludes Headroom
+    owns none of the entries, which is how a user-visible MCP server survives
+    an `unwrap` that should have removed it. The temp name carries this
+    writer's pid so two publishers cannot break each other's replace.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise

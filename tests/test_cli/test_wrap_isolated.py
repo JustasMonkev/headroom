@@ -3367,3 +3367,96 @@ class TestOwnershipSurvivesMultipleWorkers:
         }
 
         assert wrap_mod._wrap_proxy_alive(8788, owner=owner) is False
+
+
+class TestALocalGatewayOnTheReservedPortSurvives:
+    """A dedicated run reserves the requested port and binds elsewhere, so a
+    genuine gateway there (LiteLLM on 127.0.0.1:8787) is a perfectly good
+    upstream. Treating an equal-port URL as self-referential discarded it and
+    sent the session to api.anthropic.com instead (round 27, P1)."""
+
+    def test_a_gateway_on_the_reserved_port_becomes_the_upstream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        monkeypatch.setattr(wrap_mod, "_url_is_local_headroom_proxy", lambda _u: False)
+
+        upstream = wrap_mod._detect_inbound_anthropic_upstream(8787, binds_port=False)
+
+        assert upstream == "http://127.0.0.1:8787"
+
+    def test_another_headroom_proxy_there_is_still_not_chained(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The identity probe is what distinguishes the two, and it must still
+        refuse to stack two Headroom pipelines."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        monkeypatch.setattr(wrap_mod, "_url_is_local_headroom_proxy", lambda _u: True)
+        monkeypatch.setattr(wrap_mod, "_inherited_parent_upstream", lambda: None)
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8787, binds_port=False) is None
+
+    def test_a_run_that_binds_the_port_still_treats_it_as_itself(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--shared` and `--no-proxy` really do use that listener, so an
+        equal-port URL there would be a forwarding loop."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+        monkeypatch.setattr(wrap_mod, "_inherited_parent_upstream", lambda: None)
+
+        def unexpected(_url: str) -> bool:
+            raise AssertionError("must not probe: this run owns that port")
+
+        monkeypatch.setattr(wrap_mod, "_url_is_local_headroom_proxy", unexpected)
+
+        assert wrap_mod._detect_inbound_anthropic_upstream(8787, binds_port=True) is None
+
+    def test_the_claude_flow_passes_binds_port_from_the_run_shape(self) -> None:
+        import inspect
+
+        source = inspect.getsource(wrap_mod.claude.callback)
+        assert "binds_port=no_proxy or not _isolation_requested()" in source
+
+
+class TestADedicatedRunDoesNotClaimTheSharedPort:
+    """`_launch_tool` registered as a client of the REQUESTED port before
+    `_ensure_proxy` started a dedicated proxy elsewhere. The last shared
+    wrapper exiting in that window saw an attached client, left its detached
+    proxy running, and once the marker moved nobody was responsible for
+    stopping it (round 27, P2)."""
+
+    def test_an_isolated_run_does_not_claim_the_requested_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        claimed: list[int] = []
+        monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda p: claimed.append(p))
+        isolation.activate_isolated_workspace()
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
+
+        assert wrap_mod._register_launch_proxy_client(8787, no_proxy=False) is False
+        assert claimed == []
+
+    def test_no_proxy_still_claims_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`--no-proxy` genuinely reuses that proxy and must keep it alive."""
+        claimed: list[int] = []
+        monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda p: claimed.append(p))
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "1")
+
+        assert wrap_mod._register_launch_proxy_client(8787, no_proxy=True) is True
+        assert claimed == [8787]
+
+    def test_a_shared_run_still_claims_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        claimed: list[int] = []
+        monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda p: claimed.append(p))
+        monkeypatch.setenv(isolation.HEADROOM_ISOLATED_ENV, "0")
+
+        assert wrap_mod._register_launch_proxy_client(8787, no_proxy=False) is True
+        assert claimed == [8787]
+
+    def test_the_launch_paths_use_the_gated_registration(self) -> None:
+        import inspect
+
+        for fn in (wrap_mod._launch_tool, wrap_mod.claude.callback):
+            source = inspect.getsource(fn)
+            assert "_register_launch_proxy_client(port, no_proxy)" in source
+            assert "\n        _register_proxy_client(port)\n" not in source

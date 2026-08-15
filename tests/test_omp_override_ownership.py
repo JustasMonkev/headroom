@@ -204,7 +204,7 @@ class TestHandoverRequiresALiveProxy:
         self._hold_with_peer(self._live_peer(8790))
         pre_wrap = omp.backup_path(original).read_text()
 
-        status = omp.release_models_override(proxy_probe=lambda _port, _pid: False)
+        status = omp.release_models_override(proxy_probe=lambda _port, _pid, _inst: False)
 
         assert status == "restored"
         assert original.read_text() == pre_wrap
@@ -212,18 +212,22 @@ class TestHandoverRequiresALiveProxy:
     def test_a_peer_with_a_live_proxy_still_gets_it(self) -> None:
         self._hold_with_peer(self._live_peer(8790))
 
-        assert omp.release_models_override(proxy_probe=lambda _port, _pid: True) == "handover"
+        assert (
+            omp.release_models_override(proxy_probe=lambda _port, _pid, _inst: True) == "handover"
+        )
         assert "127.0.0.1:8790" in _base_url()
 
     def test_the_probe_is_asked_about_the_peers_port_and_proxy(self) -> None:
-        seen: list[tuple[int, int | None]] = []
-        self._hold_with_peer(self._live_peer(8790, proxy_pid=777))
+        seen: list[tuple[int, int | None, str | None]] = []
+        peer = self._live_peer(8790, proxy_pid=777)
+        peer["proxy_instance"] = "srv-peer"
+        self._hold_with_peer(peer)
 
         omp.release_models_override(
-            proxy_probe=lambda port, pid: seen.append((port, pid)) or True  # type: ignore[func-returns-value]
+            proxy_probe=lambda port, pid, inst: seen.append((port, pid, inst)) or True  # type: ignore[func-returns-value]
         )
 
-        assert seen == [(8790, 777)], "the probe must target the PEER's listener"
+        assert seen == [(8790, 777, "srv-peer")], "the probe must target the PEER's listener"
 
     def test_without_a_probe_the_wrapper_check_still_stands(self) -> None:
         """Callers with no way to probe keep the previous behaviour."""
@@ -234,11 +238,25 @@ class TestHandoverRequiresALiveProxy:
     def test_the_holder_records_its_own_proxy_identity(self) -> None:
         _pre_wrap_file()
 
-        omp.hold_models_override(8788, "proj", 9999)
+        omp.hold_models_override(8788, "proj", 9999, "srv-mine")
 
         owners = json.loads(omp.owners_path(omp.models_yml_path()).read_text())
         assert owners[-1]["proxy_pid"] == 9999
+        assert owners[-1]["proxy_instance"] == "srv-mine"
         assert owners[-1]["pid"] == os.getpid() != 9999
+
+    def test_the_instance_is_what_survives_multiple_workers(self) -> None:
+        """A pid recorded from one worker cannot match the next worker to
+        answer; the instance is the same for every worker of one server."""
+        peer = self._live_peer(8790, proxy_pid=777)
+        peer["proxy_instance"] = "srv-peer"
+        self._hold_with_peer(peer)
+
+        def only_the_instance_matches(_port: int, _pid: int | None, inst: str | None) -> bool:
+            assert inst == "srv-peer", "the probe was given no instance to compare"
+            return True
+
+        assert omp.release_models_override(proxy_probe=only_the_instance_matches) == "handover"
 
     def test_the_launcher_passes_a_real_probe(self) -> None:
         """The wiring, not a reimplementation of it: `wrap omp` must hand the
