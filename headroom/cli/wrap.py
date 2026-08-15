@@ -5039,19 +5039,34 @@ def _copy_openclaw_plugin_into_extensions(
 _WRAP_ISOLATION_EXEMPT_SUBCOMMANDS = frozenset({"selfheal"})
 
 
+def _wrapper_own_args(tokens: list[str]) -> list[str]:
+    """Tokens belonging to Headroom itself, i.e. everything before ``--``.
+
+    Every wrap subcommand forwards what follows ``--`` verbatim to the wrapped
+    CLI, so a flag after that delimiter is the CHILD's, never Headroom's.
+    """
+
+    return tokens[: tokens.index("--")] if "--" in tokens else tokens
+
+
 def _prepare_only_invocation(ctx: click.Context, argv: list[str] | None = None) -> bool:
-    """True when this invocation carries ``--prepare-only``.
+    """True when this invocation carries Headroom's own ``--prepare-only``.
 
     The group callback runs before the subcommand's options are parsed, and
     Click 8.4 has already consumed the remaining tokens by then (``ctx.args``
     is empty), so the process argument vector is the reliable source. Click 9
     is expected to leave the remainder in ``ctx.args``, which is checked too so
     this keeps working if that changes.
+
+    Only tokens before ``--`` count: ``headroom wrap codex -- --prepare-only``
+    passes the flag to Codex, and Click leaves the subcommand's ``prepare_only``
+    False. Matching it there would skip isolation for a perfectly ordinary
+    launch, silently putting it back on the shared workspace and proxy.
     """
 
-    if "--prepare-only" in (ctx.args or []):
+    if "--prepare-only" in _wrapper_own_args(list(ctx.args or [])):
         return True
-    return "--prepare-only" in (sys.argv if argv is None else argv)
+    return "--prepare-only" in _wrapper_own_args(list(sys.argv if argv is None else argv))
 
 
 @main.group()

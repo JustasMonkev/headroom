@@ -677,15 +677,51 @@ class TestPrepareOnlyIsExemptFromIsolation:
     be isolated (no run dir to GC) and must not have its stdout polluted
     (PR #25 review round 3, P1)."""
 
-    def test_detects_prepare_only_from_argv(self) -> None:
+    @pytest.mark.parametrize(
+        "argv,expected,why",
+        [
+            (["headroom", "wrap", "openclaw", "--prepare-only"], True, "Headroom's own flag"),
+            (["headroom", "wrap", "claude"], False, "flag absent"),
+            (
+                ["headroom", "wrap", "codex", "--prepare-only", "--", "--foo"],
+                True,
+                "own flag, before the delimiter",
+            ),
+            # Everything after `--` is forwarded verbatim to the wrapped CLI,
+            # so a match there is the CHILD's flag. Treating it as Headroom's
+            # would skip isolation for an ordinary launch and silently put it
+            # back on the shared workspace + proxy (round 7, P2).
+            (
+                ["headroom", "wrap", "codex", "--", "--prepare-only"],
+                False,
+                "forwarded to the child after --",
+            ),
+            (
+                ["headroom", "wrap", "claude", "--", "-p", "--prepare-only"],
+                False,
+                "deep inside child args",
+            ),
+        ],
+    )
+    def test_detects_only_headrooms_own_prepare_only(
+        self, argv: list[str], expected: bool, why: str
+    ) -> None:
         ctx = click.Context(click.Command("wrap"))
-        assert (
-            wrap_mod._prepare_only_invocation(
-                ctx, argv=["headroom", "wrap", "openclaw", "--prepare-only"]
-            )
-            is True
+        assert wrap_mod._prepare_only_invocation(ctx, argv=argv) is expected, why
+
+    def test_child_forwarded_flag_does_not_disable_isolation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End-to-end: `wrap <tool> -- --prepare-only` must still isolate."""
+        monkeypatch.delenv(isolation.HEADROOM_ISOLATED_ENV, raising=False)
+        monkeypatch.setattr(
+            wrap_mod.sys, "argv", ["headroom", "wrap", "fake-tool", "--", "--prepare-only"]
         )
-        assert wrap_mod._prepare_only_invocation(ctx, argv=["headroom", "wrap", "claude"]) is False
+
+        result, seen = _invoke_with_fake_tool(["wrap", "fake-tool"])
+
+        assert result.exit_code == 0, result.output
+        assert seen["workspace"].parent == tmp_path / "ws" / "runs"
 
     def test_openclaw_prepare_only_emits_pure_json_and_no_run_dir(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
