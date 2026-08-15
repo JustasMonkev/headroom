@@ -41,6 +41,12 @@ stack, keyed by a digest of the resolved settings path. They live here rather
 than in the project because nothing ever deletes a lock file, and they resolve
 against the **shared** root so concurrent isolated runs contend on one file.
 
+The per-run workspace is always exported as an absolute path, even when
+`HEADROOM_WORKSPACE_DIR` is configured relatively — every exported value is
+inherited by subprocesses that would otherwise resolve it against their own
+working directory, so a nested Headroom command launched from elsewhere would
+open a different workspace and `memory.db` than its proxy.
+
 All three variables are recognized by the Python proxy / CLI and the npm SDK.
 They are **additive** — every pre-existing per-resource env var
 (`HEADROOM_SAVINGS_PATH`, `HEADROOM_TOIN_PATH`,

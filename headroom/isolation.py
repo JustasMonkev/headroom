@@ -392,6 +392,17 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
     prune_stale_runs(runs_root)
     run_dir = runs_root / f"run-{run_id or _new_run_id()}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Export an ABSOLUTE path. A user may configure HEADROOM_WORKSPACE_DIR
+    # relatively, in which case run_dir is relative too — and every value
+    # below is inherited by subprocesses that resolve it against THEIR cwd.
+    # A nested Headroom command run from a different directory would then open
+    # a different workspace and memory.db than the proxy, quietly defeating the
+    # process-tree isolation this whole module promises. Resolve after mkdir so
+    # symlinks in the path collapse consistently for every reader.
+    try:
+        run_dir = run_dir.resolve()
+    except OSError:
+        run_dir = run_dir.absolute()
     record_run_owner(run_dir)
 
     os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = str(run_dir)

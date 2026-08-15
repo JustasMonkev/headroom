@@ -696,3 +696,51 @@ class TestGcVerifiesProcessIdentity:
     def test_dead_pid_is_never_live_regardless_of_identity(self) -> None:
         assert isolation._owner_is_live(2147480000, None) is False
         assert isolation._owner_is_live(None, None) is False
+
+
+class TestIsolatedWorkspaceIsAbsolute:
+    """Every exported path is inherited by subprocesses that resolve it
+    against THEIR cwd (round 13, P2).
+
+    With a relatively-configured HEADROOM_WORKSPACE_DIR, a nested Headroom
+    command run from another directory would open a different workspace and
+    memory.db than the proxy — silently defeating process-tree isolation.
+    """
+
+    def test_relative_workspace_still_exports_absolute_paths(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, "relative-ws")
+
+        run_dir = isolation.activate_isolated_workspace()
+
+        assert run_dir.is_absolute()
+        for var in (
+            paths.HEADROOM_WORKSPACE_DIR_ENV,
+            isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
+            isolation.HEADROOM_MEMORY_DB_PATH_ENV,
+        ):
+            assert Path(os.environ[var]).is_absolute(), f"{var} must not be cwd-relative"
+
+    def test_a_child_in_another_cwd_resolves_the_same_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The actual failure mode: resolve the exported value from a
+        different working directory and it must name the same run dir."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, "relative-ws")
+        run_dir = isolation.activate_isolated_workspace()
+
+        elsewhere = tmp_path / "some" / "other" / "dir"
+        elsewhere.mkdir(parents=True)
+        monkeypatch.chdir(elsewhere)
+
+        assert paths.workspace_dir().resolve() == run_dir
+        assert paths.memory_db_path().resolve() == run_dir / "memory.db"
+
+    def test_absolute_workspace_is_unaffected(self, tmp_path: Path) -> None:
+        run_dir = isolation.activate_isolated_workspace()
+
+        assert run_dir.is_absolute()
+        assert run_dir.parent == (tmp_path / "ws" / "runs").resolve()

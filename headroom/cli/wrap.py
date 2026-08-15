@@ -1463,7 +1463,9 @@ def _write_wrap_marker_owners(settings_path: Path, owners: list[dict[str, Any]])
         pass
 
 
-def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
+def _write_wrap_marker(
+    settings_path: Path, *, port: int, key: str, previous: str | None, url: str | None = None
+) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
     Lets a later wrap/doctor/unwrap invocation tell a stale leftover (writer
@@ -1481,14 +1483,30 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             "previous": previous,
             # This session's own URL, so a peer exiting later can hand routing
             # BACK to us instead of restoring the pre-Headroom value while we
-            # are still live (reverse exit order).
-            "url": _claude_proxy_base_url(port),
+            # are still live (reverse exit order). It must be the EXACT value
+            # written into settings, not a reconstruction from the port:
+            # Foundry mode writes `http://127.0.0.1:<port>/anthropic`, and
+            # handing back the bare URL would drop the `/anthropic` prefix the
+            # Anthropic SDK appends `/v1/messages` to.
+            "url": url or _claude_proxy_base_url(port),
         }
         # Push onto the live owner stack rather than replacing it. The whole
         # read-append-write cycle is serialized so a concurrent push cannot
         # read the same pre-image and drop us (or its own peer) on write.
         with _wrap_marker_lock(settings_path):
-            owners = [o for o in _wrap_marker_owners(settings_path) if o.get("pid") != os.getpid()]
+            # Rebuild from the PERSISTED stack. The staleness-filtered view
+            # omits a CRASHED owner of another endpoint key, so pushing from it
+            # would delete that run's self-heal record as a side effect of our
+            # unrelated write. Other keys are carried over verbatim, alive or
+            # not; only OUR key's dead entries (and our own previous entry) are
+            # dropped, which is safe because the caller's stale-marker check
+            # already recovered anything they held.
+            owners = [
+                o
+                for o in _raw_wrap_marker_owners(settings_path)
+                if o.get("key") != key
+                or (o.get("pid") != os.getpid() and not _wrap_marker_is_stale(o))
+            ]
             owners.append(payload)
             _write_wrap_marker_owners(settings_path, owners)
     except OSError:
@@ -1661,9 +1679,23 @@ def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str 
         return _check_and_clear_stale_wrap_marker_locked(settings_path, key=key)
 
 
+def _newest_persisted_owner(settings_path: Path, *, key: str) -> dict[str, Any] | None:
+    """Newest recorded owner for ``key``, alive or not.
+
+    The top-level mirror is ``owners[-1]`` across ALL endpoint keys, so a guard
+    that requires the mirror to name ``key`` goes blind whenever a newer
+    cloud-mode owner sits on top — leaving a crashed owner of ``key`` on the
+    stack, and its dead proxy URL in settings, for the next run to inherit as
+    the project's "original" value.
+    """
+
+    same_key = [o for o in _raw_wrap_marker_owners(settings_path) if o.get("key") == key]
+    return same_key[-1] if same_key else None
+
+
 def _check_and_clear_stale_wrap_marker_locked(settings_path: Path, *, key: str) -> str | None:
-    marker = _read_wrap_marker(settings_path)
-    if marker is None or marker.get("key") != key:
+    marker = _newest_persisted_owner(settings_path, key=key)
+    if marker is None:
         return None
     # Staleness is decided from the owner STACK, which is the authoritative
     # record — reading it from the mirrored top-level fields alone could
@@ -1712,8 +1744,8 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
 
 
 def _check_and_clear_dead_wrap_marker_locked(settings_path: Path, *, key: str) -> str | None:
-    marker = _read_wrap_marker(settings_path)
-    if marker is None or marker.get("key") != key:
+    marker = _newest_persisted_owner(settings_path, key=key)
+    if marker is None:
         return None
     port = marker.get("port")
     if isinstance(port, int):
@@ -1979,7 +2011,10 @@ def _write_claude_wrap_base_url_locked(
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_text(path, json.dumps(payload, indent=2) + "\n")
     if port is not None:
-        _write_wrap_marker(path, port=port, key=key, previous=previous)
+        # `proxy_url` is the mode-specific value just written into settings
+        # (Foundry appends /anthropic), which is exactly what a handover must
+        # restore for a surviving owner.
+        _write_wrap_marker(path, port=port, key=key, previous=previous, url=proxy_url)
     return previous
 
 
@@ -2043,17 +2078,24 @@ def _restore_claude_wrap_base_url_locked(
     if not _force:
         # Pop ourselves off the owner stack; whoever is still live decides what
         # the file should say now.
-        owners = _wrap_marker_owners(path)
         mine = os.getpid()
-        survivors = [o for o in owners if o.get("key") == key and o.get("pid") != mine]
-        # Pop ONLY our own (pid, key) entries. The stack is shared across
-        # endpoint keys: a concurrent run in the same project may own
-        # ANTHROPIC_VERTEX_BASE_URL (or the Foundry key) while we own
-        # ANTHROPIC_BASE_URL. Dropping the whole stack because no owner of
-        # OUR key survives would delete that run's crash/self-heal record,
-        # leaving its project-local URL pointing at a dead proxy if it later
-        # exits uncleanly.
-        remaining = [o for o in owners if not (o.get("pid") == mine and o.get("key") == key)]
+        survivors = [
+            o for o in _wrap_marker_owners(path) if o.get("key") == key and o.get("pid") != mine
+        ]
+        # Pop ONLY our own (pid, key) entries, computed from the PERSISTED
+        # stack. The stack is shared across endpoint keys: a concurrent run in
+        # the same project may own ANTHROPIC_VERTEX_BASE_URL (or the Foundry
+        # key) while we own ANTHROPIC_BASE_URL. Two ways to destroy its record
+        # here, both of which this avoids — dropping the whole stack because no
+        # owner of OUR key survives, and (subtler) rebuilding from the
+        # staleness-FILTERED view, which omits a CRASHED cloud-mode owner and
+        # would therefore delete the one record its SessionStart self-heal
+        # needs to repair that dead URL.
+        remaining = [
+            o
+            for o in _raw_wrap_marker_owners(path)
+            if not (o.get("pid") == mine and o.get("key") == key)
+        ]
         if survivors:
             # A peer wrap session is still running. Hand routing back to the
             # most recent live owner rather than restoring the pre-Headroom

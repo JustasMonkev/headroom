@@ -1114,16 +1114,18 @@ class TestWrapMarkerLocking:
     ) -> None:
         settings, _marker = self._project(tmp_path)
         observed: list[bool] = []
-        real = wrap_mod._wrap_marker_owners
+        # The push reads the PERSISTED stack (so a crashed other-key owner is
+        # not dropped), so that is where the critical section is observed.
+        real = wrap_mod._raw_wrap_marker_owners
 
         def probing_owners(path: Path) -> Any:
             observed.append(self._peer_can_lock(path))
             return real(path)
 
-        monkeypatch.setattr(wrap_mod, "_wrap_marker_owners", probing_owners)
+        monkeypatch.setattr(wrap_mod, "_raw_wrap_marker_owners", probing_owners)
         wrap_mod._write_wrap_marker(settings, port=8788, key="ANTHROPIC_BASE_URL", previous=None)
 
-        assert observed == [False], "the stack read must already be inside the lock"
+        assert observed and not any(observed), "the stack read must already be inside the lock"
 
     def test_restore_holds_the_lock_across_read_and_write(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1837,3 +1839,223 @@ class TestClearMarkerIsKeyScoped:
         assert [o["key"] for o in json.loads(marker.read_text())["owners"]] == [
             "ANTHROPIC_VERTEX_BASE_URL"
         ]
+
+
+class TestGuardsSelectTheirOwnKey:
+    """The stale/dead-marker guards keyed off the top-level mirror, which is
+    owners[-1] across ALL keys — so a newer cloud-mode owner made them go
+    blind to a crashed owner of their own key (round 13, P2)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8789"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    @staticmethod
+    def _stack(marker: Path, owners: list[dict[str, Any]]) -> None:
+        marker.write_text(json.dumps({"owners": owners, **owners[-1]}))
+
+    def _crashed_base_under_live_vertex(self, marker: Path) -> None:
+        """A crashed Base owner, with a LIVE Vertex owner newer than it — so
+        the mirror names the Vertex key."""
+        self._stack(
+            marker,
+            [
+                {
+                    "pid": 2147480000,
+                    "port": 8789,
+                    "key": "ANTHROPIC_BASE_URL",
+                    "previous": "https://user-gateway",
+                    "url": "http://127.0.0.1:8789",
+                },
+                {
+                    "pid": 111,
+                    "port": 8790,
+                    "key": "ANTHROPIC_VERTEX_BASE_URL",
+                    "previous": None,
+                    "url": "http://127.0.0.1:8790",
+                },
+            ],
+        )
+
+    def test_stale_guard_sees_past_a_newer_cloud_owner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        self._crashed_base_under_live_vertex(marker)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda o: o.get("pid") == 2147480000)
+
+        restored = wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert restored == "https://user-gateway"
+        env = json.loads(settings.read_text())["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://user-gateway"
+        # ...and the live Vertex owner is still recorded.
+        assert [o["key"] for o in json.loads(marker.read_text())["owners"]] == [
+            "ANTHROPIC_VERTEX_BASE_URL"
+        ]
+
+    def test_dead_guard_sees_past_a_newer_cloud_owner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        self._crashed_base_under_live_vertex(marker)
+        # Base's port is dead; Vertex's answers.
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda port, **_k: port == 8790)
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        restored = wrap_mod._check_and_clear_dead_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert restored == "https://user-gateway"
+
+    def test_a_live_owner_of_our_key_is_still_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        self._stack(
+            marker,
+            [
+                {
+                    "pid": 222,
+                    "port": 8789,
+                    "key": "ANTHROPIC_BASE_URL",
+                    "previous": "https://user-gateway",
+                    "url": "http://127.0.0.1:8789",
+                },
+                {
+                    "pid": 111,
+                    "port": 8790,
+                    "key": "ANTHROPIC_VERTEX_BASE_URL",
+                    "previous": None,
+                    "url": "http://127.0.0.1:8790",
+                },
+            ],
+        )
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        assert (
+            wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL") is None
+        )
+        env = json.loads(settings.read_text())["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8789"
+
+    def test_no_owner_of_our_key_is_a_noop(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        self._stack(
+            marker,
+            [{"pid": 111, "port": 8790, "key": "ANTHROPIC_VERTEX_BASE_URL", "previous": None}],
+        )
+
+        assert (
+            wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL") is None
+        )
+        assert marker.exists()
+
+
+class TestExitPreservesCrashedOtherKeyOwners:
+    """The pop was rebuilt from the staleness-FILTERED view, so a CRASHED
+    cloud-mode owner was silently dropped by an unrelated key's clean exit —
+    destroying the one record its self-heal needed (round 13, P2)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    def test_crashed_vertex_record_survives_a_clean_base_exit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        crashed_vertex = {
+            "pid": 2147480000,
+            "port": 8790,
+            "key": "ANTHROPIC_VERTEX_BASE_URL",
+            "previous": "https://vertex-original",
+            "url": "http://127.0.0.1:8790",
+        }
+        marker.write_text(json.dumps({"owners": [crashed_vertex], **crashed_vertex}))
+        # Only the Vertex owner is dead; ours (this process) is alive.
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda o: o.get("pid") == 2147480000)
+
+        previous = wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+        wrap_mod._restore_claude_wrap_base_url(previous, settings_path=settings)
+
+        assert marker.exists(), "the crashed Vertex run's self-heal record was deleted"
+        owners = json.loads(marker.read_text())["owners"]
+        assert [o["key"] for o in owners] == ["ANTHROPIC_VERTEX_BASE_URL"]
+        assert owners[0]["previous"] == "https://vertex-original"
+
+
+class TestFoundryHandoverKeepsThePathPrefix:
+    """Owner records stored a URL rebuilt from the port alone, but Foundry
+    writes `http://127.0.0.1:<port>/anthropic` into settings. A handover
+    therefore dropped the prefix the SDK appends /v1/messages to (round 13)."""
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / "proj" / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {}}))
+        return settings, wrap_mod._wrap_marker_path(settings)
+
+    def test_marker_records_the_exact_settings_value(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        foundry_url = wrap_mod._foundry_proxy_url(wrap_mod._claude_proxy_base_url(8788))
+        assert foundry_url.endswith("/anthropic")
+
+        wrap_mod._write_claude_wrap_base_url(
+            foundry_url, settings_path=settings, port=8788, foundry_mode=True
+        )
+
+        owner = json.loads(marker.read_text())["owners"][-1]
+        assert owner["key"] == "ANTHROPIC_FOUNDRY_BASE_URL"
+        assert owner["url"] == foundry_url
+
+    def test_handover_restores_the_prefixed_url(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        url_a = wrap_mod._foundry_proxy_url(wrap_mod._claude_proxy_base_url(8788))
+        url_b = wrap_mod._foundry_proxy_url(wrap_mod._claude_proxy_base_url(8789))
+        monkeypatch.setattr(wrap_mod, "_wrap_marker_is_stale", lambda _o: False)
+
+        wrap_mod._write_claude_wrap_base_url(
+            url_a, settings_path=settings, port=8788, foundry_mode=True
+        )
+        payload = json.loads(marker.read_text())
+        payload["owners"][-1]["pid"] = 111  # run A is another live process
+        marker.write_text(json.dumps(payload))
+        prev_b = wrap_mod._write_claude_wrap_base_url(
+            url_b, settings_path=settings, port=8789, foundry_mode=True
+        )
+
+        # B exits; routing hands back to the still-live A.
+        wrap_mod._restore_claude_wrap_base_url(prev_b, settings_path=settings, foundry_mode=True)
+
+        restored = json.loads(settings.read_text())["env"]["ANTHROPIC_FOUNDRY_BASE_URL"]
+        assert restored == url_a
+        assert restored.endswith("/anthropic"), "SDK would append /v1/messages to the wrong route"
+
+    def test_bare_url_is_still_the_default_for_standard_mode(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+
+        wrap_mod._write_claude_wrap_base_url(
+            "http://127.0.0.1:8788", settings_path=settings, port=8788
+        )
+
+        assert json.loads(marker.read_text())["owners"][-1]["url"] == "http://127.0.0.1:8788"
+
+    def test_explicit_url_is_optional(self, tmp_path: Path) -> None:
+        """A direct _write_wrap_marker caller that omits `url` keeps the
+        port-derived value, so older call sites are unaffected."""
+        settings, marker = self._project(tmp_path)
+
+        wrap_mod._write_wrap_marker(settings, port=8788, key="ANTHROPIC_BASE_URL", previous=None)
+
+        assert json.loads(marker.read_text())["owners"][-1]["url"] == "http://127.0.0.1:8788"
