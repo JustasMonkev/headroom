@@ -53,7 +53,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover - exercised only on Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-from headroom import fsutil
+from headroom import _filelock, fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom._version import normalize_release_version as _normalize_release_version
 from headroom.agent_savings import (
@@ -1337,53 +1337,6 @@ def _wrap_marker_lock_path(settings_path: Path) -> Path:
     return _paths.shared_workspace_dir() / "locks" / f"wrap-marker-{digest}.lock"
 
 
-# flock is held per open file description, so a second acquisition from THIS
-# process (on a fresh handle) would block against our own outer frame forever.
-# `_handover_to_live_owner` calls back into `_restore_claude_wrap_base_url`,
-# which locks too, so the guard has to be re-entrant within the process.
-_wrap_marker_lock_depth = 0
-
-
-def _lock_handle_exclusive(handle: Any, *, timeout: float) -> bool:
-    """Take an exclusive advisory lock on ``handle``, or give up after
-    ``timeout`` seconds. Returns whether the lock was acquired."""
-
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                handle.seek(0)
-                cast(Any, msvcrt).locking(handle.fileno(), cast(Any, msvcrt).LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                cast(Any, fcntl).flock(
-                    handle.fileno(), cast(Any, fcntl).LOCK_EX | cast(Any, fcntl).LOCK_NB
-                )
-            return True
-        except OSError:
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.02)
-
-
-def _unlock_handle(handle: Any) -> None:
-    try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            handle.seek(0)
-            cast(Any, msvcrt).locking(handle.fileno(), cast(Any, msvcrt).LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            cast(Any, fcntl).flock(handle.fileno(), cast(Any, fcntl).LOCK_UN)
-    except OSError:
-        pass
-
-
 @contextlib.contextmanager
 def _wrap_marker_lock(settings_path: Path, *, timeout: float = 5.0) -> Any:
     """Serialize read-modify-write cycles on the owner stack.
@@ -1393,40 +1346,24 @@ def _wrap_marker_lock(settings_path: Path, *, timeout: float = 5.0) -> Any:
     the same stack, each append itself, and the later write silently drops the
     other LIVE owner — after which that owner's exit restores the pre-Headroom
     URL out from under a still-running peer. The whole read-append-write cycle
-    therefore runs under an interprocess advisory lock on a sidecar
-    ``.headroom_wrap_marker.lock``.
+    therefore runs under an interprocess advisory lock.
 
-    Best-effort by design: if the lock file cannot be created or a holder is
-    wedged past ``timeout``, the body still runs unserialized. Marker
-    bookkeeping must never be the reason a wrap fails to launch.
+    The mechanism lives in :mod:`headroom._filelock`, shared with the isolated
+    run directory's owner records: re-entrant within a process (a handover calls
+    back into the restorer, which locks again) and best-effort across them — if
+    the lock file cannot be created or a holder is wedged past ``timeout``, the
+    body still runs unserialized. Marker bookkeeping must never be the reason a
+    wrap fails to launch.
     """
 
-    global _wrap_marker_lock_depth
-    if _wrap_marker_lock_depth > 0:
-        yield
-        return
-
-    handle = None
     try:
         path = _wrap_marker_lock_path(settings_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 — released in finally
     except OSError:
         yield
         return
 
-    acquired = _lock_handle_exclusive(handle, timeout=timeout)
-    _wrap_marker_lock_depth += 1
-    try:
+    with _filelock.exclusive(path, timeout=timeout):
         yield
-    finally:
-        _wrap_marker_lock_depth -= 1
-        if acquired:
-            _unlock_handle(handle)
-        try:
-            handle.close()
-        except OSError:
-            pass
 
 
 def _wrap_marker_owners(settings_path: Path) -> list[dict[str, Any]]:

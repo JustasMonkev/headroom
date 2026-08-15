@@ -20,7 +20,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from headroom import isolation, paths
+from headroom import _filelock, isolation, paths
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
 
@@ -1155,9 +1155,9 @@ class TestWrapMarkerLocking:
         path = wrap_mod._wrap_marker_lock_path(settings)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a+", encoding="utf-8") as handle:
-            if not wrap_mod._lock_handle_exclusive(handle, timeout=0):
+            if not _filelock.acquire(handle, timeout=0):
                 return False
-            wrap_mod._unlock_handle(handle)
+            _filelock.release(handle)
             return True
 
     def test_lock_is_observable_when_held(self, tmp_path: Path) -> None:
@@ -1233,9 +1233,9 @@ class TestWrapMarkerLocking:
 
         with wrap_mod._wrap_marker_lock(settings):
             with wrap_mod._wrap_marker_lock(settings, timeout=0):
-                assert wrap_mod._wrap_marker_lock_depth == 1
+                assert _filelock._held[str(wrap_mod._wrap_marker_lock_path(settings))] == 1
 
-        assert wrap_mod._wrap_marker_lock_depth == 0
+        assert not _filelock._held
 
     def test_handover_through_the_restorer_does_not_deadlock(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1273,7 +1273,7 @@ class TestWrapMarkerLocking:
         handover = wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
 
         assert handover == "http://127.0.0.1:8788"
-        assert wrap_mod._wrap_marker_lock_depth == 0
+        assert not _filelock._held
 
     def test_body_still_runs_when_the_lock_cannot_be_taken(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1281,12 +1281,12 @@ class TestWrapMarkerLocking:
         """Marker bookkeeping is best-effort: a wedged holder (or an
         unwritable lock path) must never stop a wrap from launching."""
         settings, marker = self._project(tmp_path)
-        monkeypatch.setattr(wrap_mod, "_lock_handle_exclusive", lambda *a, **k: False)
+        monkeypatch.setattr(_filelock, "acquire", lambda *a, **k: False)
 
         wrap_mod._write_wrap_marker(settings, port=8788, key="ANTHROPIC_BASE_URL", previous=None)
 
         assert json.loads(marker.read_text())["owners"][-1]["port"] == 8788
-        assert wrap_mod._wrap_marker_lock_depth == 0
+        assert not _filelock._held
 
     def test_lock_open_failure_is_survivable(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1300,7 +1300,7 @@ class TestWrapMarkerLocking:
         with wrap_mod._wrap_marker_lock(settings):
             pass
 
-        assert wrap_mod._wrap_marker_lock_depth == 0
+        assert not _filelock._held
 
     def test_concurrent_pushes_keep_every_live_owner(self, tmp_path: Path) -> None:
         """End-to-end proof across real processes: two wraps racing to push
@@ -2262,9 +2262,9 @@ class TestSelfhealHookWriteIsSerialized:
         path = wrap_mod._wrap_marker_lock_path(settings)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a+", encoding="utf-8") as handle:
-            if not wrap_mod._lock_handle_exclusive(handle, timeout=0):
+            if not _filelock.acquire(handle, timeout=0):
                 return False
-            wrap_mod._unlock_handle(handle)
+            _filelock.release(handle)
             return True
 
     def test_hook_install_holds_the_lock_across_read_and_write(
@@ -2324,7 +2324,7 @@ class TestSelfhealHookWriteIsSerialized:
         with wrap_mod._wrap_marker_lock(settings):
             wrap_mod._ensure_claude_wrap_selfheal_hook(settings)
 
-        assert wrap_mod._wrap_marker_lock_depth == 0
+        assert not _filelock._held
         assert "hooks" in json.loads(settings.read_text())
 
 
