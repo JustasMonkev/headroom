@@ -879,8 +879,14 @@ def save(values: dict[str, Any]) -> None:
     for key in clear_keys:
         merged.pop(key, None)
     payload = json.dumps(merged, indent=2, sort_keys=True) + "\n"
-    paths.ensure_workspace_dir()
-    _atomic_write_text(paths.settings_path(), payload)
+    # Create the SETTINGS file's own parent, not the workspace root: the
+    # settings path derives from the shared workspace (and can be relocated
+    # outright by HEADROOM_SETTINGS_PATH), so those can be different
+    # directories. `_atomic_write_text` calls `tempfile.mkstemp(dir=parent)`,
+    # which fails outright if that parent does not exist yet.
+    settings_file = paths.settings_path()
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(settings_file, payload)
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:

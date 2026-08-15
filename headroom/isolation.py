@@ -59,6 +59,14 @@ HEADROOM_ISOLATED_WORKSPACE_ENV = "HEADROOM_ISOLATED_WORKSPACE"
 # — and rewrite — the still-live outer session's private endpoint config.
 HEADROOM_ISOLATED_AGENT_HOMES_ENV = "HEADROOM_ISOLATED_AGENT_HOMES"
 
+# The workspace root as it stood BEFORE activation. Usually identical to the
+# shared root, but a user may configure HEADROOM_WORKSPACE_DIR and
+# HEADROOM_SHARED_WORKSPACE_DIR as two distinct directories — in which case
+# restoring `--shared` from the shared root would silently redirect ordinary
+# workspace state into the persistent-resource bucket. Recorded separately so
+# the opt-out returns to the exact directory isolation took over from.
+HEADROOM_PREISOLATION_WORKSPACE_ENV = "HEADROOM_PREISOLATION_WORKSPACE"
+
 _RUNS_DIR = "runs"
 _MEMORY_DB_FILE = "memory.db"
 
@@ -133,9 +141,15 @@ def disable_isolation() -> None:
     if not isolated_ws:
         return
 
-    shared = _trimmed_env(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV)
-    if shared:
-        os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = shared
+    # Restore the workspace isolation actually took over from. Fall back to the
+    # shared root only for a run activated before this was recorded; the two
+    # are identical unless the user configured them as distinct directories.
+    restore_to = _trimmed_env(HEADROOM_PREISOLATION_WORKSPACE_ENV) or _trimmed_env(
+        paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV
+    )
+    if restore_to:
+        os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = restore_to
+    os.environ.pop(HEADROOM_PREISOLATION_WORKSPACE_ENV, None)
 
     # Hand back the user's shared Codex/Grok/OMP config, so this invocation
     # does not read (and rewrite) the still-live outer session's private
@@ -306,6 +320,9 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
     # run state: pin it to the shared root so an edit made from an isolated
     # run's dashboard is not written into a directory GC later deletes.
     _pin_env(paths.HEADROOM_SETTINGS_PATH_ENV, str(paths.settings_path()))
+    # Record the exact workspace we are taking over, so `--shared` restores it
+    # rather than assuming it equals the shared-resource root.
+    os.environ[HEADROOM_PREISOLATION_WORKSPACE_ENV] = str(paths.workspace_dir())
 
     runs_root = paths.workspace_dir() / _RUNS_DIR
     prune_stale_runs(runs_root)
@@ -324,6 +341,7 @@ __all__ = [
     "HEADROOM_ISOLATED_ENV",
     "HEADROOM_ISOLATED_WORKSPACE_ENV",
     "HEADROOM_ISOLATED_AGENT_HOMES_ENV",
+    "HEADROOM_PREISOLATION_WORKSPACE_ENV",
     "HEADROOM_MEMORY_DB_PATH_ENV",
     "isolation_requested",
     "record_isolated_agent_home",

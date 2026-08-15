@@ -22,6 +22,7 @@ _MUTATED_VARS = (
     isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
     isolation.HEADROOM_MEMORY_DB_PATH_ENV,
     isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV,
+    isolation.HEADROOM_PREISOLATION_WORKSPACE_ENV,
     paths.HEADROOM_SETTINGS_PATH_ENV,
     "CODEX_HOME",
     "GROK_HOME",
@@ -533,3 +534,52 @@ class TestPathsPublicApi:
         exec("from headroom.paths import *", namespace)  # noqa: S102
         assert namespace["HEADROOM_SHARED_WORKSPACE_DIR_ENV"] == "HEADROOM_SHARED_WORKSPACE_DIR"
         assert "shared_workspace_dir" in namespace
+
+
+class TestPreIsolationWorkspaceRestore:
+    """`--shared` must restore the workspace isolation actually took over,
+    not assume it equals the shared-resource root (round 5, P2)."""
+
+    def test_distinct_roots_restore_to_the_workspace_root(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(tmp_path / "run-data"))
+        monkeypatch.setenv(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(tmp_path / "persistent"))
+
+        isolation.activate_isolated_workspace(run_id="x")
+        assert os.environ[isolation.HEADROOM_PREISOLATION_WORKSPACE_ENV] == str(
+            tmp_path / "run-data"
+        )
+
+        isolation.disable_isolation()
+
+        # Ordinary workspace state goes back to run-data, NOT the persistent bucket.
+        assert paths.workspace_dir() == tmp_path / "run-data"
+        assert paths.shared_workspace_dir() == tmp_path / "persistent"
+        assert isolation.HEADROOM_PREISOLATION_WORKSPACE_ENV not in os.environ
+
+    def test_identical_roots_still_restore(self, tmp_path: Path) -> None:
+        pre = paths.workspace_dir()
+        isolation.activate_isolated_workspace()
+
+        isolation.disable_isolation()
+
+        assert paths.workspace_dir() == pre
+
+
+class TestSettingsSaveCreatesItsParent:
+    def test_save_into_a_missing_shared_root(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Relocating settings to the shared root means its parent may not
+        exist; `mkstemp(dir=parent)` would fail outright (round 5, P2)."""
+        from headroom import settings_store
+
+        monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(tmp_path / "ws"))
+        monkeypatch.setenv(paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV, str(tmp_path / "not-yet"))
+        assert not (tmp_path / "not-yet").exists()
+
+        settings_store.save({})
+
+        assert paths.settings_path() == tmp_path / "not-yet" / "settings.json"
+        assert paths.settings_path().exists()
