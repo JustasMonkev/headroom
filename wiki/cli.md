@@ -786,7 +786,9 @@ proxy binds only narrows the race, so an isolated run instead gets its own
 copy of that config home (`PI_CODING_AGENT_DIR` / `CODEX_HOME` /
 `GROK_HOME`), seeded from the existing one so the model catalog,
 credentials, and settings carry over. An explicitly set value is always
-respected. `wrap claude` records the actual bound port in its
+respected, and a nested `wrap --shared` launched from such a session gets
+the user's shared agent config back rather than the outer session's private
+copy. `wrap claude` records the actual bound port in its
 `.headroom_wrap_marker.json`, so the SessionStart self-heal hook does not
 mistake a live run on 8788 for a dead one.
 

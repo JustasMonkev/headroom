@@ -51,6 +51,14 @@ HEADROOM_MEMORY_DB_PATH_ENV = "HEADROOM_MEMORY_DB_PATH"
 # instead of nesting a second one.
 HEADROOM_ISOLATED_WORKSPACE_ENV = "HEADROOM_ISOLATED_WORKSPACE"
 
+# Comma-separated list of agent config-home env vars that isolation pointed at
+# a per-run copy (CODEX_HOME / GROK_HOME / PI_CODING_AGENT_DIR — see
+# `_isolate_agent_config_home` in headroom/cli/wrap.py). Recorded in the
+# environment so it is inherited by children: a nested `wrap --shared` must
+# hand the child back the user's SHARED agent config instead of letting it read
+# — and rewrite — the still-live outer session's private endpoint config.
+HEADROOM_ISOLATED_AGENT_HOMES_ENV = "HEADROOM_ISOLATED_AGENT_HOMES"
+
 _RUNS_DIR = "runs"
 _MEMORY_DB_FILE = "memory.db"
 
@@ -129,11 +137,60 @@ def disable_isolation() -> None:
     if shared:
         os.environ[paths.HEADROOM_WORKSPACE_DIR_ENV] = shared
 
+    # Hand back the user's shared Codex/Grok/OMP config, so this invocation
+    # does not read (and rewrite) the still-live outer session's private
+    # per-run endpoint config.
+    _release_isolated_agent_homes(isolated_ws)
+
     # Only clear the memory path if *isolation* set it (== <run_dir>/memory.db);
     # never discard a user-supplied HEADROOM_MEMORY_DB_PATH.
     isolated_db = str(Path(isolated_ws) / _MEMORY_DB_FILE)
     if os.environ.get(HEADROOM_MEMORY_DB_PATH_ENV) == isolated_db:
         os.environ.pop(HEADROOM_MEMORY_DB_PATH_ENV, None)
+
+
+def record_isolated_agent_home(env_var: str) -> None:
+    """Note that isolation pointed ``env_var`` at a per-run agent config home.
+
+    Called by the wrap layer right after it assigns the variable, so
+    :func:`disable_isolation` knows which agent homes to hand back when a
+    nested invocation opts into shared mode.
+    """
+
+    recorded = _recorded_agent_homes()
+    if env_var not in recorded:
+        recorded.append(env_var)
+    os.environ[HEADROOM_ISOLATED_AGENT_HOMES_ENV] = ",".join(recorded)
+
+
+def _recorded_agent_homes() -> list[str]:
+    return [v for v in _trimmed_env(HEADROOM_ISOLATED_AGENT_HOMES_ENV).split(",") if v]
+
+
+def _release_isolated_agent_homes(isolated_ws: str) -> None:
+    """Unset agent config homes that isolation pointed into ``isolated_ws``.
+
+    Isolation only ever assigns one of these when it was previously UNSET (an
+    explicit user value is always respected), so handing back the user's shared
+    agent config means unsetting the variable. Guarded on the value still
+    pointing inside the run directory being left, so a value the child set for
+    itself is never clobbered.
+    """
+
+    try:
+        run_root = Path(isolated_ws).resolve(strict=False)
+    except OSError:
+        return
+    for env_var in _recorded_agent_homes():
+        value = _trimmed_env(env_var)
+        if not value:
+            continue
+        try:
+            if Path(value).resolve(strict=False).is_relative_to(run_root):
+                os.environ.pop(env_var, None)
+        except (OSError, ValueError):
+            continue
+    os.environ.pop(HEADROOM_ISOLATED_AGENT_HOMES_ENV, None)
 
 
 def active_isolated_workspace() -> Path | None:
@@ -266,8 +323,10 @@ def activate_isolated_workspace(run_id: str | None = None) -> Path:
 __all__ = [
     "HEADROOM_ISOLATED_ENV",
     "HEADROOM_ISOLATED_WORKSPACE_ENV",
+    "HEADROOM_ISOLATED_AGENT_HOMES_ENV",
     "HEADROOM_MEMORY_DB_PATH_ENV",
     "isolation_requested",
+    "record_isolated_agent_home",
     "disable_isolation",
     "active_isolated_workspace",
     "activate_isolated_workspace",

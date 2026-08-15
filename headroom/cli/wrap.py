@@ -82,6 +82,9 @@ from headroom.isolation import (
 from headroom.isolation import (
     isolation_requested as _isolation_requested,  # noqa: F401
 )
+from headroom.isolation import (
+    record_isolated_agent_home as _record_isolated_agent_home,
+)
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -4752,6 +4755,9 @@ def _isolate_agent_config_home(
         return None
 
     os.environ[env_var] = str(target)
+    # Record it so a nested `wrap --shared` hands the child back the user's
+    # shared agent config instead of this live session's private copy.
+    _record_isolated_agent_home(env_var)
     if verbose:
         click.echo(f"  Isolated {label} config: {target}", err=True)
     return target

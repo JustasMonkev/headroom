@@ -29,9 +29,18 @@ def _clean_isolation_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any
     mutated = (
         paths.HEADROOM_CONFIG_DIR_ENV,
         paths.HEADROOM_SHARED_WORKSPACE_DIR_ENV,
+        paths.HEADROOM_SETTINGS_PATH_ENV,
         isolation.HEADROOM_ISOLATED_ENV,
         isolation.HEADROOM_ISOLATED_WORKSPACE_ENV,
         isolation.HEADROOM_MEMORY_DB_PATH_ENV,
+        isolation.HEADROOM_ISOLATED_AGENT_HOMES_ENV,
+        # Agent config homes: `_isolate_*_home()` writes these directly into
+        # os.environ, so without an explicit clean they leak a per-run path
+        # into every later test in the session (observed breaking
+        # tests/test_install/test_providers.py, which writes Codex config).
+        "CODEX_HOME",
+        "GROK_HOME",
+        "PI_CODING_AGENT_DIR",
     )
     for var in mutated:
         monkeypatch.delenv(var, raising=False)

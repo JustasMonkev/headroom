@@ -487,6 +487,7 @@ def plugin_workspace_dir(plugin_name: str) -> Path:
 __all__ = [
     "HEADROOM_CONFIG_DIR_ENV",
     "HEADROOM_WORKSPACE_DIR_ENV",
+    "HEADROOM_SHARED_WORKSPACE_DIR_ENV",
     "HEADROOM_SAVINGS_PATH_ENV",
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
