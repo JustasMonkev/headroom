@@ -268,7 +268,11 @@ def test_check_and_clear_stale_wrap_marker_restores_previous(tmp_path: Path) -> 
         path, port=8787, key="ANTHROPIC_BASE_URL", previous="http://old.proxy:9000"
     )
     marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
+    # The marker is an owner STACK; kill the recorded owner in both the stack
+    # and the mirrored top-level fields so no live owner remains.
     marker["pid"] = 999_999_999
+    for owner in marker.get("owners", []):
+        owner["pid"] = 999_999_999
     _marker(tmp_path).write_text(json.dumps(marker), encoding="utf-8")
 
     restored = wrap_cli._check_and_clear_stale_wrap_marker(path, key="ANTHROPIC_BASE_URL")

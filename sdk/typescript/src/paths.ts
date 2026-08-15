@@ -268,9 +268,14 @@ export function leanCtxPath(): string {
   return joinPath(binDir(), name);
 }
 
+/**
+ * Persistent deployment profiles. Supervisors (systemd / cron / launchd)
+ * reference the runner scripts here by absolute path, so they must never land
+ * in an ephemeral per-run workspace. Mirrors `headroom.paths.deploy_root`.
+ */
 export function deployRoot(): string {
   if (!isNode()) return "";
-  return joinPath(workspaceDir(), "deploy");
+  return joinPath(sharedWorkspaceDir(), "deploy");
 }
 
 export function beaconLockPath(port: number): string {

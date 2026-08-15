@@ -499,6 +499,14 @@ describe("shared workspace root", () => {
     expect(licenseCachePath()).toBe(path.join("/tmp/ws", "license_cache.json"));
   });
 
+  it("keeps deployment profiles on the shared root", () => {
+    process.env[HEADROOM_WORKSPACE_DIR_ENV] = "/tmp/ws/runs/run-x";
+    process.env[HEADROOM_SHARED_WORKSPACE_DIR_ENV] = "/tmp/ws";
+
+    // Supervisors reference these runner scripts by absolute path.
+    expect(deployRoot()).toBe(path.join("/tmp/ws", "deploy"));
+  });
+
   it("leaves run-specific resources on the run dir", () => {
     process.env[HEADROOM_WORKSPACE_DIR_ENV] = "/tmp/ws/runs/run-x";
     process.env[HEADROOM_SHARED_WORKSPACE_DIR_ENV] = "/tmp/ws";

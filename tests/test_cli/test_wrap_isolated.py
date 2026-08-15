@@ -938,3 +938,127 @@ class TestMisplacedFlagRespectsDelimiter:
                 wrap_mod._reject_misplaced_isolated_flag((), "claude", argv=argv)
         else:
             wrap_mod._reject_misplaced_isolated_flag((), "claude", argv=argv)
+
+
+class TestCrashedOwnerHandsBackToLivePeer:
+    """Crash cleanup must remove only the DEAD owner. Wiping the whole marker
+    strands a still-live peer outside Headroom (round 9, P1)."""
+
+    def _project(self, tmp_path: Path) -> tuple[Path, Path]:
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://user-gateway"}}))
+        return settings, settings.parent / ".headroom_wrap_marker.json"
+
+    def _url(self, settings: Path) -> str | None:
+        if not settings.exists():
+            return None
+        return json.loads(settings.read_text())["env"].get("ANTHROPIC_BASE_URL")
+
+    def _stack(self, marker: Path, *owners: dict[str, Any]) -> None:
+        marker.write_text(json.dumps({**owners[-1], "owners": list(owners)}))
+
+    def test_stale_cleanup_hands_back_to_live_owner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings, marker = self._project(tmp_path)
+        live = {
+            "pid": os.getpid(),  # run A: alive
+            "port": 8788,
+            "key": "ANTHROPIC_BASE_URL",
+            "url": "http://127.0.0.1:8788",
+            "previous": "https://user-gateway",
+        }
+        dead = {
+            "pid": 2147480000,  # run B: killed without cleanup
+            "port": 8789,
+            "key": "ANTHROPIC_BASE_URL",
+            "url": "http://127.0.0.1:8789",
+            "previous": "https://user-gateway",
+        }
+        self._stack(marker, live, dead)
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8789"}}))
+
+        restored = wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        # Routing goes to the surviving run A, NOT the user's original.
+        assert restored == "http://127.0.0.1:8788"
+        assert self._url(settings) == "http://127.0.0.1:8788"
+        assert marker.exists(), "the live owner must keep the marker"
+        owners = json.loads(marker.read_text())["owners"]
+        assert [o["pid"] for o in owners] == [os.getpid()]
+
+    def test_stale_cleanup_restores_original_when_none_survive(self, tmp_path: Path) -> None:
+        settings, marker = self._project(tmp_path)
+        self._stack(
+            marker,
+            {
+                "pid": 2147480000,
+                "port": 8788,
+                "key": "ANTHROPIC_BASE_URL",
+                "url": "http://127.0.0.1:8788",
+                "previous": "https://user-gateway",
+            },
+        )
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8788"}}))
+
+        restored = wrap_mod._check_and_clear_stale_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert restored == "https://user-gateway"
+        assert self._url(settings) == "https://user-gateway"
+        assert not marker.exists()
+
+    def test_dead_proxy_cleanup_requires_a_live_port(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """#2221: a peer whose PID looks alive but whose port is dead (PID
+        reuse after reboot) must not be handed the entry."""
+        settings, marker = self._project(tmp_path)
+        self._stack(
+            marker,
+            {
+                "pid": os.getpid(),
+                "port": 8788,
+                "key": "ANTHROPIC_BASE_URL",
+                "url": "http://127.0.0.1:8788",
+                "previous": "https://user-gateway",
+            },
+        )
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8788"}}))
+        monkeypatch.setattr(wrap_mod, "_wrap_proxy_alive", lambda _p: False)
+
+        restored = wrap_mod._check_and_clear_dead_wrap_marker(settings, key="ANTHROPIC_BASE_URL")
+
+        assert restored == "https://user-gateway"
+        assert not marker.exists()
+
+
+class TestMemoryCliHonoursIsolatedDb:
+    def test_override_wins_over_project_local(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A nested `headroom memory ...` inside an isolated run must read the
+        run's DB, not the project-local legacy one (round 9, P2)."""
+        from headroom.cli import memory as memory_cli
+
+        project = tmp_path / "proj"
+        (project / ".headroom").mkdir(parents=True)
+        (project / ".headroom" / "memory.db").write_text("")
+        monkeypatch.chdir(project)
+        run_db = tmp_path / "ws" / "runs" / "run-x" / "memory.db"
+        monkeypatch.setenv("HEADROOM_MEMORY_DB_PATH", str(run_db))
+
+        assert memory_cli._default_db_path() == str(run_db)
+
+    def test_project_local_still_wins_without_override(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from headroom.cli import memory as memory_cli
+
+        project = tmp_path / "proj"
+        (project / ".headroom").mkdir(parents=True)
+        (project / ".headroom" / "memory.db").write_text("")
+        monkeypatch.chdir(project)
+        monkeypatch.delenv("HEADROOM_MEMORY_DB_PATH", raising=False)
+
+        assert memory_cli._default_db_path() == str(project / ".headroom" / "memory.db")

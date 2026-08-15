@@ -1422,6 +1422,54 @@ def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
         _wrap_marker_path(settings_path).unlink(missing_ok=True)
 
 
+def _handover_to_live_owner(
+    settings_path: Path, *, key: str, require_live_port: bool = False
+) -> str | None:
+    """Drop dead owners and hand the entry to the newest surviving one.
+
+    Crash cleanup must not wipe the whole marker: when B is killed without
+    running its cleanup while A is still live, the stack still contains A, and
+    restoring B's recorded original would strand A's daemon workers outside
+    Headroom. Removes only the dead owners and rewrites the entry to the newest
+    LIVE owner's URL, returning it. Returns None when no live owner remains, in
+    which case the caller performs the ordinary "restore the original" cleanup.
+
+    ``require_live_port`` additionally drops owners whose recorded proxy port
+    no longer answers — the authoritative signal for the reboot/SIGKILL case
+    (#2221), where a recycled PID can make a dead session look alive.
+    """
+
+    owners = [o for o in _wrap_marker_owners(settings_path) if o.get("key") == key]
+    if require_live_port:
+        owners = [
+            o
+            for o in owners
+            if not isinstance(o.get("port"), int) or _wrap_proxy_alive(int(o["port"]))
+        ]
+    if not owners:
+        return None
+
+    handover = owners[-1].get("url")
+    _write_wrap_marker_owners(settings_path, owners)
+    if not isinstance(handover, str) or not handover:
+        # Legacy owner with no recorded URL: leave the file as-is rather than
+        # guess and strand the live session.
+        return None
+    click.echo(
+        f"headroom: {key} handed back to the still-live wrap session "
+        f"(pid {owners[-1].get('pid')}, port {owners[-1].get('port')})",
+        err=True,
+    )
+    _restore_claude_wrap_base_url(
+        handover,
+        settings_path=settings_path,
+        _key_override=key,
+        _force=True,
+        _keep_marker=True,
+    )
+    return handover
+
+
 def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str | None:
     """If a stale wrap marker for ``key`` exists, restore its recorded prior
     value and clear the marker. Returns the restored value, or None if there
@@ -1431,8 +1479,21 @@ def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str 
     leftover doesn't get treated as this session's own state to restore later.
     """
     marker = _read_wrap_marker(settings_path)
-    if marker is None or marker.get("key") != key or not _wrap_marker_is_stale(marker):
+    if marker is None or marker.get("key") != key:
         return None
+    # Staleness is decided from the owner STACK, which is the authoritative
+    # record — reading it from the mirrored top-level fields alone could
+    # disagree with the stack and clear an entry a live owner still holds.
+    live = [o for o in _wrap_marker_owners(settings_path) if o.get("key") == key]
+    if live and not _wrap_marker_is_stale(marker):
+        # The newest recorded owner is alive; nothing stale to clean up.
+        return None
+    if live:
+        # A crashed owner does not mean nobody owns the entry: hand it to the
+        # surviving peer instead of restoring the user's original value.
+        handover = _handover_to_live_owner(settings_path, key=key)
+        if handover is not None:
+            return handover
     previous = marker.get("previous")
     click.echo(
         f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
@@ -1476,6 +1537,10 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
     elif not _wrap_marker_is_stale(marker):
         # No recorded port → fall back to PID-based staleness.
         return None
+    # Same as above, but a live peer must also still be answering on its port.
+    handover = _handover_to_live_owner(settings_path, key=key, require_live_port=True)
+    if handover is not None:
+        return handover
     previous = marker.get("previous")
     click.echo(
         f"headroom: clearing stale {key} left by a proxy that is no longer "
@@ -1716,6 +1781,7 @@ def _restore_claude_wrap_base_url(
     settings_path: Path | None = None,
     _key_override: str | None = None,
     _force: bool = False,
+    _keep_marker: bool = False,
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -1737,7 +1803,7 @@ def _restore_claude_wrap_base_url(
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    handed_over = False
+    handed_over = _keep_marker
     if not _force:
         # Pop ourselves off the owner stack; whoever is still live decides what
         # the file should say now.

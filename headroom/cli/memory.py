@@ -40,6 +40,17 @@ def _default_db_path() -> str:
     default pointed at neither, so ``headroom memory list`` silently read an
     empty/legacy DB.
     """
+    # An explicit override wins over everything: per-run isolation pins
+    # HEADROOM_MEMORY_DB_PATH into the run directory, and the proxy, the
+    # wrap-side sync, and the memory MCP all read it. Preferring the
+    # project-local file here would make a nested `headroom memory ...` read
+    # and mutate the SHARED legacy database while the rest of the run used the
+    # isolated one — a different view, and state leaking between runs.
+    import os
+
+    override = os.environ.get("HEADROOM_MEMORY_DB_PATH", "").strip()
+    if override:
+        return str(Path(override).expanduser())
     project_db = Path.cwd() / ".headroom" / "memory.db"
     if project_db.exists():
         return str(project_db)
