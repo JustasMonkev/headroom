@@ -893,10 +893,14 @@ class TestExcludeTools:
         assert "router:excluded:lossless_json" in result.transforms_applied
 
     def test_anthropic_mcp_bare_tool_alias_exclude_tools(self, tokenizer):
-        """Bare tool exclusions match custom-agent MCP wrappers (#1822)."""
+        """Bare tool exclusions match custom-agent MCP wrappers (#1822).
+
+        Uses a neutral tool: headroom_retrieve results are verbatim (no
+        lossless fold), which ``test_ccr_retrieve_result_recompression`` covers.
+        """
         config = ContentRouterConfig(
             min_section_tokens=10,
-            exclude_tools={"headroom_retrieve"},
+            exclude_tools={"search_docs"},
         )
         router = ContentRouter(config)
 
@@ -907,7 +911,7 @@ class TestExcludeTools:
                     {
                         "type": "tool_use",
                         "id": "toolu_retrieve_1",
-                        "name": "mcp_HeadroomZai_headroom_retrieve",
+                        "name": "mcp_HeadroomZai_search_docs",
                         "input": {"key": "abc123"},
                     }
                 ],

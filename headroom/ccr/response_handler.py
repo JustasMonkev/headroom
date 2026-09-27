@@ -50,6 +50,32 @@ def model_facing_json(payload: dict) -> str:
     return text
 
 
+def model_facing_text(text: str) -> str:
+    """Raw retrieved content for a model-facing tool result.
+
+    A successful retrieval used to be wrapped as
+    ``{"hash":…,"original_content":"…"}``. JSON string escaping turns every
+    ``"`` into ``\\"`` and every newline into ``\\n``, which costs +12% tokens
+    on compact JSON, +26% on pretty-printed JSON and +14% on source code
+    (o200k_base). Retrieval is the largest single payload the model receives,
+    and the ``hash`` echo is redundant with the tool-call id that pairs the
+    result to its request. So the original goes out verbatim.
+
+    Same surrogate guard as :func:`model_facing_json`: a lone surrogate would
+    crash the continuation request's UTF-8 serialization, so exactly that case
+    falls back to a ``\\udXXX`` escape (what the JSON form would have carried).
+    An empty original becomes ``(empty)``: some providers reject an empty
+    tool-result string, which the JSON wrapper never produced.
+    """
+    if not text:
+        return "(empty)"
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return text
+
+
 # Residual-CCR status signals (provider-generic).
 #
 # ``handle_response`` may return a response that still contains
@@ -235,15 +261,11 @@ class CCRResponseHandler:
             # Retrieval is by hash: always return the full original content.
             entry = store.retrieve(ccr_call.hash_key)
             if entry:
-                # Model-facing payload: compact separators, no telemetry echo.
-                # `original_item_count` is already carried out-of-band on
+                # Model-facing payload: the original, verbatim. No JSON wrapper
+                # (escaping overhead) and no hash / telemetry echo —
+                # `original_item_count` is carried out-of-band on
                 # CCRToolResult.items_retrieved (D2 parity with mcp_server).
-                content = model_facing_json(
-                    {
-                        "hash": ccr_call.hash_key,
-                        "original_content": entry.original_content,
-                    }
-                )
+                content = model_facing_text(entry.original_content)
                 return CCRToolResult(
                     tool_call_id=ccr_call.tool_call_id,
                     content=content,
@@ -350,10 +372,18 @@ class CCRResponseHandler:
             # Format: {"role": "user", "parts": [{"functionResponse": {"name": "...", "response": {...}}}]}
             parts = []
             for result in results:
-                # Parse the content JSON to include as response object
-                try:
-                    response_data = json.loads(result.content)
-                except json.JSONDecodeError:
+                # functionResponse.response must be an object. A successful
+                # retrieval is the original verbatim, so it is always wrapped —
+                # parsing it would rewrite a JSON-object original (duplicate
+                # keys, number formatting). Only error payloads, which are
+                # compact JSON objects, are passed through parsed.
+                response_data = None
+                if not result.success:
+                    try:
+                        response_data = json.loads(result.content)
+                    except json.JSONDecodeError:
+                        response_data = None
+                if not isinstance(response_data, dict):
                     response_data = {"content": result.content}
                 parts.append(
                     {

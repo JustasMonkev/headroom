@@ -248,10 +248,9 @@ class TestCCRRetrievalExecution:
         assert result.success
         assert result.items_retrieved == 100
 
-        # Check content structure
-        content = json.loads(result.content)
-        assert content["hash"] == hash_key
-        assert "original_content" in content
+        # The original goes to the model verbatim: no JSON wrapper, no hash echo.
+        assert result.content == original
+        assert hash_key not in result.content
 
     def test_retrieval_returns_full_content_for_cached_hash(self):
         """Retrieval always returns the full original content (never empty)."""
@@ -281,10 +280,8 @@ class TestCCRRetrievalExecution:
         assert result.success
         assert result.items_retrieved == 5
 
-        content = json.loads(result.content)
-        assert content["hash"] == hash_key
         # Full content is always returned — the complete original round-trips.
-        assert json.loads(content["original_content"]) == items
+        assert json.loads(result.content) == items
 
     def test_retrieval_nonexistent_hash(self):
         """Handle retrieval of nonexistent hash."""
@@ -759,6 +756,25 @@ class TestModelFacingJsonSurrogates:
         text = model_facing_json({"hash": "ab" * 12, "original_content": lone_surrogate})
         text.encode("utf-8")  # must not raise
         assert json.loads(text)["original_content"] == lone_surrogate
+
+    def test_retrieved_text_lone_surrogate_is_escaped(self):
+        from headroom.ccr.response_handler import model_facing_text
+
+        lone_surrogate = json.loads('"payload \\ud800 tail"')
+        text = model_facing_text(lone_surrogate)
+        text.encode("utf-8")  # must not raise
+        assert text == "payload \\ud800 tail"
+
+    def test_retrieved_text_empty_original_is_never_an_empty_result(self):
+        from headroom.ccr.response_handler import model_facing_text
+
+        assert model_facing_text("") == "(empty)"
+
+    def test_retrieved_text_passes_through_unchanged(self):
+        from headroom.ccr.response_handler import model_facing_text
+
+        original = '{"k": "v"}\n汉字 🎉'
+        assert model_facing_text(original) is original
 
     def test_normal_unicode_stays_unescaped(self):
         from headroom.ccr.response_handler import model_facing_json

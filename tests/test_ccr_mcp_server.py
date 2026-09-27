@@ -100,11 +100,15 @@ def test_mcp_compress_surfaces_unreachable_proxy(fresh_store) -> None:
     )
 
     response = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
-    payload = json.loads(response[0].kwargs["text"])
+    payload = mcp_server.parse_compress_result(response[0].kwargs["text"])
 
-    assert payload["proxy"]["status"] == "unreachable"
-    assert payload["proxy"]["url"] == "http://127.0.0.1:9"
+    assert "http://127.0.0.1:9" in payload["warning"]
     assert "unreachable" in payload["warning"].lower()
+
+    # Same state on the next call: the warning is already in context, so it
+    # is not billed again.
+    again = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
+    assert mcp_server.parse_compress_result(again[0].kwargs["text"])["warning"] is None
 
 
 def test_mcp_stats_surfaces_unreachable_proxy() -> None:
@@ -172,10 +176,51 @@ def test_mcp_local_mode_still_works_without_proxy_checking(fresh_store) -> None:
     )
 
     response = asyncio.run(server._handle_compress({"content": "local mode stays available"}))
-    payload = json.loads(response[0].kwargs["text"])
+    payload = mcp_server.parse_compress_result(response[0].kwargs["text"])
 
-    assert "proxy" not in payload
-    assert "warning" not in payload or "unreachable" not in payload["warning"].lower()
+    assert payload["warning"] is None
+    assert "unreachable" not in response[0].kwargs["text"].lower()
+
+
+def test_compress_result_is_header_plus_raw_text(fresh_store) -> None:
+    """The compressed text is not JSON-escaped, and derivable/telemetry
+    fields (tokens_saved, savings_percent, transforms) are not billed."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    content = json.dumps([{"id": i, "status": "ok", "kind": "run"} for i in range(200)], indent=2)
+
+    (response,) = asyncio.run(server._handle_compress({"content": content}))
+    text = response.kwargs["text"]
+    header, _, body = text.partition("\n")
+    parsed = mcp_server.parse_compress_result(text)
+
+    assert header.startswith("hash=")
+    assert parsed["compressed_tokens"] < parsed["original_tokens"]
+    assert parsed["compressed"] == body
+    assert '\\"' not in body  # no JSON string escaping
+    for field in ("savings_percent", "tokens_saved", "transforms"):
+        assert field not in text
+    # The hash redeems the full original.
+    (retrieved,) = asyncio.run(server._handle_retrieve({"hash": parsed["hash"]}))
+    assert retrieved.text == content
+
+
+def test_compress_result_does_not_echo_incompressible_content(fresh_store) -> None:
+    """No savings -> no echo. Echoing made the result larger than the input
+    the caller already holds (JSON escaping on top of the same bytes)."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    content = "short note that will not compress"
+
+    (response,) = asyncio.run(server._handle_compress({"content": content}))
+    text = response.kwargs["text"]
+    parsed = mcp_server.parse_compress_result(text)
+
+    assert content not in text
+    assert parsed["compressed"] is None
+    assert parsed["tokens_saved"] == 0
+
+
+def test_parse_compress_result_rejects_other_payloads() -> None:
+    assert mcp_server.parse_compress_result('{"error":"content parameter is required"}') == {}
 
 
 def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
@@ -529,14 +574,26 @@ def test_retrieve_payload_carries_content_not_telemetry(fresh_store) -> None:
     assert result == {"hash": hash_key, "source": "local", "original_content": original}
 
 
-def test_retrieve_handler_emits_compact_json(fresh_store) -> None:
-    hash_key = get_compression_store().store("hello", "<<small>>")
+def test_retrieve_handler_emits_original_verbatim(fresh_store) -> None:
+    """A hit is the original as-is: no JSON wrapper escaping its quotes and
+    newlines, and no hash echo (the tool-call id already pairs the result)."""
+    original = '[{"id": 1, "name": "a"},\n {"id": 2, "name": "b"}]'
+    hash_key = get_compression_store().store(original, "<<small>>")
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     (content,) = asyncio.run(server._handle_retrieve({"hash": hash_key}))
 
-    assert "\n  " not in content.text
-    assert json.loads(content.text)["original_content"] == "hello"
+    assert content.text == original
+    assert hash_key not in content.text
+
+
+def test_retrieve_handler_miss_stays_compact_json(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    (content,) = asyncio.run(server._handle_retrieve({"hash": "deadbeefdeadbeefdeadbeef"}))
+
+    payload = json.loads(content.text)
+    assert payload["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
+    assert "\n" not in content.text
 
 
 def test_retrieval_miss_message_is_one_short_line() -> None:
@@ -577,3 +634,73 @@ def test_tool_descriptions_are_terse_and_share_the_retrieve_constant(monkeypatch
 
     total = sum(len(t.description) for t in tools.values())
     assert total < 500, f"tool descriptions grew back to {total} chars"
+
+
+def test_stats_recent_events_are_compact_lines(monkeypatch, tmp_path) -> None:
+    """Raw event dicts (float timestamp, leaked pid, derivable savings_percent)
+    were ~87% of the headroom_stats payload; the model gets one line each.
+    The shared stats file keeps the full records."""
+    monkeypatch.setattr(mcp_server, "SHARED_STATS_DIR", tmp_path)
+    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", tmp_path / "session_stats.jsonl")
+    stats = mcp_server.SessionStats()
+    stats.record_compression(2661, 734, "router:mixed:0.16")
+    stats.record_retrieval("a1b2c3d4e5f6a1b2c3d4e5f6")
+
+    events = stats.to_dict()["recent_events"]
+
+    assert events == ["compress 2661->734 router:mixed:0.16", "retrieve a1b2c3d4e5f6"]
+    shared = mcp_server._read_shared_events()
+    assert {"timestamp", "pid", "savings_percent"} <= set(shared[0])
+
+
+def test_multiline_proxy_warning_keeps_the_header_parseable() -> None:
+    """A proxy error page can put newlines (and a lot of HTML) into the
+    warning; it must stay one short line so the header after it still parses."""
+    page = "<html>\n<body>\n" + "<p>Bad Gateway</p>\n" * 200 + "</body>\n</html>"
+    warning = f"Configured proxy http://127.0.0.1:9 is unreachable (HTTP 502 ({page}))."
+    result = {"compressed": "x", "hash": "ab12", "original_tokens": 10, "compressed_tokens": 2}
+
+    text = mcp_server._format_compress_result(result, warning)
+    parsed = mcp_server.parse_compress_result(text)
+
+    first_line = text.split("\n", 1)[0]
+    assert first_line.startswith("warning: Configured proxy http://127.0.0.1:9 is unreachable")
+    assert len(first_line) <= 250
+    assert parsed["hash"] == "ab12"
+    assert parsed["compressed"] == "x"
+
+
+def test_retrieve_miss_is_flagged_as_mcp_error_and_hit_is_not(fresh_store) -> None:
+    """A hit is the original verbatim, so an original that is itself
+    `{"error": …}` JSON must not read as a miss: misses carry isError."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    call_tool = server.server.call_tool_handler
+    original = '{"error":"application failed"}'
+    hash_key = get_compression_store().store(original, "<<small>>")
+
+    hit = asyncio.run(call_tool(mcp_server.CCR_TOOL_NAME, {"hash": hash_key}))
+    miss = asyncio.run(call_tool(mcp_server.CCR_TOOL_NAME, {"hash": "deadbeefdeadbeefdeadbeef"}))
+
+    assert isinstance(hit, list) and hit[0].text == original
+    assert miss.isError is True
+    assert json.loads(miss.content[0].text)["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
+
+
+def test_proxy_warning_suppression_is_per_session(fresh_store, monkeypatch) -> None:
+    """Over the HTTP transport one server serves every client: one session
+    having seen the warning must not hide it from another."""
+
+    class Session:
+        pass
+
+    server = mcp_server.HeadroomMCPServer(proxy_url="http://127.0.0.1:9", check_proxy=True)
+    alice, bob = Session(), Session()
+
+    def warning_for(session: object) -> str | None:
+        monkeypatch.setattr(server, "_session_key", lambda: session)
+        (response,) = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
+        return mcp_server.parse_compress_result(response.kwargs["text"])["warning"]
+
+    assert warning_for(alice) is not None
+    assert warning_for(alice) is None  # already in alice's context
+    assert warning_for(bob) is not None  # bob has not seen it yet

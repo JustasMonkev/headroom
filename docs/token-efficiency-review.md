@@ -537,6 +537,123 @@ suites: 398 passed, 3 skipped. Rust: `headroom-core` diff tests 23/23,
 parity harness diff_compressor 27/27 matched (kompress/ccr/cache_aligner
 fixtures skip in this environment — no HF model cache — same as merge-base).
 
+## H. Round 4 — what the MCP tools hand back to the model (2026-09-27)
+
+Rounds 1–3 shrank what Headroom *injects* (schemas, markers, recall). This pass
+looked at the other side of `headroom wrap`: the text Headroom's own MCP tools
+return, which lands in the agent's context and stays there. All numbers below
+are measured with `o200k_base` on identical inputs, merge-base vs branch.
+
+### H1. Retrieved content was lossily re-compressed on the next turn — P0 [fixed]
+
+The model calls `headroom_retrieve` because it needs the original. On the next
+request the proxy's ContentRouter compressed that tool result like any other.
+The #1077 guard only existed in `SmartCrusher.apply()`, matched only the bare
+name, and the ContentRouter path the proxy actually runs for Anthropic and
+OpenAI Chat had none. `headroom wrap` registers the MCP server, so the client
+calls the tool as `mcp__headroom__headroom_retrieve`, which no guard matched.
+
+Measured: a retrieved 400-line log (16,193 tokens) reached the model on the
+next turn as `"original_content":"<<ccr:6d868fb89f6a,string,40.1KB>>"`, which is
+44 tokens. The model never saw what it retrieved and had to retrieve again,
+paying a full round trip each time.
+
+Fix: `headroom_retrieve` joins `DEFAULT_EXCLUDE_TOOLS` via
+`CCR_RETRIEVE_EXCLUDE_TOOLS`. The alias matching in `is_tool_excluded` covers
+the `mcp__…__` and `mcp_…_` spellings. The router also applies it when a caller's
+`exclude_tools` replaces the defaults, and SmartCrusher's guard became
+alias-aware. Retrieve results are also in `DEFAULT_VERBATIM_EXCLUDE_TOOLS`, so
+they pass through byte-for-byte at any age. Two Codex review rounds on PR #26
+showed that anything weaker leaks:
+- Plain exclusion ages out. The proxy's token mode lets excluded outputs older
+  than the recent window (`protect_recent_reads_fraction=0.3`) fall through to
+  lossy compression, which re-mints a marker for content the model already
+  fetched.
+- The excluded-tool "lossless" folds rewrite bytes. JSON minify parses and
+  re-serializes, so an original like `{"a":1,"a":2}` became `{"a":2}`.
+
+The model asked for the original, so it gets the original. The verbatim set
+also keeps the cross-turn dedup pass from rewriting it. After the fix: the same
+log reaches the model intact (16,193 tokens).
+
+Follow-up, not done here: the optional Rust front proxy's Anthropic and Chat
+live-zone paths (`compress_anthropic_live_zone`,
+`compress_openai_chat_live_zone`) have the same gap. Its Responses path already
+guards via `ends_with("__headroom_retrieve")`.
+
+### H2. Retrieval results were JSON-wrapped — P1 [fixed]
+
+A hit came back as `{"hash":…,"source":"local","original_content":"…"}` from the
+MCP server, and as `{"hash":…,"original_content":"…"}` from the proxy's CCR
+handler and `/v1/retrieve/tool_call`. String escaping turns every `"` into
+`\"` and every newline into `\n`. The `hash` echo is redundant with the
+tool-call id that pairs the result to its call. A hit now returns the original
+verbatim (`model_facing_text`, which keeps the lone-surrogate guard). Misses
+stay one-line compact JSON; the MCP server also sets `isError` on them, since an
+original that is itself `{"error": …}` JSON would otherwise read as a miss. The caller-facing `/v1/retrieve` HTTP contract is
+unchanged.
+
+| retrieved content | original | MCP result, base → branch | proxy result, base → branch |
+|---|---|---|---|
+| log, 200 lines | 8,107 | 8,133 → **8,107** | 8,129 → **8,107** |
+| compact JSON | 2,802 | 3,128 → **2,802** (−10%) | 3,124 → **2,802** |
+| pretty JSON | 5,552 | 6,630 → **5,552** (−16%) | 6,626 → **5,552** |
+| Python source | 1,275 | 1,472 → **1,275** (−13%) | 1,468 → **1,275** |
+| small `ls` output | 48 | 72 → **48** (−33%) | 68 → **48** |
+
+Gemini's `functionResponse.response` must be an object, so every successful
+retrieval is wrapped as `{"content": …}` there. Parsing it would rewrite a
+JSON-object original, such as duplicate keys or number formatting. Only error
+payloads pass through parsed.
+
+### H3. `headroom_compress` often returned more than it was given — P1 [fixed]
+
+The result was a JSON object: the compressed text escaped, plus
+`tokens_saved` / `savings_percent` (derivable from the two counts) and
+`transforms` (telemetry). When nothing compressed, the content was echoed
+back anyway. The caller already holds that content, since it just sent it.
+Now the result is one header line, `hash=<key> tokens=<before>-><after>`,
+followed by the compressed text verbatim. When nothing was saved it is
+`tokens=<n>; not compressible, use the original as-is`.
+`parse_compress_result()` is the inverse for programmatic clients.
+
+| input | tokens | base result | branch result |
+|---|---|---|---|
+| log, 200 lines (not compressible here) | 8,107 | 8,164 | **14** |
+| compact JSON | 2,802 | 3,780 (*larger* than the input) | **2,443** |
+| pretty JSON | 5,552 | 2,026 | **1,840** |
+| Python source (not compressible) | 1,275 | 1,503 | **14** |
+| small `ls` output | 48 | 98 | **13** |
+
+The proxy-unreachable warning was attached on every call as a `proxy` object
+plus a `warning` field that restated it (~86 tokens per call for standalone
+users, whose configured default proxy is not running). It is now one
+`warning: …` line, shown only when the state changes for that client session.
+Over the HTTP transport one server instance serves every client, so one
+client seeing the warning says nothing about another. It is flattened and
+capped at 240 characters, because the probe can embed a whole error page, and
+newlines would break the header `parse_compress_result` relies on. Five calls
+with the proxy down: 10,554 → 9,218 tokens.
+
+### H4. `headroom_stats` spent 87% of its payload on `recent_events` — P2 [fixed]
+
+Each raw event dict carried a 7-decimal float timestamp, a derivable
+`savings_percent`, and a `pid` that `_append_shared_event` writes into the same
+dict object. Events now render as one line each (`compress 2661->734
+router:mixed:0.16`). The shared stats file keeps full records. After 10
+compressions: 470 → **196** tokens.
+
+### Round-4 tests
+
+New `tests/test_ccr_retrieve_result_recompression.py` covers Anthropic and
+OpenAI shapes, bare and MCP-namespaced names, a caller exclude set that replaces
+the defaults, and a non-retrieve control. It also adds MCP-namespaced cases to
+the SmartCrusher #1077 suite. All 8 new loop assertions fail on the merge-base
+and pass on the branch. The MCP/response-handler suites were updated to the
+raw-text formats.
+
+---
+
 ## Verified clean (no action)
 
 - `headroom/tools.json` is a CLI-binary registry (difft/scc/ast-grep), not LLM-facing.

@@ -38,6 +38,8 @@ except ImportError:
     for _d in _VENV_SITE.glob("python*/site-packages"):
         sys.path.insert(0, str(_d))
 
+from headroom.ccr.mcp_server import parse_compress_result  # noqa: E402
+
 _SF_CONN = os.environ.get("SF_CONN", "")
 _SF_HOST = os.environ.get("SF_HOST", "")
 _SF_MODEL = os.environ.get("SF_MODEL", "claude-sonnet-4-6")
@@ -239,18 +241,18 @@ async def run_test(token: str, host: str) -> int:
                 # ── Path B: MCP compress → proxy call ─────────────────────────
                 print("\n  [5/7] Path B — MCP headroom_compress → proxy call")
                 r1 = await session.call_tool("headroom_compress", {"content": dbt})
-                t1 = r1.content[0].text if r1.content else "{}"
-                d1 = json.loads(t1) if t1.startswith("{") else {}
-                c1 = d1.get("compressed", dbt)
-                hash1 = d1.get("hash", "")
+                t1 = r1.content[0].text if r1.content else ""
+                d1 = parse_compress_result(t1)
+                c1 = d1.get("compressed") or dbt
+                hash1 = d1.get("hash") or ""
                 mcp_s1 = d1.get("tokens_saved", 0)
                 mcp_p1 = d1.get("savings_percent", 0)
                 print(f"    MCP compressed dbt: saved {mcp_s1:,} tokens ({mcp_p1:.1f}%)")
 
                 r2 = await session.call_tool("headroom_compress", {"content": tables})
-                t2 = r2.content[0].text if r2.content else "{}"
-                d2 = json.loads(t2) if t2.startswith("{") else {}
-                c2 = d2.get("compressed", tables)
+                t2 = r2.content[0].text if r2.content else ""
+                d2 = parse_compress_result(t2)
+                c2 = d2.get("compressed") or tables
                 mcp_s2 = d2.get("tokens_saved", 0)
                 mcp_p2 = d2.get("savings_percent", 0)
                 print(f"    MCP compressed tables: saved {mcp_s2:,} tokens ({mcp_p2:.1f}%)")
@@ -295,14 +297,14 @@ async def run_test(token: str, host: str) -> int:
                 if hash1:
                     print(f"\n  [6/7] CCR round-trip — headroom_retrieve({hash1[:8]}...)")
                     r3 = await session.call_tool("headroom_retrieve", {"hash": hash1})
-                    t3 = r3.content[0].text if r3.content else "{}"
-                    d3 = json.loads(t3) if t3.startswith("{") else {}
-                    if "original_content" in d3 or "results" in d3:
+                    # A hit is the original verbatim; a miss sets isError.
+                    t3 = r3.content[0].text if r3.content else ""
+                    if r3.isError:
+                        print(f"    ⚠  {t3[:80]}")
+                    elif t3 == dbt:
                         print("    ✓  original content retrieved via headroom_retrieve")
-                    elif "error" in d3:
-                        print(f"    ⚠  {d3.get('error', '')[:80]}")
                     else:
-                        print(f"    ✓  retrieved (keys: {list(d3.keys())})")
+                        print(f"    ✓  retrieved ({len(t3):,} chars)")
 
                 # ── MCP stats ─────────────────────────────────────────────────
                 print("\n  [7/7] headroom_stats (MCP session)")

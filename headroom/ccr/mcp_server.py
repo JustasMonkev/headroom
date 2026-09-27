@@ -28,7 +28,9 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,7 @@ from headroom.cache.compression_store import format_retrieval_miss_detail
 # A4: the retrieve description is shared with the proxy-side tool injection so
 # the two can never drift again (they had). ``tool_injection`` has no heavy
 # dependencies and no import cycle back into this module.
+from headroom.ccr.response_handler import model_facing_text
 from headroom.ccr.tool_injection import CCR_RETRIEVE_DESCRIPTION
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
@@ -64,6 +67,13 @@ except ImportError:
     MCP_AVAILABLE = False
     Server = None  # type: ignore[assignment,misc]
     stdio_server = None  # type: ignore[assignment]
+
+# Separate import: lets a tool result carry isError (mcp>=1.28.1 passes a
+# returned CallToolResult through). Without it, errors stay plain content.
+try:
+    from mcp.types import CallToolResult
+except ImportError:
+    CallToolResult = None  # type: ignore[assignment,misc]
 
 # Try to import httpx for proxy communication
 try:
@@ -227,6 +237,106 @@ def _model_json(payload: Any) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
+def _format_compress_result(result: dict[str, Any], warning: str | None = None) -> str:
+    """Model-facing text for a ``headroom_compress`` result.
+
+    One header line, then the compressed text verbatim. The old JSON object
+    escaped every quote/newline of the compressed text and carried
+    ``tokens_saved`` / ``savings_percent`` (derivable from the two counts) and
+    ``transforms`` (telemetry). When nothing was saved, the content is not
+    echoed back: the caller already has it (it sent it), and echoing made the
+    result larger than the input.
+    """
+    before = result["original_tokens"]
+    after = result["compressed_tokens"]
+    lines = [f"warning: {_one_line(warning)}"] if warning else []
+    if after >= before:
+        lines.append(f"tokens={before}; not compressible, use the original as-is")
+        return "\n".join(lines)
+    compressed = result["compressed"]
+    if not isinstance(compressed, str):
+        compressed = _model_json(compressed)
+    lines.append(f"hash={result['hash']} tokens={before}->{after}")
+    lines.append(model_facing_text(compressed))
+    return "\n".join(lines)
+
+
+_WARNING_MAX_CHARS = 240
+
+
+def _one_line(text: str) -> str:
+    """Collapse a warning onto one bounded line.
+
+    The proxy probe can embed a whole error page (``response.text``) in the
+    warning. Newlines would break the header boundary ``parse_compress_result``
+    relies on, and the page itself is tokens the model cannot act on.
+    """
+    flat = " ".join(text.split())
+    if len(flat) > _WARNING_MAX_CHARS:
+        flat = flat[: _WARNING_MAX_CHARS - 1].rstrip() + "…"
+    return flat
+
+
+_COMPRESS_HEADER_RE = re.compile(
+    r"^hash=(?P<hash>[0-9a-f]+) tokens=(?P<before>\d+)->(?P<after>\d+)$"
+)
+_NOOP_HEADER_RE = re.compile(r"^tokens=(?P<before>\d+); not compressible")
+
+
+def parse_compress_result(text: str) -> dict[str, Any]:
+    """Parse a ``headroom_compress`` result back into fields.
+
+    Inverse of :func:`_format_compress_result`, for programmatic MCP clients.
+    ``compressed`` and ``hash`` are ``None`` when nothing was saved. Returns
+    ``{}`` for text in neither shape (e.g. an ``{"error": …}`` payload).
+    """
+    warning = None
+    head, _, rest = text.partition("\n")
+    if head.startswith("warning: "):
+        warning = head[len("warning: ") :]
+        head, _, rest = rest.partition("\n")
+    match = _COMPRESS_HEADER_RE.match(head)
+    if match:
+        before, after = int(match["before"]), int(match["after"])
+        parsed: dict[str, Any] = {"hash": match["hash"], "compressed": rest}
+    elif noop := _NOOP_HEADER_RE.match(head):
+        before = after = int(noop["before"])
+        parsed = {"hash": None, "compressed": None}
+    else:
+        return {}
+    parsed.update(
+        original_tokens=before,
+        compressed_tokens=after,
+        tokens_saved=before - after,
+        savings_percent=round((1 - after / before) * 100, 1) if before else 0,
+        warning=warning,
+    )
+    return parsed
+
+
+class _ToolError(list):  # type: ignore[type-arg]
+    """Tool content that reports a failure (sent with MCP ``isError``).
+
+    A successful retrieval is the original verbatim, so its text alone cannot
+    say "miss": an original that is itself ``{"error": …}`` JSON would read
+    like one. The flag carries that instead of the text shape.
+    """
+
+
+def _as_tool_result(content: list[Any]) -> Any:
+    """Return handler content as-is, or as ``CallToolResult(isError=True)``."""
+    if isinstance(content, _ToolError) and CallToolResult is not None:
+        return CallToolResult(content=list(content), isError=True)
+    return content
+
+
+class _NoSession:
+    """Warning-state key for calls made outside an MCP request context."""
+
+
+_NO_SESSION = _NoSession()
+
+
 def _append_shared_event(event: dict[str, Any]) -> None:
     """Append an event to the shared stats file (cross-process, file-locked)."""
     try:
@@ -369,8 +479,26 @@ class SessionStats:
             "total_tokens_saved": self.total_tokens_saved,
             "savings_percent": savings_pct,
             "estimated_cost_saved_usd": cost_saved,
-            "recent_events": self.events[-10:],
+            "recent_events": [_render_event(e) for e in self.events[-10:]],
         }
+
+
+def _render_event(event: dict[str, Any]) -> str:
+    """One compact line per event for the model-facing stats payload.
+
+    The raw dicts (kept as-is in the shared stats file) cost ~49 tokens each:
+    a 7-decimal float timestamp, a ``pid`` that ``_append_shared_event``
+    writes into the same dict, and a ``savings_percent`` derivable from the
+    token counts. Ten of them were ~87% of the whole ``headroom_stats`` result.
+    """
+    if event.get("type") == "compress":
+        return (
+            f"compress {event.get('input_tokens', 0)}->{event.get('output_tokens', 0)} "
+            f"{event.get('strategy', '')}"
+        ).rstrip()
+    if event.get("type") == "retrieve":
+        return f"retrieve {event.get('hash', '')}".rstrip()
+    return str(event.get("type", "event"))
 
 
 class HeadroomMCPServer:
@@ -402,6 +530,13 @@ class HeadroomMCPServer:
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
+        # Last proxy warning shown in a compress result, per MCP session, so
+        # the same warning is not re-billed on every call while the proxy stays
+        # down. Per session: over the HTTP transport one server instance serves
+        # every client, and one client seeing it says nothing about another.
+        self._last_compress_proxy_warning: weakref.WeakKeyDictionary[Any, str | None] = (
+            weakref.WeakKeyDictionary()
+        )
 
         if not MCP_AVAILABLE or Server is None:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
@@ -708,7 +843,8 @@ class HeadroomMCPServer:
             return tools
 
         @self.server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        async def call_tool(name: str, arguments: dict[str, Any]) -> Any:
+            # Content list, or CallToolResult(isError=True) for a _ToolError.
             started = time.perf_counter()
             logger.info(
                 "event=mcp_tool_call_received tool=%s arguments=%s",
@@ -741,15 +877,19 @@ class HeadroomMCPServer:
                         default=str,
                     ),
                 )
-                return result
+                return _as_tool_result(result)
             except Exception as e:
                 logger.error(f"Tool {name} failed: {e}", exc_info=True)
-                return [
-                    TextContent(
-                        type="text",
-                        text=_model_json({"error": str(e)}),
+                return _as_tool_result(
+                    _ToolError(
+                        [
+                            TextContent(
+                                type="text",
+                                text=_model_json({"error": str(e)}),
+                            )
+                        ]
                     )
-                ]
+                )
 
     async def _handle_compress(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_compress tool call."""
@@ -774,11 +914,15 @@ class HeadroomMCPServer:
             logger.debug("durable savings recording failed", exc_info=True)
 
         proxy_status = await self._probe_proxy_unreachable()
-        if proxy_status:
-            result["proxy"] = proxy_status
-            result["warning"] = proxy_status["warning"]
+        warning = proxy_status["warning"] if proxy_status else None
+        session = self._session_key()
+        if warning == self._last_compress_proxy_warning.get(session):
+            show_warning = None  # already in this session's context
+        else:
+            show_warning = warning
+        self._last_compress_proxy_warning[session] = warning
 
-        return [TextContent(type="text", text=_model_json(result))]
+        return [TextContent(type="text", text=_format_compress_result(result, show_warning))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -814,16 +958,29 @@ class HeadroomMCPServer:
             pass
         return "unknown"
 
+    def _session_key(self) -> Any:
+        """The current MCP session (a weak-dict key), or a shared fallback."""
+        try:
+            return self.server.request_context.session
+        except Exception:
+            return _NO_SESSION
+
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
-        """Handle headroom_retrieve tool call."""
+        """Handle headroom_retrieve tool call.
+
+        A hit is the original verbatim; a miss is a ``_ToolError`` (MCP
+        ``isError``), since the text shape alone cannot tell them apart.
+        """
         hash_key = arguments.get("hash")
         if not hash_key:
-            return [
-                TextContent(
-                    type="text",
-                    text=_model_json({"error": "hash parameter is required"}),
-                )
-            ]
+            return _ToolError(
+                [
+                    TextContent(
+                        type="text",
+                        text=_model_json({"error": "hash parameter is required"}),
+                    )
+                ]
+            )
 
         logger.info("event=mcp_retrieve_started hash=%s", hash_key)
         result = await self._retrieve_content(hash_key)
@@ -833,7 +990,13 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=_model_json(result))]
+        original = result.get("original_content")
+        if "error" not in result and isinstance(original, str):
+            # A hit returns the original verbatim: wrapping it in JSON escaped
+            # every quote/newline (+12-26% tokens on JSON and code) and echoed
+            # the hash the model just sent. See `model_facing_text`.
+            return [TextContent(type="text", text=model_facing_text(original))]
+        return _ToolError([TextContent(type="text", text=_model_json(result))])
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""

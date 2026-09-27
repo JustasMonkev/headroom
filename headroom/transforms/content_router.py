@@ -55,6 +55,7 @@ from enum import Enum
 from typing import Any
 
 from ..config import (
+    CCR_RETRIEVE_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
@@ -1862,6 +1863,17 @@ BYTE_SENSITIVE_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "notebook_read",
     }
 )
+
+
+def _is_ccr_retrieve_tool(tool_name: str) -> bool:
+    """True for ``headroom_retrieve`` under any spelling (bare or MCP-namespaced).
+
+    Its results are originals the model explicitly fetched. They are always
+    excluded (even when a caller's exclude set replaces the defaults), and
+    ``DEFAULT_VERBATIM_EXCLUDE_TOOLS`` then passes them through byte-for-byte
+    at any age.
+    """
+    return bool(tool_name) and is_tool_excluded(tool_name, CCR_RETRIEVE_EXCLUDE_TOOLS)
 
 
 def _tool_output_is_byte_sensitive(tool_name: str) -> bool:
@@ -4875,10 +4887,13 @@ class ContentRouter(Transform):
             if self.config.exclude_tools is not None
             else DEFAULT_EXCLUDE_TOOLS
         )
+        # headroom_retrieve results stay excluded even when a caller-supplied
+        # exclude set replaces the defaults: lossy-recompressing retrieved
+        # content re-mints a marker for it (a retrieval loop).
         excluded_tool_ids = {
             tool_id
             for tool_id, name in tool_name_map.items()
-            if is_tool_excluded(name, exclude_tools)
+            if is_tool_excluded(name, exclude_tools) or _is_ccr_retrieve_tool(name)
         }
 
         # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
