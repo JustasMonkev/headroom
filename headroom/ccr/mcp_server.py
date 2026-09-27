@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,7 @@ from headroom.cache.compression_store import format_retrieval_miss_detail
 # A4: the retrieve description is shared with the proxy-side tool injection so
 # the two can never drift again (they had). ``tool_injection`` has no heavy
 # dependencies and no import cycle back into this module.
+from headroom.ccr.response_handler import model_facing_text
 from headroom.ccr.tool_injection import CCR_RETRIEVE_DESCRIPTION
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
@@ -227,6 +229,67 @@ def _model_json(payload: Any) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
+def _format_compress_result(result: dict[str, Any], warning: str | None = None) -> str:
+    """Model-facing text for a ``headroom_compress`` result.
+
+    One header line, then the compressed text verbatim. The old JSON object
+    escaped every quote/newline of the compressed text and carried
+    ``tokens_saved`` / ``savings_percent`` (derivable from the two counts) and
+    ``transforms`` (telemetry). When nothing was saved, the content is not
+    echoed back: the caller already has it (it sent it), and echoing made the
+    result larger than the input.
+    """
+    before = result["original_tokens"]
+    after = result["compressed_tokens"]
+    lines = [f"warning: {warning}"] if warning else []
+    if after >= before:
+        lines.append(f"tokens={before}; not compressible, use the original as-is")
+        return "\n".join(lines)
+    compressed = result["compressed"]
+    if not isinstance(compressed, str):
+        compressed = _model_json(compressed)
+    lines.append(f"hash={result['hash']} tokens={before}->{after}")
+    lines.append(model_facing_text(compressed))
+    return "\n".join(lines)
+
+
+_COMPRESS_HEADER_RE = re.compile(
+    r"^hash=(?P<hash>[0-9a-f]+) tokens=(?P<before>\d+)->(?P<after>\d+)$"
+)
+_NOOP_HEADER_RE = re.compile(r"^tokens=(?P<before>\d+); not compressible")
+
+
+def parse_compress_result(text: str) -> dict[str, Any]:
+    """Parse a ``headroom_compress`` result back into fields.
+
+    Inverse of :func:`_format_compress_result`, for programmatic MCP clients.
+    ``compressed`` and ``hash`` are ``None`` when nothing was saved. Returns
+    ``{}`` for text in neither shape (e.g. an ``{"error": …}`` payload).
+    """
+    warning = None
+    head, _, rest = text.partition("\n")
+    if head.startswith("warning: "):
+        warning = head[len("warning: ") :]
+        head, _, rest = rest.partition("\n")
+    match = _COMPRESS_HEADER_RE.match(head)
+    if match:
+        before, after = int(match["before"]), int(match["after"])
+        parsed: dict[str, Any] = {"hash": match["hash"], "compressed": rest}
+    elif noop := _NOOP_HEADER_RE.match(head):
+        before = after = int(noop["before"])
+        parsed = {"hash": None, "compressed": None}
+    else:
+        return {}
+    parsed.update(
+        original_tokens=before,
+        compressed_tokens=after,
+        tokens_saved=before - after,
+        savings_percent=round((1 - after / before) * 100, 1) if before else 0,
+        warning=warning,
+    )
+    return parsed
+
+
 def _append_shared_event(event: dict[str, Any]) -> None:
     """Append an event to the shared stats file (cross-process, file-locked)."""
     try:
@@ -369,8 +432,26 @@ class SessionStats:
             "total_tokens_saved": self.total_tokens_saved,
             "savings_percent": savings_pct,
             "estimated_cost_saved_usd": cost_saved,
-            "recent_events": self.events[-10:],
+            "recent_events": [_render_event(e) for e in self.events[-10:]],
         }
+
+
+def _render_event(event: dict[str, Any]) -> str:
+    """One compact line per event for the model-facing stats payload.
+
+    The raw dicts (kept as-is in the shared stats file) cost ~49 tokens each:
+    a 7-decimal float timestamp, a ``pid`` that ``_append_shared_event``
+    writes into the same dict, and a ``savings_percent`` derivable from the
+    token counts. Ten of them were ~87% of the whole ``headroom_stats`` result.
+    """
+    if event.get("type") == "compress":
+        return (
+            f"compress {event.get('input_tokens', 0)}->{event.get('output_tokens', 0)} "
+            f"{event.get('strategy', '')}"
+        ).rstrip()
+    if event.get("type") == "retrieve":
+        return f"retrieve {event.get('hash', '')}".rstrip()
+    return str(event.get("type", "event"))
 
 
 class HeadroomMCPServer:
@@ -402,6 +483,9 @@ class HeadroomMCPServer:
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
+        # Last proxy warning shown in a compress result, so the same warning
+        # is not re-billed on every call while the proxy stays down.
+        self._last_compress_proxy_warning: str | None = None
 
         if not MCP_AVAILABLE or Server is None:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
@@ -774,11 +858,14 @@ class HeadroomMCPServer:
             logger.debug("durable savings recording failed", exc_info=True)
 
         proxy_status = await self._probe_proxy_unreachable()
-        if proxy_status:
-            result["proxy"] = proxy_status
-            result["warning"] = proxy_status["warning"]
+        warning = proxy_status["warning"] if proxy_status else None
+        if warning == self._last_compress_proxy_warning:
+            show_warning = None  # already in context from an earlier call
+        else:
+            show_warning = warning
+        self._last_compress_proxy_warning = warning
 
-        return [TextContent(type="text", text=_model_json(result))]
+        return [TextContent(type="text", text=_format_compress_result(result, show_warning))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -833,6 +920,12 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
+        original = result.get("original_content")
+        if "error" not in result and isinstance(original, str):
+            # A hit returns the original verbatim: wrapping it in JSON escaped
+            # every quote/newline (+12-26% tokens on JSON and code) and echoed
+            # the hash the model just sent. See `model_facing_text`.
+            return [TextContent(type="text", text=model_facing_text(original))]
         return [TextContent(type="text", text=_model_json(result))]
 
     async def _handle_stats(self) -> list[TextContent]:

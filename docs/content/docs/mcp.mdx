@@ -46,11 +46,16 @@ Compress content on demand. The LLM calls this when it wants to shrink large con
 **Parameters:**
 - `content` (required) -- text to compress (files, JSON, logs, search results)
 
-**Returns:**
-- `compressed` -- compressed text
-- `hash` -- key for retrieving the original later
-- `original_tokens` / `compressed_tokens` / `savings_percent`
-- `transforms` -- which compression algorithms were applied
+**Returns:** one header line, then the compressed text verbatim (not
+JSON-escaped, so it costs no more tokens than the text itself):
+- `hash=<key> tokens=<before>-><after>` -- the key retrieves the original later
+- when nothing was saved: `tokens=<n>; not compressible, use the original as-is`
+  (the content is not echoed back -- the caller already has it)
+- a `warning: ...` line first when the configured proxy is unreachable (shown
+  once per state change, not on every call)
+
+Programmatic clients can parse the text with
+`headroom.ccr.mcp_server.parse_compress_result()`.
 
 Example flow:
 
@@ -59,14 +64,8 @@ Claude: Let me compress this large output to save context space.
 
 -> headroom_compress(content="[5000 lines of grep results...]")
 
-<- {
-    "compressed": "[key matches with context...]",
-    "hash": "a1b2c3d4e5f6...",
-    "original_tokens": 12000,
-    "compressed_tokens": 3200,
-    "savings_percent": 73.3,
-    "transforms": ["router:search:0.27"]
-   }
+<- hash=a1b2c3d4e5f6a1b2c3d4e5f6 tokens=12000->3200
+   [key matches with context...]
 ```
 
 The original is stored locally for 1 hour. If the LLM needs the full content later, it calls `headroom_retrieve`.
@@ -77,11 +76,10 @@ Retrieve original uncompressed content by hash.
 
 **Parameters:**
 - `hash` (required) -- hash key from a previous compression
-- `query` (optional) -- search within the original to return only matching items
 
-**Returns:**
-- `original_content` (full retrieval) or `results` (filtered search)
-- `source` -- `"local"` or `"proxy"`
+**Returns:** the original content, verbatim. Wrapping it in JSON escaped every
+quote and newline (+12% tokens on compact JSON, +26% on pretty-printed JSON,
++14% on code). A miss returns a one-line `{"error": ...}` object.
 
 Retrieval checks the local store first, then falls back to the proxy's store. Hashes from either source work transparently.
 
@@ -92,7 +90,8 @@ Session compression statistics.
 **Returns:**
 - `compressions`, `retrievals`, `tokens_saved`, `savings_percent`
 - `estimated_cost_saved_usd`
-- `recent_events` -- last 10 compression/retrieval events
+- `recent_events` -- last 10 compression/retrieval events, one line each
+  (e.g. `compress 2661->734 router:mixed:0.16`)
 - `sub_agents` -- stats from sub-agent MCP instances
 - `combined` -- main + sub-agent totals
 - `proxy` -- request count, cache hits, cost saved (if proxy is running)

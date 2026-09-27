@@ -33,6 +33,8 @@ except ImportError:
     for _d in _VENV_SITE.glob("python*/site-packages"):
         sys.path.insert(0, str(_d))
 
+from headroom.ccr.mcp_server import parse_compress_result  # noqa: E402
+
 _SF_CONN = os.environ.get("SF_CONN", "")
 _SF_HOST = os.environ.get("SF_HOST", "")
 _SF_MODEL = os.environ.get("SF_MODEL", "claude-sonnet-4-6")
@@ -189,12 +191,12 @@ async def run_mcp_test(token: str, host: str) -> int:
 
             print("    ├─ MCP headroom_compress ...", end=" ", flush=True)
             r1 = await session.call_tool("headroom_compress", {"content": dbt_content})
-            text1 = r1.content[0].text if r1.content else "{}"
-            data1 = json.loads(text1) if text1.startswith("{") else {}
-            compressed1 = data1.get("compressed", dbt_content)
+            text1 = r1.content[0].text if r1.content else ""
+            data1 = parse_compress_result(text1)
+            compressed1 = data1.get("compressed") or dbt_content
             saved1 = data1.get("tokens_saved", 0)
             pct1 = data1.get("savings_percent", 0)
-            hash1 = data1.get("hash", "")
+            hash1 = data1.get("hash") or ""
             print(f"saved {saved1:,} tokens ({pct1:.1f}%)  hash={hash1[:8]}...")
 
             print("    └─ Cortex call (MCP-compressed) ...", end=" ", flush=True)
@@ -238,9 +240,9 @@ async def run_mcp_test(token: str, host: str) -> int:
 
             print("    ├─ MCP headroom_compress ...", end=" ", flush=True)
             r2 = await session.call_tool("headroom_compress", {"content": tbl_content})
-            text2 = r2.content[0].text if r2.content else "{}"
-            data2 = json.loads(text2) if text2.startswith("{") else {}
-            compressed2 = data2.get("compressed", tbl_content)
+            text2 = r2.content[0].text if r2.content else ""
+            data2 = parse_compress_result(text2)
+            compressed2 = data2.get("compressed") or tbl_content
             saved2 = data2.get("tokens_saved", 0)
             pct2 = data2.get("savings_percent", 0)
             print(f"saved {saved2:,} tokens ({pct2:.1f}%)")
@@ -270,14 +272,14 @@ async def run_mcp_test(token: str, host: str) -> int:
             if hash1:
                 print(f"\n  [5/6] headroom_retrieve — CCR round-trip (hash={hash1[:8]}...)")
                 r3 = await session.call_tool("headroom_retrieve", {"hash": hash1})
-                text3 = r3.content[0].text if r3.content else "{}"
-                data3 = json.loads(text3) if text3.startswith("{") else {}
-                if "original_content" in data3 or "results" in data3:
+                # A hit is the original verbatim; a miss is {"error": ...} JSON.
+                text3 = r3.content[0].text if r3.content else ""
+                if text3 == dbt_content:
                     print("    ✓  original content retrieved successfully")
-                elif "error" in data3:
-                    print(f"    ⚠  {data3['error'][:80]}")
+                elif text3.startswith('{"error"'):
+                    print(f"    ⚠  {json.loads(text3)['error'][:80]}")
                 else:
-                    print(f"    ✓  retrieved (keys: {list(data3.keys())})")
+                    print(f"    ✓  retrieved ({len(text3):,} chars)")
 
             # ── headroom_stats ────────────────────────────────────────────────
             print("\n  [6/6] headroom_stats")

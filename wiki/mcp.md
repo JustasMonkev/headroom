@@ -42,12 +42,16 @@ Tool: headroom_compress
 Parameters:
   - content (required): Text to compress (files, JSON, logs, search results, etc.)
 
-Returns:
-  - compressed: Compressed text
-  - hash: Key for retrieving the original later
-  - original_tokens / compressed_tokens / savings_percent
-  - transforms: Which compression algorithms were applied
+Returns (one header line, then the compressed text verbatim — not JSON-escaped):
+  - "hash=<key> tokens=<before>-><after>": the key retrieves the original later
+  - "tokens=<n>; not compressible, use the original as-is" when nothing was
+    saved (the content is not echoed back — the caller already has it)
+  - a leading "warning: ..." line when the configured proxy is unreachable
+    (once per state change, not on every call)
 ```
+
+Programmatic clients can parse the text with
+`headroom.ccr.mcp_server.parse_compress_result()`.
 
 Example — Claude reads a large file, then compresses it:
 
@@ -56,14 +60,8 @@ Claude: Let me compress this large output to save context space.
 
 → headroom_compress(content="[5000 lines of grep results...]")
 
-← {
-    "compressed": "[key matches with context...]",
-    "hash": "a1b2c3d4e5f6...",
-    "original_tokens": 12000,
-    "compressed_tokens": 3200,
-    "savings_percent": 73.3,
-    "transforms": ["router:search:0.27"]
-  }
+← hash=a1b2c3d4e5f6a1b2c3d4e5f6 tokens=12000->3200
+  [key matches with context...]
 ```
 
 The original is stored locally for the session (1-hour TTL). If Claude needs the full content later, it calls `headroom_retrieve`.
@@ -77,11 +75,11 @@ Tool: headroom_retrieve
 
 Parameters:
   - hash (required): Hash key from compression
-  - query (optional): Search within the original to return only matching items
 
 Returns:
-  - original_content (full retrieval) or results (search)
-  - source: "local" or "proxy"
+  - the original content, verbatim (no JSON wrapper: escaping every quote and
+    newline cost +12-26% tokens on JSON and +14% on code)
+  - on a miss, a one-line {"error": ...} object
 ```
 
 Retrieval checks the local store first (content compressed via `headroom_compress`), then falls back to the proxy's store (content compressed automatically by the proxy). Hashes from either source work transparently.
@@ -96,7 +94,8 @@ Tool: headroom_stats
 Returns:
   - compressions, retrievals, tokens_saved, savings_percent
   - estimated_cost_saved_usd
-  - recent_events (last 10 compression/retrieval events)
+  - recent_events (last 10 compression/retrieval events, one line each,
+    e.g. "compress 2661->734 router:mixed:0.16")
   - sub_agents (stats from sub-agent MCP instances, if any)
   - combined (main + sub-agent totals)
   - proxy (request count, cache hits, cost saved — if proxy is running)

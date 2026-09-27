@@ -100,11 +100,15 @@ def test_mcp_compress_surfaces_unreachable_proxy(fresh_store) -> None:
     )
 
     response = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
-    payload = json.loads(response[0].kwargs["text"])
+    payload = mcp_server.parse_compress_result(response[0].kwargs["text"])
 
-    assert payload["proxy"]["status"] == "unreachable"
-    assert payload["proxy"]["url"] == "http://127.0.0.1:9"
+    assert "http://127.0.0.1:9" in payload["warning"]
     assert "unreachable" in payload["warning"].lower()
+
+    # Same state on the next call: the warning is already in context, so it
+    # is not billed again.
+    again = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
+    assert mcp_server.parse_compress_result(again[0].kwargs["text"])["warning"] is None
 
 
 def test_mcp_stats_surfaces_unreachable_proxy() -> None:
@@ -172,10 +176,51 @@ def test_mcp_local_mode_still_works_without_proxy_checking(fresh_store) -> None:
     )
 
     response = asyncio.run(server._handle_compress({"content": "local mode stays available"}))
-    payload = json.loads(response[0].kwargs["text"])
+    payload = mcp_server.parse_compress_result(response[0].kwargs["text"])
 
-    assert "proxy" not in payload
-    assert "warning" not in payload or "unreachable" not in payload["warning"].lower()
+    assert payload["warning"] is None
+    assert "unreachable" not in response[0].kwargs["text"].lower()
+
+
+def test_compress_result_is_header_plus_raw_text(fresh_store) -> None:
+    """The compressed text is not JSON-escaped, and derivable/telemetry
+    fields (tokens_saved, savings_percent, transforms) are not billed."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    content = json.dumps([{"id": i, "status": "ok", "kind": "run"} for i in range(200)], indent=2)
+
+    (response,) = asyncio.run(server._handle_compress({"content": content}))
+    text = response.kwargs["text"]
+    header, _, body = text.partition("\n")
+    parsed = mcp_server.parse_compress_result(text)
+
+    assert header.startswith("hash=")
+    assert parsed["compressed_tokens"] < parsed["original_tokens"]
+    assert parsed["compressed"] == body
+    assert '\\"' not in body  # no JSON string escaping
+    for field in ("savings_percent", "tokens_saved", "transforms"):
+        assert field not in text
+    # The hash redeems the full original.
+    (retrieved,) = asyncio.run(server._handle_retrieve({"hash": parsed["hash"]}))
+    assert retrieved.text == content
+
+
+def test_compress_result_does_not_echo_incompressible_content(fresh_store) -> None:
+    """No savings -> no echo. Echoing made the result larger than the input
+    the caller already holds (JSON escaping on top of the same bytes)."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    content = "short note that will not compress"
+
+    (response,) = asyncio.run(server._handle_compress({"content": content}))
+    text = response.kwargs["text"]
+    parsed = mcp_server.parse_compress_result(text)
+
+    assert content not in text
+    assert parsed["compressed"] is None
+    assert parsed["tokens_saved"] == 0
+
+
+def test_parse_compress_result_rejects_other_payloads() -> None:
+    assert mcp_server.parse_compress_result('{"error":"content parameter is required"}') == {}
 
 
 def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
@@ -529,14 +574,26 @@ def test_retrieve_payload_carries_content_not_telemetry(fresh_store) -> None:
     assert result == {"hash": hash_key, "source": "local", "original_content": original}
 
 
-def test_retrieve_handler_emits_compact_json(fresh_store) -> None:
-    hash_key = get_compression_store().store("hello", "<<small>>")
+def test_retrieve_handler_emits_original_verbatim(fresh_store) -> None:
+    """A hit is the original as-is: no JSON wrapper escaping its quotes and
+    newlines, and no hash echo (the tool-call id already pairs the result)."""
+    original = '[{"id": 1, "name": "a"},\n {"id": 2, "name": "b"}]'
+    hash_key = get_compression_store().store(original, "<<small>>")
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     (content,) = asyncio.run(server._handle_retrieve({"hash": hash_key}))
 
-    assert "\n  " not in content.text
-    assert json.loads(content.text)["original_content"] == "hello"
+    assert content.text == original
+    assert hash_key not in content.text
+
+
+def test_retrieve_handler_miss_stays_compact_json(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    (content,) = asyncio.run(server._handle_retrieve({"hash": "deadbeefdeadbeefdeadbeef"}))
+
+    payload = json.loads(content.text)
+    assert payload["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
+    assert "\n" not in content.text
 
 
 def test_retrieval_miss_message_is_one_short_line() -> None:
@@ -577,3 +634,20 @@ def test_tool_descriptions_are_terse_and_share_the_retrieve_constant(monkeypatch
 
     total = sum(len(t.description) for t in tools.values())
     assert total < 500, f"tool descriptions grew back to {total} chars"
+
+
+def test_stats_recent_events_are_compact_lines(monkeypatch, tmp_path) -> None:
+    """Raw event dicts (float timestamp, leaked pid, derivable savings_percent)
+    were ~87% of the headroom_stats payload; the model gets one line each.
+    The shared stats file keeps the full records."""
+    monkeypatch.setattr(mcp_server, "SHARED_STATS_DIR", tmp_path)
+    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", tmp_path / "session_stats.jsonl")
+    stats = mcp_server.SessionStats()
+    stats.record_compression(2661, 734, "router:mixed:0.16")
+    stats.record_retrieval("a1b2c3d4e5f6a1b2c3d4e5f6")
+
+    events = stats.to_dict()["recent_events"]
+
+    assert events == ["compress 2661->734 router:mixed:0.16", "retrieve a1b2c3d4e5f6"]
+    shared = mcp_server._read_shared_events()
+    assert {"timestamp", "pid", "savings_percent"} <= set(shared[0])

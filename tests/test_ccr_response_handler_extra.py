@@ -136,6 +136,14 @@ def test_create_tool_result_message_google_and_generic_formats() -> None:
     )
     assert invalid_google["parts"][0]["functionResponse"]["response"] == {"content": "not-json"}
 
+    # Retrieved originals are raw text; one that parses as a JSON array must
+    # still be wrapped, since functionResponse.response has to be an object.
+    array_google = handler._create_tool_result_message(
+        [CCRToolResult(tool_call_id="headroom_retrieve", content="[1, 2]", success=True)],
+        "google",
+    )
+    assert array_google["parts"][0]["functionResponse"]["response"] == {"content": "[1, 2]"}
+
 
 def test_extract_assistant_message_google_and_generic() -> None:
     handler = CCRResponseHandler()
