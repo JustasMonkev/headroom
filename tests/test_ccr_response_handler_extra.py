@@ -112,14 +112,26 @@ def test_execute_retrieval_error_paths(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_create_tool_result_message_google_and_generic_formats() -> None:
     handler = CCRResponseHandler()
+    # Error payloads are compact JSON objects and pass through parsed.
     results = [
-        CCRToolResult(tool_call_id="headroom_retrieve", content='{"count": 1}', success=True)
+        CCRToolResult(tool_call_id="headroom_retrieve", content='{"error": "gone"}', success=False)
     ]
     google_message = handler._create_tool_result_message(results, "google")
     assert google_message == {
         "role": "user",
-        "parts": [{"functionResponse": {"name": "headroom_retrieve", "response": {"count": 1}}}],
+        "parts": [
+            {"functionResponse": {"name": "headroom_retrieve", "response": {"error": "gone"}}}
+        ],
     }
+
+    # A successful retrieval is the original verbatim — a JSON-object original
+    # is wrapped, not parsed (parsing would drop duplicate keys / reformat numbers).
+    original = '{"a": 1, "a": 2, "n": 1.50}'
+    object_google = handler._create_tool_result_message(
+        [CCRToolResult(tool_call_id="headroom_retrieve", content=original, success=True)],
+        "google",
+    )
+    assert object_google["parts"][0]["functionResponse"]["response"] == {"content": original}
 
     generic_message = handler._create_tool_result_message(
         [CCRToolResult(tool_call_id="tool-1", content="not-json", success=False)],

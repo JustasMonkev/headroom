@@ -1865,6 +1865,16 @@ BYTE_SENSITIVE_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 )
 
 
+def _is_ccr_retrieve_tool(tool_name: str) -> bool:
+    """True for ``headroom_retrieve`` under any spelling (bare or MCP-namespaced).
+
+    Its results are originals the model explicitly fetched: excluded from
+    lossy compression at every age, unlike the recent-window decay other
+    excluded tools get. Lossless folds still apply.
+    """
+    return bool(tool_name) and is_tool_excluded(tool_name, CCR_RETRIEVE_EXCLUDE_TOOLS)
+
+
 def _tool_output_is_byte_sensitive(tool_name: str) -> bool:
     """True when this tool's result must stay byte-identical (see the set above)."""
     if not tool_name:
@@ -4882,8 +4892,7 @@ class ContentRouter(Transform):
         excluded_tool_ids = {
             tool_id
             for tool_id, name in tool_name_map.items()
-            if is_tool_excluded(name, exclude_tools)
-            or is_tool_excluded(name, CCR_RETRIEVE_EXCLUDE_TOOLS)
+            if is_tool_excluded(name, exclude_tools) or _is_ccr_retrieve_tool(name)
         }
 
         # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
@@ -5172,7 +5181,12 @@ class ContentRouter(Transform):
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
                         continue
-                    if messages_from_end <= read_protection_window:
+                    # headroom_retrieve results never age out of protection:
+                    # a lossy pass re-mints a marker for content the model
+                    # already fetched.
+                    if messages_from_end <= read_protection_window or _is_ccr_retrieve_tool(
+                        tool_name
+                    ):
                         # Protected from lossy compression — but grep/log/json
                         # output can still be losslessly compacted. Byte-
                         # sensitive tools (Read) are held out by tool_name.
@@ -6284,7 +6298,10 @@ class ContentRouter(Transform):
                         if route_counts is not None:
                             route_counts["excluded_tool"] += 1
                         continue
-                    if messages_from_end <= read_protection_window:
+                    # headroom_retrieve results never age out (see the twin above).
+                    if messages_from_end <= read_protection_window or _is_ccr_retrieve_tool(
+                        tool_name
+                    ):
                         # Protected from lossy compression — but grep/log/json
                         # output can still be losslessly compacted. Byte-
                         # sensitive tools (Read) are held out by tool_name.

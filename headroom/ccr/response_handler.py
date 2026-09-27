@@ -372,13 +372,17 @@ class CCRResponseHandler:
             # Format: {"role": "user", "parts": [{"functionResponse": {"name": "...", "response": {...}}}]}
             parts = []
             for result in results:
-                # functionResponse.response must be an object: error payloads
-                # are JSON objects; retrieved content is raw text (which may
-                # itself parse as a JSON array or scalar), so wrap it.
-                try:
-                    response_data = json.loads(result.content)
-                except json.JSONDecodeError:
-                    response_data = None
+                # functionResponse.response must be an object. A successful
+                # retrieval is the original verbatim, so it is always wrapped —
+                # parsing it would rewrite a JSON-object original (duplicate
+                # keys, number formatting). Only error payloads, which are
+                # compact JSON objects, are passed through parsed.
+                response_data = None
+                if not result.success:
+                    try:
+                        response_data = json.loads(result.content)
+                    except json.JSONDecodeError:
+                        response_data = None
                 if not isinstance(response_data, dict):
                     response_data = {"content": result.content}
                 parts.append(

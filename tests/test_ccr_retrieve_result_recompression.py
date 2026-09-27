@@ -142,3 +142,30 @@ def test_guard_survives_a_caller_exclude_set_that_replaces_defaults() -> None:
     result = router.apply(_anthropic("mcp__headroom__headroom_retrieve", payload), tokenizer)
 
     assert not CCR_RETRIEVAL_MARKER_RE.search(_anthropic_out(result))
+
+
+@pytest.mark.parametrize("shape", ["anthropic", "openai"])
+def test_old_retrieve_result_is_not_age_decayed_into_a_marker(shape) -> None:
+    """Excluded tools age out of protection past the recent window (the
+    proxy's default token mode sets protect_recent_reads_fraction=0.3). A
+    retrieve result must stay exempt from lossy compression at any age, or a
+    long conversation re-mints a marker for content the model already fetched."""
+    from headroom import OpenAIProvider, Tokenizer
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_reads_fraction=0.3))
+    tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+    payload = _legacy_mcp_payload()
+    build = _anthropic if shape == "anthropic" else _openai
+    messages = build("mcp__headroom__headroom_retrieve", payload)
+    # Push the retrieve result far outside the recent-message window.
+    for i in range(40):
+        messages.append({"role": "assistant", "content": f"step {i}"})
+        messages.append({"role": "user", "content": f"continue {i}"})
+    idx = 2
+
+    result = router.apply(messages, tokenizer)
+
+    retrieved = result.messages[idx]
+    out = retrieved["content"][0]["content"] if shape == "anthropic" else retrieved["content"]
+    assert not CCR_RETRIEVAL_MARKER_RE.search(out)
+    assert json.loads(out)["original_content"] == _retrieved_log()

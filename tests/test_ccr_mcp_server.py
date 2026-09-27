@@ -651,3 +651,20 @@ def test_stats_recent_events_are_compact_lines(monkeypatch, tmp_path) -> None:
     assert events == ["compress 2661->734 router:mixed:0.16", "retrieve a1b2c3d4e5f6"]
     shared = mcp_server._read_shared_events()
     assert {"timestamp", "pid", "savings_percent"} <= set(shared[0])
+
+
+def test_multiline_proxy_warning_keeps_the_header_parseable() -> None:
+    """A proxy error page can put newlines (and a lot of HTML) into the
+    warning; it must stay one short line so the header after it still parses."""
+    page = "<html>\n<body>\n" + "<p>Bad Gateway</p>\n" * 200 + "</body>\n</html>"
+    warning = f"Configured proxy http://127.0.0.1:9 is unreachable (HTTP 502 ({page}))."
+    result = {"compressed": "x", "hash": "ab12", "original_tokens": 10, "compressed_tokens": 2}
+
+    text = mcp_server._format_compress_result(result, warning)
+    parsed = mcp_server.parse_compress_result(text)
+
+    first_line = text.split("\n", 1)[0]
+    assert first_line.startswith("warning: Configured proxy http://127.0.0.1:9 is unreachable")
+    assert len(first_line) <= 250
+    assert parsed["hash"] == "ab12"
+    assert parsed["compressed"] == "x"

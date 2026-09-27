@@ -562,9 +562,13 @@ Fix: `headroom_retrieve` joins `DEFAULT_EXCLUDE_TOOLS` via
 `CCR_RETRIEVE_EXCLUDE_TOOLS`. The alias matching in `is_tool_excluded` covers
 the `mcp__…__` and `mcp_…_` spellings. The router also applies it when a caller's
 `exclude_tools` replaces the defaults, and SmartCrusher's guard became
-alias-aware. The tool is *excluded*, not *verbatim*, so recent retrieve results
-still get the lossless folds (JSON minify, log run-collapse) and never a new
-marker. After the fix: the same log reaches the model intact (16,193 tokens).
+alias-aware. The tool is *excluded*, not *verbatim*, so retrieve results still
+get the lossless folds (JSON minify, log run-collapse) and never a new marker.
+Unlike other excluded tools, they never age out of protection: the proxy's
+token mode lets excluded outputs older than the recent window
+(`protect_recent_reads_fraction=0.3`) fall through to lossy compression, which
+would re-mint a marker for content the model already fetched (Codex review on
+PR #26). After the fix: the same log reaches the model intact (16,193 tokens).
 
 Follow-ups, not done here:
 - The optional Rust front proxy's Anthropic and Chat live-zone paths
@@ -593,8 +597,10 @@ unchanged.
 | Python source | 1,275 | 1,472 → **1,275** (−13%) | 1,468 → **1,275** |
 | small `ls` output | 48 | 72 → **48** (−33%) | 68 → **48** |
 
-Gemini's `functionResponse.response` must be an object, so raw text that
-parses as a JSON array or scalar is wrapped as `{"content": …}` there.
+Gemini's `functionResponse.response` must be an object, so every successful
+retrieval is wrapped as `{"content": …}` there. Parsing it would rewrite a
+JSON-object original, such as duplicate keys or number formatting. Only error
+payloads pass through parsed.
 
 ### H3. `headroom_compress` often returned more than it was given — P1 [fixed]
 
@@ -618,8 +624,10 @@ followed by the compressed text verbatim. When nothing was saved it is
 The proxy-unreachable warning was attached on every call as a `proxy` object
 plus a `warning` field that restated it (~86 tokens per call for standalone
 users, whose configured default proxy is not running). It is now one
-`warning: …` line, shown only when the state changes. Five calls with the
-proxy down: 10,554 → 9,218 tokens.
+`warning: …` line, shown only when the state changes. It is flattened and
+capped at 240 characters, because the probe can embed a whole error page, and
+newlines would break the header `parse_compress_result` relies on. Five calls
+with the proxy down: 10,554 → 9,218 tokens.
 
 ### H4. `headroom_stats` spent 87% of its payload on `recent_events` — P2 [fixed]
 

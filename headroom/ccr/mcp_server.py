@@ -241,7 +241,7 @@ def _format_compress_result(result: dict[str, Any], warning: str | None = None) 
     """
     before = result["original_tokens"]
     after = result["compressed_tokens"]
-    lines = [f"warning: {warning}"] if warning else []
+    lines = [f"warning: {_one_line(warning)}"] if warning else []
     if after >= before:
         lines.append(f"tokens={before}; not compressible, use the original as-is")
         return "\n".join(lines)
@@ -251,6 +251,22 @@ def _format_compress_result(result: dict[str, Any], warning: str | None = None) 
     lines.append(f"hash={result['hash']} tokens={before}->{after}")
     lines.append(model_facing_text(compressed))
     return "\n".join(lines)
+
+
+_WARNING_MAX_CHARS = 240
+
+
+def _one_line(text: str) -> str:
+    """Collapse a warning onto one bounded line.
+
+    The proxy probe can embed a whole error page (``response.text``) in the
+    warning. Newlines would break the header boundary ``parse_compress_result``
+    relies on, and the page itself is tokens the model cannot act on.
+    """
+    flat = " ".join(text.split())
+    if len(flat) > _WARNING_MAX_CHARS:
+        flat = flat[: _WARNING_MAX_CHARS - 1].rstrip() + "…"
+    return flat
 
 
 _COMPRESS_HEADER_RE = re.compile(
