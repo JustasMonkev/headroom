@@ -51,14 +51,18 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from ..ccr.tool_injection import CCR_TOOL_NAME
-from ..config import CCRConfig, TransformResult
+from ..config import CCR_RETRIEVE_EXCLUDE_TOOLS, CCRConfig, TransformResult, is_tool_excluded
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
 from .content_detector import normalize_concatenated_json
 
 logger = logging.getLogger(__name__)
+
+
+def _is_ccr_retrieve(tool_name: str | None) -> bool:
+    """True for ``headroom_retrieve`` under any spelling (bare or MCP-namespaced)."""
+    return tool_name is not None and is_tool_excluded(tool_name, CCR_RETRIEVE_EXCLUDE_TOOLS)
 
 
 # Lossless-compaction renderers known to the Rust core — mirrors
@@ -1304,7 +1308,9 @@ class SmartCrusher(Transform):
                 # unresolvable retrieval loop.
                 # ponytail: ceiling is tool_call_id lookup; if the id is missing we
                 # compress (conservative: unknown tool names don't get a free pass).
-                if tool_names_by_id.get(msg.get("tool_call_id") or "") == CCR_TOOL_NAME:
+                # Alias-aware: `headroom wrap` surfaces the MCP tool as
+                # `mcp__headroom__headroom_retrieve`, which never equals the bare name.
+                if _is_ccr_retrieve(tool_names_by_id.get(msg.get("tool_call_id") or "")):
                     continue
                 content = msg.get("content", "")
                 if isinstance(content, str):
@@ -1335,7 +1341,7 @@ class SmartCrusher(Transform):
                     # would produce a new <<ccr:hash>> marker the agent cannot
                     # redeem (infinite retrieval loop).
                     # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
-                    if tool_names_by_id.get(block.get("tool_use_id") or "") == CCR_TOOL_NAME:
+                    if _is_ccr_retrieve(tool_names_by_id.get(block.get("tool_use_id") or "")):
                         continue
                     tool_content = block.get("content", "")
                     if not isinstance(tool_content, str):

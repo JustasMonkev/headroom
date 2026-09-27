@@ -232,3 +232,26 @@ class TestHeadroomRetrieveExemptionAnthropic:
         )
         # The bash result should differ (or at least the crush count > 0)
         assert bash_block["content"] != content or result.tokens_after < result.tokens_before
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["mcp__headroom__headroom_retrieve", "mcp_headroom_headroom_retrieve"],
+)
+def test_mcp_namespaced_retrieve_result_not_compressed(tool_name: str) -> None:
+    """`headroom wrap` registers the MCP server, so clients call the tool as
+    `mcp__headroom__headroom_retrieve` — the guard must match that spelling."""
+    content = _big_content()
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_ccr_1", "name": tool_name, "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_ccr_1", "content": content}],
+        },
+    ]
+    result = _make_crusher(min_tokens=0).apply(messages, _get_tokenizer())
+
+    assert result.messages[1]["content"][0]["content"] == content

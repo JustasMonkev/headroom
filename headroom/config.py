@@ -413,7 +413,16 @@ class AnchorConfig:
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
 # To protect Bash or other non-excluded tools from lossy compression, use
 # HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
-DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+#
+# headroom_retrieve results ARE the originals the model explicitly asked for.
+# Lossy-recompressing one mints a fresh CCR marker for the same bytes, so the
+# model has to retrieve again: a loop that pays for the content every round.
+# Excluding (not verbatim) keeps the lossless folds (JSON minify, log collapse),
+# so a retrieved payload still shrinks. The alias matching in
+# ``is_tool_excluded`` also covers ``mcp__headroom__headroom_retrieve``.
+CCR_RETRIEVE_EXCLUDE_TOOLS: frozenset[str] = frozenset({"headroom_retrieve"})
+
+DEFAULT_EXCLUDE_TOOLS: frozenset[str] = CCR_RETRIEVE_EXCLUDE_TOOLS | frozenset(
     {
         "Read",
         "ReadFile",
