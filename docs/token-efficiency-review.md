@@ -562,21 +562,24 @@ Fix: `headroom_retrieve` joins `DEFAULT_EXCLUDE_TOOLS` via
 `CCR_RETRIEVE_EXCLUDE_TOOLS`. The alias matching in `is_tool_excluded` covers
 the `mcp__…__` and `mcp_…_` spellings. The router also applies it when a caller's
 `exclude_tools` replaces the defaults, and SmartCrusher's guard became
-alias-aware. The tool is *excluded*, not *verbatim*, so retrieve results still
-get the lossless folds (JSON minify, log run-collapse) and never a new marker.
-Unlike other excluded tools, they never age out of protection: the proxy's
-token mode lets excluded outputs older than the recent window
-(`protect_recent_reads_fraction=0.3`) fall through to lossy compression, which
-would re-mint a marker for content the model already fetched (Codex review on
-PR #26). After the fix: the same log reaches the model intact (16,193 tokens).
+alias-aware. Retrieve results are also in `DEFAULT_VERBATIM_EXCLUDE_TOOLS`, so
+they pass through byte-for-byte at any age. Two Codex review rounds on PR #26
+showed that anything weaker leaks:
+- Plain exclusion ages out. The proxy's token mode lets excluded outputs older
+  than the recent window (`protect_recent_reads_fraction=0.3`) fall through to
+  lossy compression, which re-mints a marker for content the model already
+  fetched.
+- The excluded-tool "lossless" folds rewrite bytes. JSON minify parses and
+  re-serializes, so an original like `{"a":1,"a":2}` became `{"a":2}`.
 
-Follow-ups, not done here:
-- The optional Rust front proxy's Anthropic and Chat live-zone paths
-  (`compress_anthropic_live_zone`, `compress_openai_chat_live_zone`) have the
-  same gap. Its Responses path already guards via `ends_with("__headroom_retrieve")`.
-- Excluded JSON only gets whitespace-minified. SmartCrusher's lossless-only
-  tabular re-encode would shrink retrieved JSON arrays further, but that
-  changes the excluded-tool policy for every tool, so it is a separate call.
+The model asked for the original, so it gets the original. The verbatim set
+also keeps the cross-turn dedup pass from rewriting it. After the fix: the same
+log reaches the model intact (16,193 tokens).
+
+Follow-up, not done here: the optional Rust front proxy's Anthropic and Chat
+live-zone paths (`compress_anthropic_live_zone`,
+`compress_openai_chat_live_zone`) have the same gap. Its Responses path already
+guards via `ends_with("__headroom_retrieve")`.
 
 ### H2. Retrieval results were JSON-wrapped — P1 [fixed]
 
@@ -586,7 +589,8 @@ handler and `/v1/retrieve/tool_call`. String escaping turns every `"` into
 `\"` and every newline into `\n`. The `hash` echo is redundant with the
 tool-call id that pairs the result to its call. A hit now returns the original
 verbatim (`model_facing_text`, which keeps the lone-surrogate guard). Misses
-stay one-line compact JSON. The caller-facing `/v1/retrieve` HTTP contract is
+stay one-line compact JSON; the MCP server also sets `isError` on them, since an
+original that is itself `{"error": …}` JSON would otherwise read as a miss. The caller-facing `/v1/retrieve` HTTP contract is
 unchanged.
 
 | retrieved content | original | MCP result, base → branch | proxy result, base → branch |
@@ -624,7 +628,9 @@ followed by the compressed text verbatim. When nothing was saved it is
 The proxy-unreachable warning was attached on every call as a `proxy` object
 plus a `warning` field that restated it (~86 tokens per call for standalone
 users, whose configured default proxy is not running). It is now one
-`warning: …` line, shown only when the state changes. It is flattened and
+`warning: …` line, shown only when the state changes for that client session.
+Over the HTTP transport one server instance serves every client, so one
+client seeing the warning says nothing about another. It is flattened and
 capped at 240 characters, because the probe can embed a whole error page, and
 newlines would break the header `parse_compress_result` relies on. Five calls
 with the proxy down: 10,554 → 9,218 tokens.

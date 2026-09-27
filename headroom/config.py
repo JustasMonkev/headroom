@@ -417,9 +417,10 @@ class AnchorConfig:
 # headroom_retrieve results ARE the originals the model explicitly asked for.
 # Lossy-recompressing one mints a fresh CCR marker for the same bytes, so the
 # model has to retrieve again: a loop that pays for the content every round.
-# Excluding (not verbatim) keeps the lossless folds (JSON minify, log collapse),
-# so a retrieved payload still shrinks. The alias matching in
-# ``is_tool_excluded`` also covers ``mcp__headroom__headroom_retrieve``.
+# They are also verbatim (below), at any age: even the "lossless" folds rewrite
+# bytes (JSON minify re-serializes, so duplicate keys collapse), and the model
+# asked for the original. The alias matching in ``is_tool_excluded`` also covers
+# ``mcp__headroom__headroom_retrieve``.
 CCR_RETRIEVE_EXCLUDE_TOOLS: frozenset[str] = frozenset({"headroom_retrieve"})
 
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = CCR_RETRIEVE_EXCLUDE_TOOLS | frozenset(
@@ -448,9 +449,9 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = CCR_RETRIEVE_EXCLUDE_TOOLS | frozenset(
     }
 )
 
-# These excluded web-tool results must remain byte-faithful. Even the
-# excluded-tool lossless fold rewrites formatted JSON.
-DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+# These excluded results must remain byte-faithful (web tools and retrieved
+# CCR originals). Even the excluded-tool lossless fold rewrites formatted JSON.
+DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = CCR_RETRIEVE_EXCLUDE_TOOLS | frozenset(
     {
         "WebSearch",
         "WebFetch",

@@ -52,7 +52,7 @@ JSON-escaped, so it costs no more tokens than the text itself):
 - when nothing was saved: `tokens=<n>; not compressible, use the original as-is`
   (the content is not echoed back -- the caller already has it)
 - a `warning: ...` line first when the configured proxy is unreachable (shown
-  once per state change, not on every call)
+  once per state change in each client session, not on every call)
 
 Programmatic clients can parse the text with
 `headroom.ccr.mcp_server.parse_compress_result()`.
@@ -79,7 +79,9 @@ Retrieve original uncompressed content by hash.
 
 **Returns:** the original content, verbatim. Wrapping it in JSON escaped every
 quote and newline (+12% tokens on compact JSON, +26% on pretty-printed JSON,
-+14% on code). A miss returns a one-line `{"error": ...}` object.
++14% on code). A miss returns a one-line `{"error": ...}` object with the MCP
+`isError` flag set, so an original that is itself error-shaped JSON is never
+mistaken for a miss.
 
 Retrieval checks the local store first, then falls back to the proxy's store. Hashes from either source work transparently.
 

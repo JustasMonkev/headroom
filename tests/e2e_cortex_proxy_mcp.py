@@ -297,12 +297,12 @@ async def run_test(token: str, host: str) -> int:
                 if hash1:
                     print(f"\n  [6/7] CCR round-trip — headroom_retrieve({hash1[:8]}...)")
                     r3 = await session.call_tool("headroom_retrieve", {"hash": hash1})
-                    # A hit is the original verbatim; a miss is {"error": ...} JSON.
+                    # A hit is the original verbatim; a miss sets isError.
                     t3 = r3.content[0].text if r3.content else ""
-                    if t3 == dbt:
+                    if r3.isError:
+                        print(f"    ⚠  {t3[:80]}")
+                    elif t3 == dbt:
                         print("    ✓  original content retrieved via headroom_retrieve")
-                    elif t3.startswith('{"error"'):
-                        print(f"    ⚠  {json.loads(t3)['error'][:80]}")
                     else:
                         print(f"    ✓  retrieved ({len(t3):,} chars)")
 

@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,13 @@ except ImportError:
     MCP_AVAILABLE = False
     Server = None  # type: ignore[assignment,misc]
     stdio_server = None  # type: ignore[assignment]
+
+# Separate import: lets a tool result carry isError (mcp>=1.28.1 passes a
+# returned CallToolResult through). Without it, errors stay plain content.
+try:
+    from mcp.types import CallToolResult
+except ImportError:
+    CallToolResult = None  # type: ignore[assignment,misc]
 
 # Try to import httpx for proxy communication
 try:
@@ -306,6 +314,29 @@ def parse_compress_result(text: str) -> dict[str, Any]:
     return parsed
 
 
+class _ToolError(list):  # type: ignore[type-arg]
+    """Tool content that reports a failure (sent with MCP ``isError``).
+
+    A successful retrieval is the original verbatim, so its text alone cannot
+    say "miss": an original that is itself ``{"error": …}`` JSON would read
+    like one. The flag carries that instead of the text shape.
+    """
+
+
+def _as_tool_result(content: list[Any]) -> Any:
+    """Return handler content as-is, or as ``CallToolResult(isError=True)``."""
+    if isinstance(content, _ToolError) and CallToolResult is not None:
+        return CallToolResult(content=list(content), isError=True)
+    return content
+
+
+class _NoSession:
+    """Warning-state key for calls made outside an MCP request context."""
+
+
+_NO_SESSION = _NoSession()
+
+
 def _append_shared_event(event: dict[str, Any]) -> None:
     """Append an event to the shared stats file (cross-process, file-locked)."""
     try:
@@ -499,9 +530,13 @@ class HeadroomMCPServer:
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
-        # Last proxy warning shown in a compress result, so the same warning
-        # is not re-billed on every call while the proxy stays down.
-        self._last_compress_proxy_warning: str | None = None
+        # Last proxy warning shown in a compress result, per MCP session, so
+        # the same warning is not re-billed on every call while the proxy stays
+        # down. Per session: over the HTTP transport one server instance serves
+        # every client, and one client seeing it says nothing about another.
+        self._last_compress_proxy_warning: weakref.WeakKeyDictionary[Any, str | None] = (
+            weakref.WeakKeyDictionary()
+        )
 
         if not MCP_AVAILABLE or Server is None:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
@@ -808,7 +843,8 @@ class HeadroomMCPServer:
             return tools
 
         @self.server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        async def call_tool(name: str, arguments: dict[str, Any]) -> Any:
+            # Content list, or CallToolResult(isError=True) for a _ToolError.
             started = time.perf_counter()
             logger.info(
                 "event=mcp_tool_call_received tool=%s arguments=%s",
@@ -841,15 +877,19 @@ class HeadroomMCPServer:
                         default=str,
                     ),
                 )
-                return result
+                return _as_tool_result(result)
             except Exception as e:
                 logger.error(f"Tool {name} failed: {e}", exc_info=True)
-                return [
-                    TextContent(
-                        type="text",
-                        text=_model_json({"error": str(e)}),
+                return _as_tool_result(
+                    _ToolError(
+                        [
+                            TextContent(
+                                type="text",
+                                text=_model_json({"error": str(e)}),
+                            )
+                        ]
                     )
-                ]
+                )
 
     async def _handle_compress(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_compress tool call."""
@@ -875,11 +915,12 @@ class HeadroomMCPServer:
 
         proxy_status = await self._probe_proxy_unreachable()
         warning = proxy_status["warning"] if proxy_status else None
-        if warning == self._last_compress_proxy_warning:
-            show_warning = None  # already in context from an earlier call
+        session = self._session_key()
+        if warning == self._last_compress_proxy_warning.get(session):
+            show_warning = None  # already in this session's context
         else:
             show_warning = warning
-        self._last_compress_proxy_warning = warning
+        self._last_compress_proxy_warning[session] = warning
 
         return [TextContent(type="text", text=_format_compress_result(result, show_warning))]
 
@@ -917,16 +958,29 @@ class HeadroomMCPServer:
             pass
         return "unknown"
 
+    def _session_key(self) -> Any:
+        """The current MCP session (a weak-dict key), or a shared fallback."""
+        try:
+            return self.server.request_context.session
+        except Exception:
+            return _NO_SESSION
+
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
-        """Handle headroom_retrieve tool call."""
+        """Handle headroom_retrieve tool call.
+
+        A hit is the original verbatim; a miss is a ``_ToolError`` (MCP
+        ``isError``), since the text shape alone cannot tell them apart.
+        """
         hash_key = arguments.get("hash")
         if not hash_key:
-            return [
-                TextContent(
-                    type="text",
-                    text=_model_json({"error": "hash parameter is required"}),
-                )
-            ]
+            return _ToolError(
+                [
+                    TextContent(
+                        type="text",
+                        text=_model_json({"error": "hash parameter is required"}),
+                    )
+                ]
+            )
 
         logger.info("event=mcp_retrieve_started hash=%s", hash_key)
         result = await self._retrieve_content(hash_key)
@@ -942,7 +996,7 @@ class HeadroomMCPServer:
             # every quote/newline (+12-26% tokens on JSON and code) and echoed
             # the hash the model just sent. See `model_facing_text`.
             return [TextContent(type="text", text=model_facing_text(original))]
-        return [TextContent(type="text", text=_model_json(result))]
+        return _ToolError([TextContent(type="text", text=_model_json(result))])
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""

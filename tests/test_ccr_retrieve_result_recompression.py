@@ -116,17 +116,28 @@ def test_same_payload_from_another_tool_is_still_compressed() -> None:
     assert out != payload
 
 
-def test_retrieve_results_keep_lossless_folds() -> None:
-    """Excluded, not verbatim: pretty JSON is still minified (data-lossless)."""
-    rows = [{"id": i, "name": f"user_{i}", "status": "ok"} for i in range(200)]
-    pretty = json.dumps(rows, indent=2)
+@pytest.mark.parametrize(
+    "tool_name", ["mcp__headroom__headroom_retrieve", "mcp_HeadroomZai_headroom_retrieve"]
+)
+@pytest.mark.parametrize("age_padding", [0, 40])
+def test_retrieve_results_pass_through_byte_for_byte(age_padding, tool_name) -> None:
+    """Verbatim, not merely "lossless": JSON minify re-serializes, which
+    collapses duplicate keys and reformats numbers. The model asked for the
+    original, so it gets the original — recent or old."""
+    from headroom import OpenAIProvider, Tokenizer
 
-    result = compress(_anthropic("mcp__headroom__headroom_retrieve", pretty))
-    out = _anthropic_out(result)
+    rows = ",\n  ".join(f'{{"id": {i}, "id": "dup-{i}", "score": 1.50}}' for i in range(200))
+    original = "[\n  " + rows + "\n]"
+    messages = _anthropic(tool_name, original)
+    for i in range(age_padding):
+        messages.append({"role": "assistant", "content": f"step {i}"})
+        messages.append({"role": "user", "content": f"continue {i}"})
+    router = ContentRouter(ContentRouterConfig(protect_recent_reads_fraction=0.3))
+    tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
 
-    assert json.loads(out) == rows
-    assert len(out) < len(pretty)
-    assert result.tokens_after < result.tokens_before
+    result = router.apply(messages, tokenizer)
+
+    assert result.messages[2]["content"][0]["content"] == original
 
 
 def test_guard_survives_a_caller_exclude_set_that_replaces_defaults() -> None:
@@ -167,5 +178,4 @@ def test_old_retrieve_result_is_not_age_decayed_into_a_marker(shape) -> None:
 
     retrieved = result.messages[idx]
     out = retrieved["content"][0]["content"] if shape == "anthropic" else retrieved["content"]
-    assert not CCR_RETRIEVAL_MARKER_RE.search(out)
-    assert json.loads(out)["original_content"] == _retrieved_log()
+    assert out == payload

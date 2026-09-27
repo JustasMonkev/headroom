@@ -57,6 +57,12 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
+    class DummyCallToolResult:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
     async def dummy_stdio_server():
         raise RuntimeError("stdio_server should not run in unit tests")
 
@@ -64,6 +70,7 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
     mcp_stdio_module.stdio_server = dummy_stdio_server
     mcp_types_module.TextContent = DummyTextContent
     mcp_types_module.Tool = DummyTool
+    mcp_types_module.CallToolResult = DummyCallToolResult
 
     return {
         "mcp": mcp_module,

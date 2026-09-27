@@ -47,7 +47,7 @@ Returns (one header line, then the compressed text verbatim — not JSON-escaped
   - "tokens=<n>; not compressible, use the original as-is" when nothing was
     saved (the content is not echoed back — the caller already has it)
   - a leading "warning: ..." line when the configured proxy is unreachable
-    (once per state change, not on every call)
+    (once per state change in each client session, not on every call)
 ```
 
 Programmatic clients can parse the text with
@@ -79,7 +79,8 @@ Parameters:
 Returns:
   - the original content, verbatim (no JSON wrapper: escaping every quote and
     newline cost +12-26% tokens on JSON and +14% on code)
-  - on a miss, a one-line {"error": ...} object
+  - on a miss, a one-line {"error": ...} object with the MCP isError flag set
+    (so an error-shaped original is never mistaken for a miss)
 ```
 
 Retrieval checks the local store first (content compressed via `headroom_compress`), then falls back to the proxy's store (content compressed automatically by the proxy). Hashes from either source work transparently.

@@ -272,12 +272,12 @@ async def run_mcp_test(token: str, host: str) -> int:
             if hash1:
                 print(f"\n  [5/6] headroom_retrieve — CCR round-trip (hash={hash1[:8]}...)")
                 r3 = await session.call_tool("headroom_retrieve", {"hash": hash1})
-                # A hit is the original verbatim; a miss is {"error": ...} JSON.
+                # A hit is the original verbatim; a miss sets isError.
                 text3 = r3.content[0].text if r3.content else ""
-                if text3 == dbt_content:
+                if r3.isError:
+                    print(f"    ⚠  {text3[:80]}")
+                elif text3 == dbt_content:
                     print("    ✓  original content retrieved successfully")
-                elif text3.startswith('{"error"'):
-                    print(f"    ⚠  {json.loads(text3)['error'][:80]}")
                 else:
                     print(f"    ✓  retrieved ({len(text3):,} chars)")
 

@@ -1868,9 +1868,10 @@ BYTE_SENSITIVE_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 def _is_ccr_retrieve_tool(tool_name: str) -> bool:
     """True for ``headroom_retrieve`` under any spelling (bare or MCP-namespaced).
 
-    Its results are originals the model explicitly fetched: excluded from
-    lossy compression at every age, unlike the recent-window decay other
-    excluded tools get. Lossless folds still apply.
+    Its results are originals the model explicitly fetched. They are always
+    excluded (even when a caller's exclude set replaces the defaults), and
+    ``DEFAULT_VERBATIM_EXCLUDE_TOOLS`` then passes them through byte-for-byte
+    at any age.
     """
     return bool(tool_name) and is_tool_excluded(tool_name, CCR_RETRIEVE_EXCLUDE_TOOLS)
 
@@ -5181,12 +5182,7 @@ class ContentRouter(Transform):
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
                         continue
-                    # headroom_retrieve results never age out of protection:
-                    # a lossy pass re-mints a marker for content the model
-                    # already fetched.
-                    if messages_from_end <= read_protection_window or _is_ccr_retrieve_tool(
-                        tool_name
-                    ):
+                    if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
                         # output can still be losslessly compacted. Byte-
                         # sensitive tools (Read) are held out by tool_name.
@@ -6298,10 +6294,7 @@ class ContentRouter(Transform):
                         if route_counts is not None:
                             route_counts["excluded_tool"] += 1
                         continue
-                    # headroom_retrieve results never age out (see the twin above).
-                    if messages_from_end <= read_protection_window or _is_ccr_retrieve_tool(
-                        tool_name
-                    ):
+                    if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
                         # output can still be losslessly compacted. Byte-
                         # sensitive tools (Read) are held out by tool_name.

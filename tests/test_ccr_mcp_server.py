@@ -668,3 +668,39 @@ def test_multiline_proxy_warning_keeps_the_header_parseable() -> None:
     assert len(first_line) <= 250
     assert parsed["hash"] == "ab12"
     assert parsed["compressed"] == "x"
+
+
+def test_retrieve_miss_is_flagged_as_mcp_error_and_hit_is_not(fresh_store) -> None:
+    """A hit is the original verbatim, so an original that is itself
+    `{"error": …}` JSON must not read as a miss: misses carry isError."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    call_tool = server.server.call_tool_handler
+    original = '{"error":"application failed"}'
+    hash_key = get_compression_store().store(original, "<<small>>")
+
+    hit = asyncio.run(call_tool(mcp_server.CCR_TOOL_NAME, {"hash": hash_key}))
+    miss = asyncio.run(call_tool(mcp_server.CCR_TOOL_NAME, {"hash": "deadbeefdeadbeefdeadbeef"}))
+
+    assert isinstance(hit, list) and hit[0].text == original
+    assert miss.isError is True
+    assert json.loads(miss.content[0].text)["error"] == mcp_server.RETRIEVAL_MISS_MESSAGE
+
+
+def test_proxy_warning_suppression_is_per_session(fresh_store, monkeypatch) -> None:
+    """Over the HTTP transport one server serves every client: one session
+    having seen the warning must not hide it from another."""
+
+    class Session:
+        pass
+
+    server = mcp_server.HeadroomMCPServer(proxy_url="http://127.0.0.1:9", check_proxy=True)
+    alice, bob = Session(), Session()
+
+    def warning_for(session: object) -> str | None:
+        monkeypatch.setattr(server, "_session_key", lambda: session)
+        (response,) = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
+        return mcp_server.parse_compress_result(response.kwargs["text"])["warning"]
+
+    assert warning_for(alice) is not None
+    assert warning_for(alice) is None  # already in alice's context
+    assert warning_for(bob) is not None  # bob has not seen it yet
